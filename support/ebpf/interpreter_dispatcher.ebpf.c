@@ -116,6 +116,15 @@ struct trace_events_t {
   __uint(max_entries, 0);
 } trace_events SEC(".maps");
 
+// OBI shared context map.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, u64);
+    __type(value, ObiCtx);
+    __uint(max_entries, 1 << 14);
+    __uint(pinning, 1); // LIBBPF_PIN_BY_NAME
+} obi_ctx SEC(".maps");
+
 // End shared maps
 
 struct apm_int_procs_t {
@@ -188,6 +197,21 @@ static EBPF_INLINE void maybe_add_go_custom_labels(struct pt_regs *ctx, PerCPURe
   tail_call(ctx, PROG_GO_LABELS);
 }
 
+static EBPF_INLINE void maybe_add_obi_info(Trace *trace)
+{
+  u64 id = bpf_get_current_pid_tgid();
+
+  ObiCtx *obi_info = bpf_map_lookup_elem(&obi_ctx, &id);
+  if (!obi_info) {
+    return;
+  }
+
+  __builtin_memcpy(&trace->apm_trace_id.raw, obi_info->trace_id, 16);
+  __builtin_memcpy(&trace->apm_transaction_id.raw, obi_info->span_id, 8);
+
+  DEBUG_PRINT("OBI span ID: %016llX", trace->apm_transaction_id.as_int);
+}
+
 static EBPF_INLINE void maybe_add_apm_info(Trace *trace)
 {
   u32 pid              = trace->pid; // verifier needs this to be on stack on 4.15 kernel
@@ -247,6 +271,7 @@ static EBPF_INLINE int unwind_stop(struct pt_regs *ctx)
   UnwindState *state = &record->state;
 
   maybe_add_apm_info(trace);
+  maybe_add_obi_info(trace);
 
   // If the stack is otherwise empty, push an error for that: we should
   // never encounter empty stacks for successful unwinding.

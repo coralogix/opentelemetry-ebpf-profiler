@@ -21,11 +21,13 @@ import (
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/link"
 	"github.com/elastic/go-perf"
-	"go.opentelemetry.io/ebpf-profiler/internal/log"
-	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
 
+	"go.opentelemetry.io/obi/pkg/shared"
+
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/kallsyms"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/nativeunwind/elfunwindinfo"
@@ -557,6 +559,16 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 	for mapName, mapSpec := range coll.Maps {
 		if mapName == "sched_times" && cfg.OffCPUThreshold == 0 {
 			// Off CPU Profiling is disabled. So do not load this map.
+			continue
+		}
+
+		if mapName == shared.ObiCtxMapName {
+			obiCtxMap, err := shared.LoadOrCreateCtxMap()
+			if err != nil {
+				log.Warnf("Failed to load or create %s map: %v", shared.ObiCtxMapName, err)
+				continue
+			}
+			ebpfMaps[mapName] = obiCtxMap
 			continue
 		}
 

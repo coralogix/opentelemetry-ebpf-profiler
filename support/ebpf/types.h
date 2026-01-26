@@ -537,7 +537,7 @@ typedef union ApmSpanID {
   u64 as_int;
 } ApmSpanID;
 
-_Static_assert(sizeof(ApmSpanID) == 8, "unexpected trace ID size");
+_Static_assert(sizeof(ApmSpanID) == 8, "unexpected span ID size");
 
 // Defines the format of the APM correlation TLS buffer.
 //
@@ -959,5 +959,10 @@ typedef struct GoLabelsOffsets {
   u32 hmap_buckets;
   s32 tls_offset;
 } GoLabelsOffsets;
+
+typedef struct ObiCtx {
+  u8 trace_id[16];
+  u8 span_id[8];
+} ObiCtx;
 
 #endif // OPTI_TYPES_H
