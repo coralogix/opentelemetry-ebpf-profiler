@@ -6,8 +6,10 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/ebpf-profiler/gpu/cupti"
 	"go.opentelemetry.io/ebpf-profiler/internal/linux"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
@@ -29,6 +31,7 @@ type Controller struct {
 
 	shutdownOnceFn sync.Once
 	cancelFunc     context.CancelFunc
+	gpuStop        atomic.Pointer[func()]
 }
 
 // New creates a new controller
@@ -108,6 +111,7 @@ func (c *Controller) Start(ctx context.Context) error {
 		IncludeEnvVars:         envVars,
 		ProbeLinks:             c.config.ProbeLinks,
 		LoadProbe:              c.config.LoadProbe,
+		LoadGPU:                c.config.GPU,
 		ExecutableReporter:     c.config.ExecutableReporter,
 		BPFFSRoot:              c.config.BPFFSRoot,
 		OBIProcessCtx:          c.config.OBIProcessCtx,
@@ -166,6 +170,46 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start trace handling: %w", err)
 	}
 
+	if c.config.GPU {
+		if err := c.startGPU(ctx, trc); err != nil {
+			// GPU init must NOT take down the main profiler, so we continue.
+			// But the errors returned by startGPU are wiring failures (missing
+			// ProbeRegistrar, origin registration, GPU programs/maps absent
+			// from the tracer blob, ringbuf setup) — NOT benign "no GPU
+			// present" cases, which cupti handles gracefully (no-op attach
+			// scans, nil busy poller). The user explicitly requested --gpu, so
+			// surface this at Error level: the feature is on but will emit
+			// nothing.
+			log.Errorf("GPU profiling was requested but failed to start "+
+				"(profiler continues without it): %v", err)
+		}
+	}
+
+	return nil
+}
+
+// startGPU wires GPU profiling into the agent. Errors are non-fatal for the
+// caller: the main (CPU) profiler keeps running.
+func (c *Controller) startGPU(ctx context.Context, trc *tracer.Tracer) error {
+	pr, ok := c.reporter.(reporter.ProbeRegistrar)
+	if !ok {
+		return fmt.Errorf("reporter does not implement reporter.ProbeRegistrar")
+	}
+	h, err := cupti.Run(ctx, cupti.RunConfig{
+		Progs:          trc.EBPFPrograms(),
+		Maps:           trc.EBPFMaps(),
+		Reporter:       c.reporter,
+		Registrar:      pr,
+		AllocateOrigin: trc.AllocateCustomOrigin,
+	})
+	if err != nil {
+		return err
+	}
+	trc.ProcessManager().SetGPULaunchObserver(h.OnLaunchTrace)
+	trc.SetPIDEventHook(h.OnNewPID)
+	stop := h.Stop
+	c.gpuStop.Store(&stop)
+	log.Info("GPU profiling enabled")
 	return nil
 }
 
@@ -173,6 +217,14 @@ func (c *Controller) Start(ctx context.Context) error {
 func (c *Controller) Shutdown() {
 	c.shutdownOnceFn.Do(func() {
 		log.Info("Stop processing ...")
+
+		// Stop GPU profiling first: its final flush lands in the reporter's
+		// buffers while the report loop may still get a tick. (The reporter
+		// has no final-export-on-stop, so this is best effort.)
+		if stop := c.gpuStop.Load(); stop != nil {
+			(*stop)()
+		}
+
 		if c.cancelFunc != nil {
 			c.cancelFunc()
 		}

@@ -84,6 +84,7 @@ var (
 	bpffsHelp = fmt.Sprintf("Set the root BPF FS path for pinned maps. Only used for OBI span/trace ID communication. Default is %s",
 		defaultBPFFSRoot)
 	obiProcessCtxHelp = "Load or create a pinned eBPF map for sharing process context information with OBI."
+	gpuHelp           = "Enable GPU profiling (NVIDIA). Collects real per-kernel GPU timing from the CUPTI shim (libotelcupti.so) via its USDT probes, for processes that have it injected. Disabled by default."
 )
 
 // Package-scope variable, so that conditionally compiled other components can refer
@@ -153,6 +154,8 @@ func parseArgs() (*controller.Config, error) {
 	})
 
 	fs.BoolVar(&args.OBIProcessCtx, "obi-process-ctx", false, obiProcessCtxHelp)
+
+	fs.BoolVar(&args.GPU, "gpu", false, gpuHelp)
 
 	fs.BoolVar(&args.LoadProbe, "load-probe", false, loadProbeHelper)
 

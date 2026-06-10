@@ -30,6 +30,7 @@ import (
 	eim "go.opentelemetry.io/ebpf-profiler/processmanager/execinfomanager"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
+	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/times"
 	"go.opentelemetry.io/ebpf-profiler/tracer/types"
 	"go.opentelemetry.io/ebpf-profiler/traceutil"
@@ -342,6 +343,14 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 	cacheHit := uint64(0)
 
 	for frames := libpf.EbpfFrame(bpfTrace.FrameData); len(frames) > 0; frames = frames[frames.Length():] {
+		// A frame header always occupies >=1 word (header + varlen). A zero or
+		// over-long length nibble means malformed/garbage frame_data — guard
+		// against the otherwise-fatal frames[:0].Flags() panic (and the infinite
+		// loop the for-post would spin) instead of crashing the whole agent.
+		flen := int(frames.Length())
+		if flen == 0 || flen > len(frames) {
+			break
+		}
 		frame := frames[:frames.Length()]
 		if frame.Flags().Error() {
 			if !pm.filterErrorFrames {
@@ -389,7 +398,27 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 	trace.Hash = traceutil.HashTrace(trace)
 	meta.APMServiceName = pm.maybeNotifyAPMAgent(bpfTrace, trace.Hash, 1)
 
+	// TRACE_GPU traces carry a correlation id in meta.Value, not a metric:
+	// hand them to the GPU matcher (which owns GPU reporting) and never
+	// report them raw — even with no observer registered.
+	if meta.Origin == support.TraceOriginGPU {
+		if obs := pm.gpuLaunchObserver.Load(); obs != nil {
+			(*obs)(trace, meta)
+		}
+		return
+	}
+
 	if err := pm.traceReporter.ReportTraceEvent(trace, meta); err != nil {
 		log.Errorf("Failed to report trace event: %v", err)
 	}
+}
+
+// SetGPULaunchObserver registers (or, with nil, clears) the observer invoked
+// for every TRACE_GPU trace before it is reported. Safe to call concurrently.
+func (pm *ProcessManager) SetGPULaunchObserver(f GPULaunchObserver) {
+	if f == nil {
+		pm.gpuLaunchObserver.Store(nil)
+		return
+	}
+	pm.gpuLaunchObserver.Store(&f)
 }

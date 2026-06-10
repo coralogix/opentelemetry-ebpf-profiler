@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -139,6 +140,25 @@ type Tracer struct {
 	// Use Done() to obtain a read-only channel for use in select statements.
 	done     chan libpf.Void
 	doneOnce sync.Once
+
+	// customHooksMu guards customHooks for concurrent Enable() callers.
+	customHooksMu sync.Mutex
+	// customHooks holds links returned by custom probes loaded via Enable().
+	customHooks []link.Link
+	// probeOriginsCount is the number of custom probes registered so far.
+	// Used to assign monotonically increasing origin IDs starting after the
+	// last statically assigned origin.
+	probeOriginsCount atomic.Int64
+	// probeRegistrar is the reporter.ProbeRegistrar used to announce probe
+	// sample-type metadata. Set via SetProbeRegistrar before calling Enable.
+	probeRegistrar reporter.ProbeRegistrar
+	// systemVars holds resolved kernel offsets passed to probe Load() calls.
+	systemVars SystemVariables
+	// pidEventHook, if set, is invoked once for every newly-observed PID from
+	// the same goroutine that synchronizes processes. Probes (e.g. the GPU
+	// uprobe source) use it to attach at process-exec time, before the process
+	// loads its target libraries — far earlier than a periodic /proc rescan.
+	pidEventHook atomic.Pointer[func(libpf.PID)]
 }
 
 // Done returns a channel that is closed when the tracer encounters an
@@ -193,6 +213,9 @@ type Config struct {
 	// LoadProbe indicates whether the generic eBPF program should be loaded
 	// without being attached to something.
 	LoadProbe bool
+	// LoadGPU indicates whether the CUPTI GPU profiling eBPF programs
+	// (otel_cupti_on_launch, otel_cupti_kernel_executed) should be loaded.
+	LoadGPU bool
 	// BPFFSRoot is the root path to BPF filesystem for pinned maps and programs.
 	BPFFSRoot string
 	// OBIProcessCtx enable the use of a known shared eBPF map with OBI.
@@ -307,6 +330,17 @@ func (t *Tracer) Close() {
 			log.Errorf("Failed to close '%s/%s': %v", hookPoint.group, hookPoint.name, err)
 		}
 		delete(t.hooks, hookPoint)
+	}
+
+	// Close custom probe links registered via Enable().
+	t.customHooksMu.Lock()
+	hooks := t.customHooks
+	t.customHooks = nil
+	t.customHooksMu.Unlock()
+	for _, lk := range hooks {
+		if err := lk.Close(); err != nil {
+			log.Errorf("Failed to close custom probe link: %v", err)
+		}
 	}
 
 	t.processManager.Close()
@@ -457,7 +491,7 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 		return nil, nil, nil, fmt.Errorf("failed to load perf eBPF programs: %v", err)
 	}
 
-	if cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe {
+	if cfg.OffCPUThreshold > 0 || len(cfg.ProbeLinks) > 0 || cfg.LoadProbe || cfg.LoadGPU {
 		// Load the tail call destinations if any kind of event profiling is enabled.
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], tailCallProgs,
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
@@ -495,6 +529,27 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], probeProgs,
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to load uprobe eBPF programs: %v", err)
+		}
+	}
+
+	if cfg.LoadGPU {
+		// All otel_cupti_* programs (USDT consumers + API span probes); see
+		// support/ebpf/gpu_cupti.ebpf.c.
+		var gpuProgs []progLoaderHelper
+		for name := range coll.Programs {
+			if strings.HasPrefix(name, "otel_cupti_") {
+				gpuProgs = append(gpuProgs, progLoaderHelper{
+					name:             name,
+					noTailCallTarget: true,
+					enable:           true,
+				})
+			}
+		}
+		// Non-fatal: GPU profiling must not take down the CPU profiler (e.g.
+		// otel_cupti_api_* need bpf_get_attach_cookie, kernel 5.15+).
+		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], gpuProgs,
+			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
+			log.Warnf("Failed to load GPU eBPF programs, GPU profiling disabled: %v", err)
 		}
 	}
 
@@ -638,6 +693,11 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 	for mapName, mapSpec := range coll.Maps {
 		if mapName == "sched_times" && cfg.OffCPUThreshold == 0 {
 			// Off CPU Profiling is disabled. So do not load this map.
+			continue
+		}
+		if !cfg.LoadGPU && strings.HasPrefix(mapName, "cupti_") {
+			// GPU profiling disabled: skip its maps (28+ MiB of ringbufs).
+			// Their consumer programs are not loaded either.
 			continue
 		}
 		if mapName == obiSpanTracesMap {
@@ -1050,6 +1110,7 @@ func (t *Tracer) loadBpfTrace(raw []byte) (*libpf.EbpfTrace, error) {
 	case support.TraceOriginSampling:
 	case support.TraceOriginOffCPU:
 	case support.TraceOriginProbe:
+	case support.TraceOriginGPU:
 	default:
 		return nil, fmt.Errorf("origin %d: %w", trace.Origin, errOriginUnexpected)
 	}
@@ -1349,4 +1410,75 @@ func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 	// Reclaim the EbpfTrace
 	bpfTrace.KernelFrames = bpfTrace.KernelFrames[0:0]
 	t.tracePool.Put(bpfTrace)
+}
+
+// EBPFMaps returns the loaded BPF maps. The returned map MUST NOT be mutated.
+func (t *Tracer) EBPFMaps() map[string]*cebpf.Map {
+	return t.ebpfMaps
+}
+
+// EBPFPrograms returns the loaded BPF programs. See EBPFMaps for caveats.
+func (t *Tracer) EBPFPrograms() map[string]*cebpf.Program {
+	return t.ebpfProgs
+}
+
+// ProcessManager exposes the underlying process manager.
+func (t *Tracer) ProcessManager() *pm.ProcessManager {
+	return t.processManager
+}
+
+// SetProbeRegistrar wires the reporter.ProbeRegistrar used by Enable() to
+// announce dynamic probe origin metadata. Call before the first Enable().
+func (t *Tracer) SetProbeRegistrar(r reporter.ProbeRegistrar) {
+	t.probeRegistrar = r
+}
+
+// AllocateCustomOrigin reserves a fresh custom probe-origin ID (>= 0x11),
+// using the same counter as Enable(). Used by GPU profiling to register a
+// dedicated sample type without a full Probe.
+func (t *Tracer) AllocateCustomOrigin() libpf.Origin {
+	const customOriginBase = 0x10
+	return libpf.Origin(customOriginBase + uint32(t.probeOriginsCount.Add(1)))
+}
+
+// SetPIDEventHook registers a callback invoked once per newly-observed PID,
+// from the PID-event goroutine. Pass nil to clear. Used by probes that must
+// attach to a process as early as possible (at exec) rather than via polling.
+func (t *Tracer) SetPIDEventHook(h func(libpf.PID)) {
+	if h == nil {
+		t.pidEventHook.Store(nil)
+		return
+	}
+	t.pidEventHook.Store(&h)
+}
+
+// Enable loads a custom Probe, assigns it a unique origin ID, registers its
+// sample-type metadata with the reporter, and stores the returned link for
+// cleanup on Close(). Must be called after SetProbeRegistrar. Safe for
+// concurrent callers.
+func (t *Tracer) Enable(p Probe) error {
+	if t.probeRegistrar == nil {
+		return fmt.Errorf("tracer.Enable: SetProbeRegistrar must be called first")
+	}
+	// Custom probe origin IDs start at 0x11 (customOriginBase + first
+	// pre-incremented count of 1), leaving 0x0–0x0F for static origins
+	// (sampling=0x1, off-cpu=0x2, probe=0x3). The gap is intentional so adding
+	// static origins later does not collide with registered custom probes.
+	const customOriginBase = 0x10
+	originID := libpf.Origin(customOriginBase + uint32(t.probeOriginsCount.Add(1)))
+
+	lk, err := p.Load(originID, t.ebpfMaps, &t.systemVars)
+	if err != nil {
+		return fmt.Errorf("probe %T Load: %w", p, err)
+	}
+
+	if err := t.probeRegistrar.RegisterProbeOrigin(originID, p.ReportMetadata()); err != nil {
+		_ = lk.Close()
+		return fmt.Errorf("probe %T RegisterProbeOrigin: %w", p, err)
+	}
+
+	t.customHooksMu.Lock()
+	t.customHooks = append(t.customHooks, lk)
+	t.customHooksMu.Unlock()
+	return nil
 }

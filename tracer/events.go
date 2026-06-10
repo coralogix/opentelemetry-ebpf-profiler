@@ -10,7 +10,6 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/perf"
@@ -18,6 +17,7 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/support"
@@ -55,6 +55,9 @@ func (t *Tracer) processPIDEvents(ctx context.Context) {
 		select {
 		case pidTid := <-t.pidEvents:
 			t.processManager.SynchronizeProcess(process.New(pidTid.PID(), pidTid.TID()))
+			if h := t.pidEventHook.Load(); h != nil {
+				(*h)(pidTid.PID())
+			}
 		case <-pidCleanupTicker.C:
 			t.processManager.CleanupPIDs()
 		case <-ctx.Done():
@@ -79,7 +82,10 @@ func (t *Tracer) handleGenericPID() {
 // C structure in the received data is transformed to a Go structure and the event
 // handler is invoked.
 func (t *Tracer) triggerReportEvent(data []byte) {
-	event := (*support.Event)(unsafe.Pointer(&data[0]))
+	event, ok := pfunsafe.Read[support.Event](data)
+	if !ok {
+		return
+	}
 	switch event.Type {
 	case support.EventTypeGenericPID:
 		t.handleGenericPID()
@@ -169,6 +175,7 @@ func (t *Tracer) startTraceEventMonitor(ctx context.Context,
 		var data ringbuf.Record
 		var oldKTime, minKTime int64
 		var eventCount int
+		var malformedCount uint64
 
 		pollTicker := time.NewTicker(t.intervals.TracePollInterval())
 		defer pollTicker.Stop()
@@ -234,9 +241,16 @@ func (t *Tracer) startTraceEventMonitor(ctx context.Context,
 					log.Warnf("skip trace handling: %v", err)
 					continue
 				case errors.Is(err, errRecordTooSmall), errors.Is(err, errRecordUnexpectedSize):
-					log.Errorf("Stop receiving traces: %v", err)
-					t.signalDone()
-					return
+					// A truncated record (e.g. a very deep host stack overflowing
+					// the perf sample — common for GPU launch traces) must not
+					// take the profiler down. Skip it; log sparsely so a
+					// systematic blob/struct mismatch doesn't spam per record.
+					malformedCount++
+					if malformedCount == 1 || malformedCount%10000 == 0 {
+						log.Warnf("skipping malformed trace record (%d so far): %v",
+							malformedCount, err)
+					}
+					continue
 				default:
 					log.Warnf("unexpected error handling trace: %v", err)
 					continue

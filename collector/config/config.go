@@ -64,6 +64,9 @@ type Config struct {
 	BPFFSRoot              string        `mapstructure:"bpf_fs_root"`
 	ErrorMode              ErrorMode     `mapstructure:"error_mode"`
 	OBIProcessCtx          bool          `mapstructure:"obi_process_ctx"`
+	// GPU enables GPU profiling (currently NVIDIA only). When false, the GPU
+	// eBPF programs are not loaded and no CUPTI USDT probes are attached.
+	GPU bool `mapstructure:"gpu"`
 }
 
 // Validate validates the config.
