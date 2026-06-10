@@ -1,0 +1,44 @@
+name: "CI-GPU"
+
+# GPU profiling Go package (USDT attach + matcher). The eBPF consumers
+# (support/ebpf/gpu_cupti.ebpf.c) are part of the main tracer blob and are
+# covered by CI-EBPF's rebuild-and-diff check; the CUPTI shim / NCCL plugin
+# build matrix lives in gpu-shim.yml with its own narrower paths.
+on:
+  push:
+    branches: [main]
+    paths:
+      - gpu/**
+      - support/ebpf/gpu_cupti.ebpf.c
+      - .github/workflows/gpu.yml
+  pull_request:
+    branches: ["**"]
+    paths:
+      - gpu/**
+      - support/ebpf/gpu_cupti.ebpf.c
+      - .github/workflows/gpu.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test gpu/cupti (${{ matrix.target_arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { target_arch: amd64, runner: ubuntu-24.04 }
+          - { target_arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - name: Clone code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      # Includes the wire-layout pins that keep the Go decode in sync with the
+      # eBPF ringbuf records.
+      - name: Test
+        run: go test -v ./gpu/cupti/

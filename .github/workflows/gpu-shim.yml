@@ -1,0 +1,79 @@
+name: "CI-GPU-Shim"
+
+# The CUPTI shim + NCCL plugin build matrix. Separate workflow so Go-only GPU
+# changes don't rebuild four CUDA containers; paths cover exactly the shim
+# inputs.
+on:
+  push:
+    branches: [main]
+    paths:
+      - gpu/cupti/shim.c
+      - gpu/cupti/ncclprofiler.c
+      - gpu/cupti/usdt_probes.h
+      - gpu/cupti/nccl/**
+      - gpu/cupti/Makefile
+      - .github/workflows/gpu-shim.yml
+  pull_request:
+    branches: ["**"]
+    paths:
+      - gpu/cupti/shim.c
+      - gpu/cupti/ncclprofiler.c
+      - gpu/cupti/usdt_probes.h
+      - gpu/cupti/nccl/**
+      - gpu/cupti/Makefile
+      - .github/workflows/gpu-shim.yml
+
+permissions:
+  contents: read
+
+jobs:
+  shim:
+    # Builds the CUPTI injection shim per (arch, CUDA major) and runs `make
+    # check`: injection entry exported, USDT notes present, no libstdc++, and
+    # every probe's arg spec is the pinned single register (8@%rax / 8@x0) the
+    # eBPF consumers hard-code. A toolchain change that breaks the spec fails
+    # here instead of silently breaking correlation at runtime.
+    name: Shim (${{ matrix.arch }}, CUDA ${{ matrix.cuda }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, cuda: 13, runner: ubuntu-24.04,
+              img: nvidia/cuda:13.0.1-devel-ubuntu24.04 }
+          - { arch: amd64, cuda: 12, runner: ubuntu-24.04,
+              img: nvidia/cuda:12.6.3-devel-ubuntu24.04 }
+          - { arch: arm64, cuda: 13, runner: ubuntu-24.04-arm,
+              img: nvidia/cuda:13.0.1-devel-ubuntu24.04 }
+          - { arch: arm64, cuda: 12, runner: ubuntu-24.04-arm,
+              img: nvidia/cuda:12.6.3-devel-ubuntu24.04 }
+    steps:
+      - name: Clone code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # The COMMITTED blobs are what production injects; a stale or
+      # wrongly-built committed artifact would otherwise ship with green CI
+      # (the build below only checks its own fresh output, which overwrites
+      # the working copy — hence this step runs first).
+      - name: Check committed blobs
+        run: |
+          make -C gpu/cupti check-usdt \
+            SO=libotelcupti.${{ matrix.arch }}.cuda${{ matrix.cuda }}.so \
+            PROBES='error gpu_event gpu_mem kernel_executed on_launch'
+          make -C gpu/cupti check-usdt \
+            SO=libotelnccl.${{ matrix.arch }}.so PROBES=gpu_event
+      - name: Build and check shim
+        run: |
+          make -C gpu/cupti docker ARCH=${{ matrix.arch }} CUDA=${{ matrix.cuda }} \
+            IMG=${{ matrix.img }}
+      - name: Upload shim
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libotelcupti.${{ matrix.arch }}.cuda${{ matrix.cuda }}.so
+          path: gpu/cupti/libotelcupti.${{ matrix.arch }}.cuda${{ matrix.cuda }}.so
+      # The NCCL plugin is CUDA-independent; one upload per arch avoids the
+      # duplicate-artifact-name collision between the two CUDA legs.
+      - name: Upload NCCL plugin
+        if: matrix.cuda == 13
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libotelnccl.${{ matrix.arch }}.so
+          path: gpu/cupti/libotelnccl.${{ matrix.arch }}.so
