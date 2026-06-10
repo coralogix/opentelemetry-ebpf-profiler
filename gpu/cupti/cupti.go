@@ -10,7 +10,7 @@
 // NCCL ops, API spans). A correlation matcher joins GPU-side records to the
 // host stack captured at the launch site (on_launch → collect_trace,
 // TRACE_GPU, correlation id in the trace value).
-package cupti
+package cupti // import "go.opentelemetry.io/ebpf-profiler/gpu/cupti"
 
 import (
 	"bufio"

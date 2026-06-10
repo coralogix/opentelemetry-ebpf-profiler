@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-package cupti
+package cupti // import "go.opentelemetry.io/ebpf-profiler/gpu/cupti"
 
 import (
 	"strings"

@@ -93,18 +93,12 @@ const (
 )
 
 const (
-	TraceOriginUnknown  = 0x0
-	TraceOriginSampling = 0x1
-	TraceOriginOffCPU   = 0x2
-	TraceOriginProbe    = 0x3
-	// TraceOriginGPU carries a CUDA kernel's host launch stack with a synthetic
-	// GPU-kernel leaf frame; its value is the kernel's GPU execution time in
-	// nanoseconds (gpu_cupti.ebpf.c + gpu/cupti). TraceOriginGPUMetric is
-	// reserved for future GPU metric samples.
+	TraceOriginUnknown   = 0x0
+	TraceOriginSampling  = 0x1
+	TraceOriginOffCPU    = 0x2
+	TraceOriginProbe     = 0x3
 	TraceOriginGPU       = 0x4
 	TraceOriginGPUMetric = 0x5
-	// 0x06–0x0F reserved for future static origins.
-	// Custom probe origins start at 0x10 (assigned dynamically by tracer.Enable).
 )
 
 type ApmSpanID [8]byte

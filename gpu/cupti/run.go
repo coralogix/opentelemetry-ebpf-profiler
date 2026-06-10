@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-package cupti
+package cupti // import "go.opentelemetry.io/ebpf-profiler/gpu/cupti"
 
 import (
 	"context"
@@ -181,8 +181,10 @@ func listPIDs() []int {
 	}
 	pids := make([]int, 0, len(ents))
 	for _, e := range ents {
-		if pid, err := strconv.Atoi(e.Name()); err == nil {
-			pids = append(pids, pid)
+		// ParseUint with bitSize 32: PIDs always fit, and downstream uint32
+		// conversions stay provably in range.
+		if pid, err := strconv.ParseUint(e.Name(), 10, 32); err == nil {
+			pids = append(pids, int(pid))
 		}
 	}
 	return pids

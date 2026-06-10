@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-package cupti
+package cupti // import "go.opentelemetry.io/ebpf-profiler/gpu/cupti"
 
 // apiSymbols is the curated set of cuDNN/cuBLAS entry points instrumented
 // with enter/exit span probes. The slice index is the eBPF attach cookie

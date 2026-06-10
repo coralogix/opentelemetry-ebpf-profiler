@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-package cupti
+package cupti // import "go.opentelemetry.io/ebpf-profiler/gpu/cupti"
 
 import (
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -480,6 +481,9 @@ func (m *Matcher) PruneDeadPIDs(dead []int) {
 	}
 	deadSet := make(map[libpf.PID]struct{}, len(dead))
 	for _, p := range dead {
+		if p <= 0 || p > math.MaxUint32 {
+			continue
+		}
 		deadSet[libpf.PID(p)] = struct{}{}
 		m.tp.ForgetPID(uint32(p))
 	}

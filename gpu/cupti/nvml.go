@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-package cupti
+package cupti // import "go.opentelemetry.io/ebpf-profiler/gpu/cupti"
 
 import (
 	"context"
@@ -61,7 +61,7 @@ func (b *BusyPoller) poll() {
 		if len(f) < 4 {
 			continue
 		}
-		pid, err := strconv.Atoi(f[1])
+		pid, err := strconv.ParseUint(f[1], 10, 32)
 		if err != nil || pid == 0 {
 			continue
 		}
