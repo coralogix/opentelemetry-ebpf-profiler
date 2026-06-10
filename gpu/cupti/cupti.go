@@ -659,5 +659,10 @@ func scanLibs(pid int) (map[string]string, error) {
 			out[key] = path
 		}
 	}
+	// A mid-stream scan failure means partial results: the shim could be in
+	// the unread remainder, so it must not be reported as "not mapped".
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }

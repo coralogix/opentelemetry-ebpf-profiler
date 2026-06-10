@@ -152,8 +152,6 @@ type Tracer struct {
 	// probeRegistrar is the reporter.ProbeRegistrar used to announce probe
 	// sample-type metadata. Set via SetProbeRegistrar before calling Enable.
 	probeRegistrar reporter.ProbeRegistrar
-	// systemVars holds resolved kernel offsets passed to probe Load() calls.
-	systemVars SystemVariables
 	// pidEventHook, if set, is invoked once for every newly-observed PID from
 	// the same goroutine that synchronizes processes. Probes (e.g. the GPU
 	// uprobe source) use it to attach at process-exec time, before the process
@@ -546,10 +544,24 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 			}
 		}
 		// Non-fatal: GPU profiling must not take down the CPU profiler (e.g.
-		// otel_cupti_api_* need bpf_get_attach_cookie, kernel 5.15+).
+		// otel_cupti_api_* need bpf_get_attach_cookie, kernel 5.15+). But
+		// "disabled" must not leak the GPU ringbufs (tens of MiB of kernel
+		// memory), so tear the cupti_ maps down with the failed programs.
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], gpuProgs,
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
 			log.Warnf("Failed to load GPU eBPF programs, GPU profiling disabled: %v", err)
+			for name, m := range ebpfMaps {
+				if strings.HasPrefix(name, "cupti_") {
+					_ = m.Close()
+					delete(ebpfMaps, name)
+				}
+			}
+			for name, p := range ebpfProgs {
+				if strings.HasPrefix(name, "otel_cupti_") {
+					_ = p.Close()
+					delete(ebpfProgs, name)
+				}
+			}
 		}
 	}
 
@@ -1462,12 +1474,13 @@ func (t *Tracer) Enable(p Probe) error {
 	}
 	// Custom probe origin IDs start at 0x11 (customOriginBase + first
 	// pre-incremented count of 1), leaving 0x0–0x0F for static origins
-	// (sampling=0x1, off-cpu=0x2, probe=0x3). The gap is intentional so adding
-	// static origins later does not collide with registered custom probes.
+	// (sampling=0x1, off-cpu=0x2, probe=0x3, gpu=0x4, gpu-metric=0x5; see
+	// support.TraceOrigin*). The gap is intentional so adding static origins
+	// later does not collide with registered custom probes.
 	const customOriginBase = 0x10
 	originID := libpf.Origin(customOriginBase + uint32(t.probeOriginsCount.Add(1)))
 
-	lk, err := p.Load(originID, t.ebpfMaps, &t.systemVars)
+	lk, err := p.Load(originID, t.ebpfMaps)
 	if err != nil {
 		return fmt.Errorf("probe %T Load: %w", p, err)
 	}
