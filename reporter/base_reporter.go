@@ -6,6 +6,7 @@ package reporter // import "go.opentelemetry.io/ebpf-profiler/reporter"
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -38,6 +39,17 @@ type baseReporter struct {
 	// Initialized when Start() is called. The duration of the first profile may be
 	// slightly overestimated as it includes tracer setup time before samples arrive.
 	collectionStartTime time.Time
+
+	// probeOriginsMu guards probeOrigins and probeOriginsVersion.
+	probeOriginsMu sync.RWMutex
+	// probeOrigins holds metadata for dynamically registered probe origins
+	// (registered via RegisterProbeOrigin).
+	probeOrigins map[libpf.Origin]samples.ProbeOriginMetadata
+	// probeOriginsVersion is incremented on every RegisterProbeOrigin call.
+	// syncProbeOriginsToPdata uses it to skip the copy when nothing changed.
+	probeOriginsVersion uint64
+	// probeOriginsLastVer is the version last synced to pdata.ProbeOrigins.
+	probeOriginsLastVer uint64
 }
 
 var errUnknownOrigin = errors.New("unknown trace origin")
@@ -46,14 +58,56 @@ func (b *baseReporter) Stop() {
 	b.runLoop.Stop()
 }
 
+// RegisterProbeOrigin implements reporter.ProbeRegistrar.
+func (b *baseReporter) RegisterProbeOrigin(origin libpf.Origin, meta samples.ProbeOriginMetadata) error {
+	b.probeOriginsMu.Lock()
+	defer b.probeOriginsMu.Unlock()
+	if b.probeOrigins == nil {
+		b.probeOrigins = make(map[libpf.Origin]samples.ProbeOriginMetadata)
+	}
+	b.probeOrigins[origin] = meta
+	b.probeOriginsVersion++
+	return nil
+}
+
+// syncProbeOriginsToPdata copies the current probe origin map into p.ProbeOrigins
+// so that the next Generate() call emits correct sample types for custom probes.
+// Call this immediately before Generate(). The copy is skipped when the set of
+// registered origins has not changed since the last sync (common case after startup).
+func (b *baseReporter) syncProbeOriginsToPdata() {
+	b.probeOriginsMu.RLock()
+	ver := b.probeOriginsVersion
+	b.probeOriginsMu.RUnlock()
+
+	if ver == b.probeOriginsLastVer {
+		return
+	}
+
+	b.probeOriginsMu.RLock()
+	defer b.probeOriginsMu.RUnlock()
+	out := make(map[libpf.Origin]samples.ProbeOriginMetadata, len(b.probeOrigins))
+	for k, v := range b.probeOrigins {
+		out[k] = v
+	}
+	b.pdata.ProbeOrigins = out
+	b.probeOriginsLastVer = ver
+}
+
 func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error {
 	switch meta.Origin {
 	case support.TraceOriginSampling:
 	case support.TraceOriginOffCPU:
 	case support.TraceOriginProbe:
+	case support.TraceOriginGPU:
 	default:
-		return fmt.Errorf("skip reporting trace for %d origin: %w", meta.Origin,
-			errUnknownOrigin)
+		// Accept dynamically registered probe origins.
+		b.probeOriginsMu.RLock()
+		_, known := b.probeOrigins[meta.Origin]
+		b.probeOriginsMu.RUnlock()
+		if !known {
+			return fmt.Errorf("skip reporting trace for %d origin: %w", meta.Origin,
+				errUnknownOrigin)
+		}
 	}
 
 	var extraMeta any

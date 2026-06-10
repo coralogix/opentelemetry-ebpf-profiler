@@ -6,6 +6,7 @@ package pdata // import "go.opentelemetry.io/ebpf-profiler/reporter/internal/pda
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -79,6 +80,16 @@ func (p *Pdata) Generate(tree samples.TraceEventsTree,
 
 	attrMgr := samples.NewAttrTableManager(stringSet, dic.AttributeTable())
 
+	// Build a stable, sorted list of all dynamic probe origins so that
+	// Generate() produces deterministic profile ordering across runs.
+	dynamicOrigins := make([]libpf.Origin, 0, len(p.ProbeOrigins))
+	for origin := range p.ProbeOrigins {
+		dynamicOrigins = append(dynamicOrigins, origin)
+	}
+	sort.Slice(dynamicOrigins, func(i, j int) bool {
+		return dynamicOrigins[i] < dynamicOrigins[j]
+	})
+
 	for resource, toEvents := range tree {
 		if len(toEvents.Events) == 0 {
 			continue
@@ -93,13 +104,26 @@ func (p *Pdata) Generate(tree samples.TraceEventsTree,
 		sp.Scope().SetVersion(agentVersion)
 		sp.SetSchemaUrl(semconv.SchemaURL)
 
-		for _, origin := range []libpf.Origin{
+		// Static origins first, then dynamic probe origins in stable order.
+		origins := []libpf.Origin{
 			support.TraceOriginSampling,
 			support.TraceOriginOffCPU,
 			support.TraceOriginProbe,
-		} {
+			support.TraceOriginGPU,
+		}
+		origins = append(origins, dynamicOrigins...)
+
+		for _, origin := range origins {
 			if len(toEvents.Events[origin]) == 0 {
 				// Do not append empty profiles.
+				continue
+			}
+			if !p.originSupported(origin) {
+				// An origin with events but no registered sample type (e.g. a
+				// dynamic probe origin whose metadata has not yet synced). Skip
+				// just this profile rather than failing the whole report, which
+				// would drop every other profile too.
+				log.Errorf("skipping profile for unsupported origin %d", origin)
 				continue
 			}
 
@@ -135,6 +159,21 @@ func (p *Pdata) Generate(tree samples.TraceEventsTree,
 	return profiles, nil
 }
 
+// originSupported reports whether setProfile can assign a sample type for the
+// origin: the three static origins are always supported, and a dynamic probe
+// origin is supported once its metadata has been registered via
+// RegisterProbeOrigin (mirrored into ProbeOrigins).
+func (p *Pdata) originSupported(origin libpf.Origin) bool {
+	switch origin {
+	case support.TraceOriginSampling, support.TraceOriginOffCPU, support.TraceOriginProbe,
+		support.TraceOriginGPU:
+		return true
+	default:
+		_, ok := p.ProbeOrigins[origin]
+		return ok
+	}
+}
+
 // setProfile sets the data an OTLP profile with all collected samples up to
 // this moment.
 func (p *Pdata) setProfile(
@@ -167,17 +206,32 @@ func (p *Pdata) setProfile(
 	case support.TraceOriginProbe:
 		st.SetTypeStrindex(stringSet.Add("events"))
 		st.SetUnitStrindex(stringSet.Add("count"))
+	case support.TraceOriginGPU:
+		// Sampled host stacks at CUDA launch sites; each sample's Value is the
+		// sample rate, so the summed count approximates total kernel launches.
+		st.SetTypeStrindex(stringSet.Add("gpu_kernel_launches"))
+		st.SetUnitStrindex(stringSet.Add("count"))
 	default:
-		// Should never happen
-		return fmt.Errorf("generating profile for unsupported origin %d", origin)
+		// Dynamic probe origin registered via RegisterProbeOrigin.
+		if meta, ok := p.ProbeOrigins[origin]; ok {
+			st.SetTypeStrindex(stringSet.Add(meta.Typ))
+			st.SetUnitStrindex(stringSet.Add(meta.Unit))
+		} else {
+			return fmt.Errorf("generating profile for unsupported origin %d", origin)
+		}
 	}
 
 	for sampleKey, traceInfo := range events {
 		sample := profile.Samples().AppendEmpty()
 
 		sample.TimestampsUnixNano().FromRaw(traceInfo.Timestamps)
-		if origin == support.TraceOriginOffCPU {
+		switch origin {
+		case support.TraceOriginOffCPU, support.TraceOriginGPU:
 			sample.Values().Append(traceInfo.Values...)
+		default:
+			if meta, ok := p.ProbeOrigins[origin]; ok && meta.ReportValues {
+				sample.Values().Append(traceInfo.Values...)
+			}
 		}
 
 		if sampleKey.SpanID != libpf.InvalidAPMSpanID &&
