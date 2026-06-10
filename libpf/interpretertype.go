@@ -37,6 +37,10 @@ const (
 	Go InterpreterType = support.FrameMarkerGo
 	// BEAM identifies the BEAM interpreter.
 	BEAM InterpreterType = support.FrameMarkerBEAM
+	// GPUKernel identifies a synthetic GPU kernel frame.
+	GPUKernel InterpreterType = support.FrameMarkerGPUKernel
+	// GPUMetric identifies a synthetic GPU utilisation/metric frame.
+	GPUMetric InterpreterType = support.FrameMarkerGPUMetric
 )
 
 // Pseudo-interpreters without a corresponding frame type.
@@ -75,9 +79,11 @@ var interpreterTypeToString = map[InterpreterType]string{
 	Dotnet:   "dotnet",
 	BEAM:     "beam",
 	APMInt:   "apm-integration",
-	LuaJIT:   "luajit",
-	Go:       "go",
-	GoLabels: "go-labels",
+	LuaJIT:    "luajit",
+	Go:        "go",
+	GoLabels:  "go-labels",
+	GPUKernel: "gpu-kernel",
+	GPUMetric: "gpu-metric",
 }
 
 var stringToInterpreterType = make(map[string]InterpreterType, len(interpreterTypeToString))

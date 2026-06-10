@@ -35,6 +35,10 @@
 #define FRAME_MARKER_BEAM    0xC
 // Indicates a LuaJIT frame
 #define FRAME_MARKER_LUAJIT  0xD
+// Indicates a synthetic GPU kernel frame.
+#define FRAME_MARKER_GPU_KERNEL 0xE
+// Indicates a synthetic GPU utilisation/metric frame.
+#define FRAME_MARKER_GPU_METRIC 0xF
 
 // Frame flags
 // Indicates that this frame is an error frame.

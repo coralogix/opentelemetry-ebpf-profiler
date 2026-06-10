@@ -55,6 +55,12 @@ const (
 	BEAMFrame FrameType = support.FrameMarkerBEAM
 	// LuaJITFrame identifies the LuaJIT interpreter frames.
 	LuaJITFrame FrameType = support.FrameMarkerLuaJIT
+	// GPUKernelFrame identifies a synthetic GPU kernel frame produced by
+	// the gpu package (e.g. cuLaunchKernel uprobe).
+	GPUKernelFrame FrameType = support.FrameMarkerGPUKernel
+	// GPUMetricFrame identifies a synthetic GPU utilisation frame produced by
+	// the gpu package (e.g. NVML poll).
+	GPUMetricFrame FrameType = support.FrameMarkerGPUMetric
 )
 
 const (
