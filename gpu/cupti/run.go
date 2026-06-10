@@ -181,9 +181,9 @@ func listPIDs() []int {
 	}
 	pids := make([]int, 0, len(ents))
 	for _, e := range ents {
-		// ParseUint with bitSize 32: PIDs always fit, and downstream uint32
-		// conversions stay provably in range.
-		if pid, err := strconv.ParseUint(e.Name(), 10, 32); err == nil {
+		// bitSize 31: PIDs always fit (kernel max is 2^22), and the result is
+		// provably in range for both int and the downstream uint32 conversions.
+		if pid, err := strconv.ParseUint(e.Name(), 10, 31); err == nil {
 			pids = append(pids, int(pid))
 		}
 	}

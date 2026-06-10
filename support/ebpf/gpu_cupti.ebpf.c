@@ -114,7 +114,7 @@ struct cupti_api_starts_t {
 
 static void *(*bpf_ringbuf_reserve_)(void *ringbuf, u64 size, u64 flags) = (void *)
   BPF_FUNC_ringbuf_reserve;
-static void (*bpf_ringbuf_submit_)(void *data, u64 flags) = (void *)BPF_FUNC_ringbuf_submit;
+static void (*bpf_ringbuf_submit_)(void *data, u64 flags)  = (void *)BPF_FUNC_ringbuf_submit;
 static void (*bpf_ringbuf_discard_)(void *data, u64 flags) = (void *)BPF_FUNC_ringbuf_discard;
 static long (*bpf_probe_read_user_str_)(void *dst, u32 size, const void *unsafe_ptr) = (void *)
   BPF_FUNC_probe_read_user_str;
@@ -123,7 +123,8 @@ static u64 (*bpf_get_attach_cookie_)(void *ctx) = (void *)BPF_FUNC_get_attach_co
 // otelcupti:on_launch — capture the host stack at a tracked CUDA call site,
 // keyed by the correlation id (first field of otelcupti_launch_rec).
 SEC("uprobe/otelcupti_on_launch")
-int otel_cupti_on_launch(struct pt_regs *ctx) {
+int otel_cupti_on_launch(struct pt_regs *ctx)
+{
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 pid      = pid_tgid >> 32;
   u32 tid      = pid_tgid & 0xFFFFFFFF;
@@ -169,26 +170,27 @@ _Static_assert(sizeof(GPUShimError) == 128, "pin: gpu/cupti.ShimError (seSize)")
 
 // FORWARD_PROBE(name, ringbuf): read the probe's record into a name_##_wire
 // and submit it; an unreadable record is discarded outright.
-#define FORWARD_PROBE(name_, ringbuf_)                                   \
-  SEC("uprobe/otelcupti_" #name_)                                        \
-  int otel_cupti_##name_(struct pt_regs *ctx) {                          \
-    u32 pid = bpf_get_current_pid_tgid() >> 32;                          \
-    u64 recp = OTELCUPTI_REC_PTR(ctx);                                   \
-    if (pid == 0 || recp == 0) {                                         \
-      return 0;                                                          \
-    }                                                                    \
-    struct name_##_wire *ev = bpf_ringbuf_reserve_(&ringbuf_, sizeof(*ev), 0); \
-    if (!ev) {                                                           \
-      return 0;                                                          \
-    }                                                                    \
-    if (bpf_probe_read_user(&ev->rec, sizeof(ev->rec), (void *)recp)) {  \
-      bpf_ringbuf_discard_(ev, 0);                                       \
-      return 0;                                                          \
-    }                                                                    \
-    ev->pid  = pid;                                                      \
-    ev->_pad = 0;                                                        \
-    bpf_ringbuf_submit_(ev, 0);                                          \
-    return 0;                                                            \
+#define FORWARD_PROBE(name_, ringbuf_)                                                             \
+  SEC("uprobe/otelcupti_" #name_)                                                                  \
+  int otel_cupti_##name_(struct pt_regs *ctx)                                                      \
+  {                                                                                                \
+    u32 pid  = bpf_get_current_pid_tgid() >> 32;                                                   \
+    u64 recp = OTELCUPTI_REC_PTR(ctx);                                                             \
+    if (pid == 0 || recp == 0) {                                                                   \
+      return 0;                                                                                    \
+    }                                                                                              \
+    struct name_##_wire *ev = bpf_ringbuf_reserve_(&ringbuf_, sizeof(*ev), 0);                     \
+    if (!ev) {                                                                                     \
+      return 0;                                                                                    \
+    }                                                                                              \
+    if (bpf_probe_read_user(&ev->rec, sizeof(ev->rec), (void *)recp)) {                            \
+      bpf_ringbuf_discard_(ev, 0);                                                                 \
+      return 0;                                                                                    \
+    }                                                                                              \
+    ev->pid  = pid;                                                                                \
+    ev->_pad = 0;                                                                                  \
+    bpf_ringbuf_submit_(ev, 0);                                                                    \
+    return 0;                                                                                      \
   }
 
 FORWARD_PROBE(kernel_executed, cupti_events)
@@ -198,7 +200,8 @@ FORWARD_PROBE(gpu_event, cupti_misc_events)
 // otelcupti:error — copy the static message in-probe so the Go side needs no
 // /proc/<pid>/mem read for a process that may be shutting down.
 SEC("uprobe/otelcupti_error")
-int otel_cupti_error(struct pt_regs *ctx) {
+int otel_cupti_error(struct pt_regs *ctx)
+{
   u32 pid  = bpf_get_current_pid_tgid() >> 32;
   u64 recp = OTELCUPTI_REC_PTR(ctx);
   if (pid == 0 || recp == 0) {
@@ -227,7 +230,8 @@ int otel_cupti_error(struct pt_regs *ctx) {
 #define GPU_EVENT_KIND_API 11
 
 SEC("uprobe/otelcupti_api_enter")
-int otel_cupti_api_enter(struct pt_regs *ctx) {
+int otel_cupti_api_enter(struct pt_regs *ctx)
+{
   u64 pid_tgid = bpf_get_current_pid_tgid();
   if ((pid_tgid >> 32) == 0) {
     return 0;
@@ -244,7 +248,8 @@ int otel_cupti_api_enter(struct pt_regs *ctx) {
 }
 
 SEC("uprobe/otelcupti_api_exit")
-int otel_cupti_api_exit(struct pt_regs *ctx) {
+int otel_cupti_api_exit(struct pt_regs *ctx)
+{
   (void)ctx;
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 pid      = pid_tgid >> 32;
