@@ -12,11 +12,10 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 )
 
-// NameCache resolves and memoises strings (kernel names, NVTX ranges, stall
-// reasons) the shim passes as pointers into the workload's address space.
-// CUPTI keeps these strings alive for the process lifetime, so caching by
-// (pid, ptr) is safe; ForgetPID drops entries when a PID exits so a reused
-// PID cannot resolve stale memory.
+// NameCache resolves and memoises strings the shim passes as pointers into
+// the workload's address space. CUPTI keeps them alive for the process
+// lifetime, so caching by (pid, ptr) is safe — as long as entries die with
+// the PID (ForgetPID/Sweep), or a reused PID would resolve stale memory.
 type NameCache struct {
 	mu    sync.RWMutex
 	cache map[nameKey]string
@@ -42,8 +41,8 @@ func (nc *NameCache) ForgetPID(pid uint32) {
 	nc.mu.Unlock()
 }
 
-// Sweep drops entries whose PID is not in live (late events can repopulate a
-// pruned PID's entries; a reused PID must not resolve stale memory).
+// Sweep drops entries for non-live PIDs (late events repopulate after a
+// prune).
 func (nc *NameCache) Sweep(live map[int]struct{}) {
 	nc.mu.Lock()
 	for k := range nc.cache {
@@ -74,8 +73,8 @@ func (nc *NameCache) resolveName(pid uint32, ptr uint64) string {
 	return name
 }
 
-// demangleKernel demangles an Itanium C++ symbol, dropping template/parameter
-// detail (flamegraph labels). No-op for already-clean names.
+// demangleKernel demangles an Itanium C++ symbol, dropping template and
+// parameter detail. No-op for already-clean names.
 func demangleKernel(s string) string {
 	if !strings.HasPrefix(s, "_Z") {
 		return s

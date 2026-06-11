@@ -1,25 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// gpu_cupti.ebpf.c — GPU profiling: consume the otelcupti USDT probes emitted
-// by the CUPTI shim (libotelcupti.so) and the NCCL plugin (libotelnccl.so).
-//
-//   on_launch       → collect_trace(TRACE_GPU): host stack, correlation id in
-//                     the trace value
-//   kernel_executed → cupti_events ringbuf
-//   gpu_mem         → cupti_mem_events ringbuf
-//   gpu_event       → cupti_misc_events ringbuf (UVM/allocs/memsets/stalls/NCCL)
-//   error           → cupti_errors ringbuf
+// gpu_cupti.ebpf.c — consume the otelcupti USDT probes of the CUPTI shim and
+// NCCL plugin:
+//   on_launch       → collect_trace(TRACE_GPU), correlation id as trace value
+//   kernel_executed → cupti_events
+//   gpu_mem         → cupti_mem_events
+//   gpu_event       → cupti_misc_events (UVM/allocs/memsets/stalls/NCCL)
+//   error           → cupti_errors
 // plus eBPF-native cuDNN/cuBLAS API spans (api_enter/api_exit uprobe pairs).
-//
 // Map names share the cupti_ prefix: the tracer gates GPU map loading on it.
 
 #include "bpfdefs.h"
 #include "tracemgmt.h"
 #include "types.h"
 
-// Every otelcupti probe passes a single struct pointer pinned to a fixed
-// register (shim's OTELCUPTI_PROBE1_PINNED, see gpu/cupti/usdt_probes.h).
-// The Go side verifies the spec at attach time.
+// Every otelcupti probe passes one struct pointer pinned to a fixed register
+// (see usdt_probes.h); the Go side verifies the spec at attach.
 #if defined(__x86_64__)
   #define OTELCUPTI_REC_PTR(ctx) ((ctx)->ax)
 #elif defined(__aarch64__)
@@ -28,9 +24,8 @@
   #error "unsupported architecture for otelcupti USDT consumers"
 #endif
 
-// Mirrors of the otelcupti_*_rec structs in gpu/cupti/usdt_probes.h; keep
-// layouts identical. The ringbuf wire records append {pid, _pad} at the tail
-// (see FORWARD_PROBE); Go-side layouts are pinned by tests.
+// Mirrors of the otelcupti_*_rec structs in usdt_probes.h; keep layouts
+// identical.
 struct otelcupti_kernel_rec {
   u64 start;
   u64 end;
@@ -69,9 +64,8 @@ struct otelcupti_error_rec {
   u64 msg_ptr;
 };
 
-// 16 MiB: CUPTI flushes activity records in big bursts (a whole 8 MiB
-// activity buffer back-to-back); kernel timing is the authoritative total and
-// is not sampled, so the ringbuf is sized to not drop.
+// 16 MiB: CUPTI flushes whole 8 MiB activity buffers back-to-back, and
+// kernel timing is the authoritative total — sized to not drop.
 struct cupti_events_t {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
   __uint(max_entries, 1 << 24); // 16 MiB
@@ -92,8 +86,7 @@ struct cupti_errors_t {
   __uint(max_entries, 1 << 16); // 64 KiB, rare
 } cupti_errors SEC(".maps");
 
-// Shim-side error wire record: the message is copied in-probe (the source is
-// a static string in the shim). Pinned to gpu/cupti.ShimError decode.
+// Shim-side error wire record; the message is copied in-probe.
 typedef struct GPUShimError {
   s32 code;
   u32 pid;
@@ -120,8 +113,8 @@ static long (*bpf_probe_read_user_str_)(void *dst, u32 size, const void *unsafe_
   BPF_FUNC_probe_read_user_str;
 static u64 (*bpf_get_attach_cookie_)(void *ctx) = (void *)BPF_FUNC_get_attach_cookie;
 
-// otelcupti:on_launch — capture the host stack at a tracked CUDA call site,
-// keyed by the correlation id (first field of otelcupti_launch_rec).
+// on_launch: capture the host stack, keyed by the correlation id (offset 0
+// of otelcupti_launch_rec).
 SEC("uprobe/otelcupti_on_launch")
 int otel_cupti_on_launch(struct pt_regs *ctx)
 {
@@ -142,8 +135,7 @@ int otel_cupti_on_launch(struct pt_regs *ctx)
   return collect_trace(ctx, TRACE_GPU, pid, tid, bpf_ktime_get_ns(), corr);
 }
 
-// Wire records: the probe's record plus {pid, _pad} at the tail. Layouts are
-// pinned by the Go tests (gpu/cupti.KernelTiming/MemTiming/GPUEvent).
+// Wire records: the probe's record plus {pid, _pad} at the tail.
 struct kernel_executed_wire {
   struct otelcupti_kernel_rec rec;
   u32 pid;
@@ -160,9 +152,8 @@ struct gpu_event_wire {
   u32 _pad;
 };
 
-// The Go decode casts the raw ringbuf sample to these exact sizes; the same
-// values are pinned Go-side (gpu/cupti wire tests) and shim-side
-// (usdt_probes.h asserts), so drift on any of the three fails a build.
+// Wire sizes are pinned on all three sides (shim asserts, these, Go tests);
+// drift anywhere fails a build.
 _Static_assert(sizeof(struct kernel_executed_wire) == 56, "pin: gpu/cupti.KernelTiming");
 _Static_assert(sizeof(struct gpu_mem_wire) == 56, "pin: gpu/cupti.MemTiming");
 _Static_assert(sizeof(struct gpu_event_wire) == 56, "pin: gpu/cupti.GPUEvent");
@@ -197,8 +188,8 @@ FORWARD_PROBE(kernel_executed, cupti_events)
 FORWARD_PROBE(gpu_mem, cupti_mem_events)
 FORWARD_PROBE(gpu_event, cupti_misc_events)
 
-// otelcupti:error — copy the static message in-probe so the Go side needs no
-// /proc/<pid>/mem read for a process that may be shutting down.
+// error: copy the static message in-probe — the Go side must not need a
+// /proc/<pid>/mem read from a process that may be exiting.
 SEC("uprobe/otelcupti_error")
 int otel_cupti_error(struct pt_regs *ctx)
 {
@@ -225,8 +216,7 @@ int otel_cupti_error(struct pt_regs *ctx)
   return 0;
 }
 
-// Mirror of OTELCUPTI_EV_API_SPAN (usdt_probes.h) / EvAPISpan (Go) — the
-// shared otelcupti_event_kind namespace; usdt_probes.h is the owner.
+// Mirror of OTELCUPTI_EV_API_SPAN (usdt_probes.h) / EvAPISpan (Go).
 #define GPU_EVENT_KIND_API 11
 
 SEC("uprobe/otelcupti_api_enter")
@@ -239,10 +229,8 @@ int otel_cupti_api_enter(struct pt_regs *ctx)
   struct api_start_t st;
   st.ts     = bpf_ktime_get_ns();
   st.cookie = bpf_get_attach_cookie_(ctx);
-  // NOEXIST: instrumented APIs nest (cublasGemmEx → cublasLtMatmul); keep the
-  // outermost span and ignore inner ones (the exit pairs by cookie).
-  // Best-effort under LRU pressure: eviction of a live outer entry lets an
-  // inner call claim the slot, mis-attributing that one span.
+  // NOEXIST: instrumented APIs nest; keep the outermost span (the exit pairs
+  // by cookie). Best-effort under LRU eviction.
   bpf_map_update_elem(&cupti_api_starts, &pid_tgid, &st, BPF_NOEXIST);
   return 0;
 }

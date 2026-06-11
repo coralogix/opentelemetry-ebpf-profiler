@@ -28,11 +28,9 @@ permissions:
 
 jobs:
   shim:
-    # Builds the CUPTI injection shim per (arch, CUDA major) and runs `make
-    # check`: injection entry exported, USDT notes present, no libstdc++, and
-    # every probe's arg spec is the pinned single register (8@%rax / 8@x0) the
-    # eBPF consumers hard-code. A toolchain change that breaks the spec fails
-    # here instead of silently breaking correlation at runtime.
+    # Builds the shim per (arch, CUDA major) and runs `make check`: a
+    # toolchain change that breaks the pinned USDT specs fails here instead
+    # of silently breaking correlation at runtime.
     name: Shim (${{ matrix.arch }}, CUDA ${{ matrix.cuda }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -49,10 +47,9 @@ jobs:
     steps:
       - name: Clone code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      # The COMMITTED blobs are what production injects; a stale or
-      # wrongly-built committed artifact would otherwise ship with green CI
-      # (the build below only checks its own fresh output, which overwrites
-      # the working copy — hence this step runs first).
+      # The COMMITTED blobs are what production injects; the build below only
+      # checks its own fresh output (and overwrites the working copy — hence
+      # this step runs first).
       - name: Check committed blobs
         run: |
           make -C gpu/cupti check-usdt \

@@ -28,10 +28,8 @@ func FromSlice[T any](data []T) []byte {
 }
 
 // Read copies b's prefix into a value of type T, returning false if b is too
-// short. For decoding fixed-layout kernel records (ringbuf/perf samples)
-// whose buffers are reused between reads. Copying (rather than casting the
-// slice data pointer) keeps it valid for unaligned b; the compiler lowers it
-// to plain moves for small structs.
+// short. For decoding fixed-layout kernel records. Copying (not casting the
+// slice pointer) keeps it valid for unaligned b.
 func Read[T any](b []byte) (T, bool) {
 	var v T
 	size := int(unsafe.Sizeof(v))

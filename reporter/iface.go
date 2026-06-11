@@ -50,9 +50,8 @@ type ExecutableMetadata struct {
 	DebuglinkFileName string
 }
 
-// ProbeRegistrar is implemented by reporters that accept dynamic probe metadata.
-// tracer.Enable() calls RegisterProbeOrigin so the reporter can emit correct
-// pprof sample types for custom probes without hardcoded switch statements.
+// ProbeRegistrar is implemented by reporters that accept dynamic probe
+// origins with pprof sample-type metadata.
 type ProbeRegistrar interface {
 	RegisterProbeOrigin(libpf.Origin, samples.ProbeOriginMetadata) error
 }

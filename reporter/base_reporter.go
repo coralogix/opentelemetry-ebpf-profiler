@@ -40,15 +40,11 @@ type baseReporter struct {
 	// slightly overestimated as it includes tracer setup time before samples arrive.
 	collectionStartTime time.Time
 
-	// probeOriginsMu guards probeOrigins and probeOriginsVersion.
-	probeOriginsMu sync.RWMutex
-	// probeOrigins holds metadata for dynamically registered probe origins
-	// (registered via RegisterProbeOrigin).
-	probeOrigins map[libpf.Origin]samples.ProbeOriginMetadata
-	// probeOriginsVersion is incremented on every RegisterProbeOrigin call.
-	// syncProbeOriginsToPdata uses it to skip the copy when nothing changed.
+	// Dynamically registered probe origins; the version counters let
+	// syncProbeOriginsToPdata skip the copy when nothing changed.
+	probeOriginsMu      sync.RWMutex
+	probeOrigins        map[libpf.Origin]samples.ProbeOriginMetadata
 	probeOriginsVersion uint64
-	// probeOriginsLastVer is the version last synced to pdata.ProbeOrigins.
 	probeOriginsLastVer uint64
 }
 
@@ -70,27 +66,21 @@ func (b *baseReporter) RegisterProbeOrigin(origin libpf.Origin, meta samples.Pro
 	return nil
 }
 
-// syncProbeOriginsToPdata copies the current probe origin map into p.ProbeOrigins
-// so that the next Generate() call emits correct sample types for custom probes.
-// Call this immediately before Generate(). The copy is skipped when the set of
-// registered origins has not changed since the last sync (common case after startup).
+// syncProbeOriginsToPdata copies the probe origin map into pdata for the next
+// Generate(); call immediately before it. One lock hold for check+copy: a
+// registration arriving in between must be visible to the same report tick.
 func (b *baseReporter) syncProbeOriginsToPdata() {
-	b.probeOriginsMu.RLock()
-	ver := b.probeOriginsVersion
-	b.probeOriginsMu.RUnlock()
-
-	if ver == b.probeOriginsLastVer {
+	b.probeOriginsMu.Lock()
+	defer b.probeOriginsMu.Unlock()
+	if b.probeOriginsVersion == b.probeOriginsLastVer {
 		return
 	}
-
-	b.probeOriginsMu.RLock()
-	defer b.probeOriginsMu.RUnlock()
 	out := make(map[libpf.Origin]samples.ProbeOriginMetadata, len(b.probeOrigins))
 	for k, v := range b.probeOrigins {
 		out[k] = v
 	}
 	b.pdata.ProbeOrigins = out
-	b.probeOriginsLastVer = ver
+	b.probeOriginsLastVer = b.probeOriginsVersion
 }
 
 func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error {

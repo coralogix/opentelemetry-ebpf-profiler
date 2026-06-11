@@ -23,10 +23,8 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
-// GPULaunchObserver is invoked for every TRACE_GPU (CUDA kernel-launch) trace
-// just before it is reported, with the host launch stack and its meta (whose
-// Value carries the CUPTI correlation id). Used by the GPU-time matcher to join
-// host stacks to per-kernel GPU timing.
+// GPULaunchObserver receives every TRACE_GPU trace: the host launch stack
+// plus meta whose Value carries the CUPTI correlation id.
 type GPULaunchObserver func(*libpf.Trace, *samples.TraceEventMeta)
 
 // elfInfo contains cached data from an executable needed for processing mappings.

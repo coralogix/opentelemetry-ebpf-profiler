@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// usdt_probes.h — the USDT contract between the CUDA injection shim
-// (libotelcupti.so) and the profiler's eBPF consumers in
-// support/ebpf/gpu_cupti.ebpf.c.
+// usdt_probes.h — the USDT contract between the injection shim and the eBPF
+// consumers in support/ebpf/gpu_cupti.ebpf.c.
 //
-// Provider "otelcupti". Every probe passes a SINGLE struct pointer, pinned to
-// a fixed register via a local register-asm variable (honored by GCC and
-// Clang when the variable is used as an asm operand, which is what sys/sdt.h
-// does — and asserted on the build output by `make check`, the authority). The
-// .note.stapsdt arg spec is therefore exactly "8@%rax" (amd64) / "8@x0"
-// (arm64) on every build, so the eBPF side can read the pointer from a known
-// register. Without pinning, the compiler picks a register per call site —
-// and multi-arg probes produce memory operands — neither decodable
-// build-stably. `make check` asserts the spec at build time; the agent
-// re-verifies it at attach time.
-//
-// Struct layouts MUST match the mirrors in gpu_cupti.ebpf.c.
+// Provider "otelcupti". Every probe passes a SINGLE struct pointer pinned to
+// a fixed register ("8@%rax" amd64 / "8@x0" arm64) via a register-asm
+// variable: without pinning the compiler picks a register per call site, and
+// multi-arg probes produce memory operands — neither decodable build-stably.
+// `make check` asserts the spec at build time; the agent re-verifies at
+// attach. Struct layouts MUST match the mirrors in gpu_cupti.ebpf.c.
 #pragma once
 
 #include <stddef.h>
@@ -35,9 +28,8 @@
     DTRACE_PROBE1(otelcupti, name, otelcupti_rec_);                     \
   } while (0)
 
-// CPU side: fired from a CUPTI enter-callback at each tracked call site
-// (kernel launches and memcpys). The profiler attaches collect_trace() here
-// to capture the host stack, keyed by correlation id.
+// CPU side: fired at each tracked call site (launches, memcpys, allocs);
+// the profiler captures the host stack here, keyed by correlation id.
 struct otelcupti_launch_rec {
   uint32_t correlation_id; // MUST stay first: the eBPF reads it at offset 0
   uint32_t cbid;           // CUPTI callback id of the call site
@@ -76,9 +68,8 @@ struct otelcupti_mem_rec {
 #define OTELCUPTI_GPU_MEM_REC(recptr) \
   OTELCUPTI_PROBE1_PINNED(gpu_mem, (recptr))
 
-// Shim-side error (e.g. another CUPTI subscriber present). Re-emitted
-// periodically: the initial cuInit-time emission always races the agent's
-// USDT attach.
+// Shim-side error. Re-emitted periodically: the cuInit-time emission always
+// races the agent's USDT attach.
 struct otelcupti_error_rec {
   int32_t code;     // CUptiResult or -1 for shim-internal failures
   uint32_t _pad;
@@ -87,9 +78,8 @@ struct otelcupti_error_rec {
 #define OTELCUPTI_ERROR_REC(recptr) \
   OTELCUPTI_PROBE1_PINNED(error, (recptr))
 
-// Generic low-rate GPU event, discriminated by kind. Shared by UVM counters,
-// allocations, memsets, PC-sampling stall histograms and the NCCL profiler
-// plugin (libotelnccl.so emits it too). Field semantics per kind below.
+// Generic low-rate GPU event, discriminated by kind; also emitted by the
+// NCCL plugin. Field semantics per kind below.
 enum otelcupti_event_kind {
   OTELCUPTI_EV_UVM_HTOD    = 1,  // v1 = bytes migrated host→device
   OTELCUPTI_EV_UVM_DTOH    = 2,  // v1 = bytes migrated device→host
@@ -102,11 +92,8 @@ enum otelcupti_event_kind {
                                  // reason, v2 = sample count
   OTELCUPTI_EV_NCCL_OP     = 10, // name_ptr = op name, v1 = traffic bytes,
                                  // start/end = CLOCK_MONOTONIC ns
-  OTELCUPTI_EV_API_SPAN    = 11, // cuDNN/cuBLAS API spans. Emitted by the
-                                 // eBPF api_exit program (no USDT emission);
-                                 // declared here so the kind namespace has a
-                                 // single owner. Mirrors GPU_EVENT_KIND_API
-                                 // in gpu_cupti.ebpf.c and EvAPISpan in Go.
+  OTELCUPTI_EV_API_SPAN    = 11, // cuDNN/cuBLAS API span, emitted by the
+                                 // eBPF api_exit program (no USDT emission).
 };
 struct otelcupti_event_rec {
   uint64_t start;
@@ -118,9 +105,8 @@ struct otelcupti_event_rec {
   uint64_t name_ptr;
 };
 
-// The eBPF wire structs append {u32 pid, u32 pad}: Go decodes these layouts
-// + 8 at fixed offsets (gpu/cupti wire tests), so the record sizes are part
-// of the contract.
+// The record sizes are part of the wire contract (eBPF appends {pid, pad};
+// Go decodes at fixed offsets).
 _Static_assert(sizeof(struct otelcupti_launch_rec) == 16, "wire contract");
 _Static_assert(sizeof(struct otelcupti_kernel_rec) == 48, "wire contract");
 _Static_assert(sizeof(struct otelcupti_mem_rec) == 48, "wire contract");

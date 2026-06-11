@@ -18,8 +18,8 @@ type Pdata struct {
 	// samplesPerSecond is the number of samples per second.
 	samplesPerSecond int
 
-	// ProbeOrigins holds metadata for dynamically registered probe origins.
-	// Set by the base reporter before each Generate() call via SetProbeOrigins.
+	// ProbeOrigins holds dynamic probe-origin metadata, synced by the base
+	// reporter before each Generate().
 	ProbeOrigins map[libpf.Origin]samples.ProbeOriginMetadata
 }
 

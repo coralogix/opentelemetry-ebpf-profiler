@@ -145,17 +145,13 @@ type Tracer struct {
 	customHooksMu sync.Mutex
 	// customHooks holds links returned by custom probes loaded via Enable().
 	customHooks []link.Link
-	// probeOriginsCount is the number of custom probes registered so far.
-	// Used to assign monotonically increasing origin IDs starting after the
-	// last statically assigned origin.
+	// probeOriginsCount assigns monotonically increasing custom origin IDs.
 	probeOriginsCount atomic.Int64
 	// probeRegistrar is the reporter.ProbeRegistrar used to announce probe
 	// sample-type metadata. Set via SetProbeRegistrar before calling Enable.
 	probeRegistrar reporter.ProbeRegistrar
-	// pidEventHook, if set, is invoked once for every newly-observed PID from
-	// the same goroutine that synchronizes processes. Probes (e.g. the GPU
-	// uprobe source) use it to attach at process-exec time, before the process
-	// loads its target libraries — far earlier than a periodic /proc rescan.
+	// pidEventHook, if set, is invoked once per newly-observed PID; probes
+	// use it to attach at exec time, far earlier than a /proc rescan.
 	pidEventHook atomic.Pointer[func(libpf.PID)]
 }
 
@@ -531,8 +527,7 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 	}
 
 	if cfg.LoadGPU {
-		// All otel_cupti_* programs (USDT consumers + API span probes); see
-		// support/ebpf/gpu_cupti.ebpf.c.
+		// All otel_cupti_* programs (USDT consumers + API span probes).
 		var gpuProgs []progLoaderHelper
 		for name := range coll.Programs {
 			if strings.HasPrefix(name, "otel_cupti_") {
@@ -543,10 +538,9 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config) (
 				})
 			}
 		}
-		// Non-fatal: GPU profiling must not take down the CPU profiler (e.g.
-		// otel_cupti_api_* need bpf_get_attach_cookie, kernel 5.15+). But
-		// "disabled" must not leak the GPU ringbufs (tens of MiB of kernel
-		// memory), so tear the cupti_ maps down with the failed programs.
+		// Non-fatal: GPU must not take down the CPU profiler (api probes need
+		// kernel 5.15+); but "disabled" must not leak the GPU ringbufs, so the
+		// cupti_ maps go down with the failed programs.
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], gpuProgs,
 			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD()); err != nil {
 			log.Warnf("Failed to load GPU eBPF programs, GPU profiling disabled: %v", err)
@@ -1472,11 +1466,8 @@ func (t *Tracer) Enable(p Probe) error {
 	if t.probeRegistrar == nil {
 		return fmt.Errorf("tracer.Enable: SetProbeRegistrar must be called first")
 	}
-	// Custom probe origin IDs start at 0x11 (customOriginBase + first
-	// pre-incremented count of 1), leaving 0x0–0x0F for static origins
-	// (sampling=0x1, off-cpu=0x2, probe=0x3, gpu=0x4, gpu-metric=0x5; see
-	// support.TraceOrigin*). The gap is intentional so adding static origins
-	// later does not collide with registered custom probes.
+	// Custom origin IDs start at 0x11, leaving 0x0–0x0F for static origins
+	// (support.TraceOrigin*) so adding static ones later cannot collide.
 	const customOriginBase = 0x10
 	originID := libpf.Origin(customOriginBase + uint32(t.probeOriginsCount.Add(1)))
 

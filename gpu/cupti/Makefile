@@ -33,28 +33,23 @@ NCCL_OUT ?= libotelnccl.so
 $(NCCL_OUT): ncclprofiler.c usdt_probes.h nccl/profiler_v2.h nccl/profiler_v2_compat.h
 	$(CC) $(CFLAGS) $(LDFLAGS) ncclprofiler.c -I. -o $@
 
-# Sanity checks on the built shim: injection entry DEFINED and exported (an
-# undefined reference or a renamed wrapper must not pass) + no direct
-# libstdc++ dependency + the USDT contract via check-usdt.
+# Injection entry DEFINED and exported + no direct libstdc++ dependency
+# (the shim loads into arbitrary processes; a second C++ runtime can clash
+# with the host's) + the USDT contract via check-usdt.
 check: $(OUT)
 	@nm -D --defined-only $(OUT) | grep -qE ' T InitializeInjection$$' \
 	  && echo "InitializeInjection exported ✓" \
 	  || { echo "InitializeInjection not a defined exported function"; exit 1; }
-	@# The shim loads into arbitrary host processes: a direct libstdc++
-	@# dependency can clash with the process's own bundled C++ runtime.
 	@! readelf -d $(OUT) | grep NEEDED | grep -q stdc++ && echo "no libstdc++ ✓"
 	@$(MAKE) --no-print-directory check-usdt SO=$(OUT) PROBES='$(SHIM_PROBES)'
 
 SHIM_PROBES := error gpu_event gpu_mem kernel_executed on_launch
 
 # check-usdt asserts SO's USDT contract: the probe set is EXACTLY $(PROBES)
-# (sorted — a new probe must be enrolled here to be spec-checked) and every
-# arg spec is the single struct pointer in the per-arch register the eBPF
-# consumers hard-code (8@%rax amd64 / 8@x0 arm64). A multi-arg or
-# memory-operand spec is not build-stable and silently breaks the eBPF reads
-# (see support/ebpf/gpu_cupti.ebpf.c). The awk parse keys on the Name:/
-# Arguments: lines (stable across binutils versions, unlike line offsets).
-# No build dependency on purpose: CI also runs it against the COMMITTED blobs.
+# (sorted; a new probe must be enrolled to be spec-checked) and every arg
+# spec is the pinned single register (8@%rax / 8@x0) — anything else silently
+# breaks the eBPF reads. No build dependency on purpose: CI also runs this
+# against the COMMITTED blobs.
 check-usdt:
 	@found=$$(readelf -n $(SO) | sed -n 's/^ *Name: //p' | sort -u | tr '\n' ' '); \
 	[ "$$found" = "$(PROBES) " ] || { echo "$(SO): probe set '$$found' != '$(PROBES)'"; exit 1; }; \

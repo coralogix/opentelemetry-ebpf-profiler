@@ -172,14 +172,10 @@ func (c *Controller) Start(ctx context.Context) error {
 
 	if c.config.GPU {
 		if err := c.startGPU(ctx, trc); err != nil {
-			// GPU init must NOT take down the main profiler, so we continue.
-			// But the errors returned by startGPU are wiring failures (missing
-			// ProbeRegistrar, origin registration, GPU programs/maps absent
-			// from the tracer blob, ringbuf setup) — NOT benign "no GPU
-			// present" cases, which cupti handles gracefully (no-op attach
-			// scans, nil busy poller). The user explicitly requested --gpu, so
-			// surface this at Error level: the feature is on but will emit
-			// nothing.
+			// Non-fatal for the CPU profiler, but startGPU errors are wiring
+			// failures, not benign "no GPU" cases (cupti handles those
+			// gracefully) — the user asked for --gpu and it will emit nothing,
+			// so log at Error level.
 			log.Errorf("GPU profiling was requested but failed to start "+
 				"(profiler continues without it): %v", err)
 		}
@@ -218,9 +214,8 @@ func (c *Controller) Shutdown() {
 	c.shutdownOnceFn.Do(func() {
 		log.Info("Stop processing ...")
 
-		// Stop GPU profiling first: its final flush lands in the reporter's
-		// buffers while the report loop may still get a tick. (The reporter
-		// has no final-export-on-stop, so this is best effort.)
+		// Stop GPU first so its final flush lands while the report loop may
+		// still tick (the reporter has no final-export-on-stop; best effort).
 		if stop := c.gpuStop.Load(); stop != nil {
 			(*stop)()
 		}

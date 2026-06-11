@@ -2,24 +2,17 @@
 
 // SPDX-License-Identifier: Apache-2.0
 //
-// libotelcupti.so — CUDA injection shim, in C. Built into a standalone shared
-// object by gpu/cupti/Makefile (gcc), NOT compiled by the Go toolchain — the
-// //go:build ignore above keeps `go build` from treating it as cgo. (gcc reads
-// it as an ordinary // comment.)
+// libotelcupti.so — CUDA injection shim (CUDA_INJECTION64_PATH). Captures
+// per-kernel GPU timing + correlation ids via CUPTI and exposes them as USDT
+// probes (provider "otelcupti") for the profiler's eBPF side. Built by
+// gpu/cupti/Makefile; the //go:build ignore line keeps `go build` away.
 //
-// Injected via CUDA_INJECTION64_PATH; uses CUPTI to capture real per-kernel GPU
-// timing + correlation IDs and exposes them as USDT probes (provider
-// "otelcupti") for the profiler's eBPF side. Written in C (not C++) on purpose:
-// the shim is loaded into an arbitrary host process (ollama, pytorch, ...), so
-// it must avoid libstdc++/C++ runtime ABI conflicts and keep the smallest
-// possible footprint. CUPTI is a C API; no C++ features are needed (kernel-name
-// demangling is done later on the Go side).
+// Plain C on purpose: the shim loads into arbitrary host processes, so no
+// libstdc++/C++ runtime ABI exposure (demangling happens on the Go side).
 //
-// Coexistence: CUPTI allows a single subscriber per process on CUDA <= 13.2 /
-// driver < r610. If another CUPTI client (PyTorch/Kineto, Nsight, cuda-gdb,
-// DCGM) is already subscribed, cuptiSubscribe returns
-// CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED (39); we emit an `error` probe
-// and disable gracefully (the rest of the profiler keeps working).
+// Coexistence: CUPTI allows one subscriber per process before CUDA 13.2 /
+// r610. If another client (Kineto, Nsight, DCGM) holds it, we emit an
+// `error` probe and disable gracefully.
 
 #include <pthread.h>
 #include <stdint.h>
@@ -41,15 +34,11 @@ static void uvm_configure_ctx(CUcontext ctx);
 
 #include "usdt_probes.h"
 
-// CUPTI fills KERNEL/CONCURRENT_KERNEL activity records as the LATEST versioned
-// struct (CUpti_ActivityKernelN) the libcupti we ship supports — NOT the
-// unversioned `CUpti_ActivityKernel`, which cupti_activity_deprecated.h pins to
-// an old, smaller layout with DIFFERENT field offsets (e.g. on CUDA 13 the real
-// record is CUpti_ActivityKernel9 @208B with start@16/deviceId@40, while the
-// deprecated alias is 104B with start@8/deviceId@24). Casting to the deprecated
-// type reads every field from the wrong offset → garbage timings/ids. Pick the
-// version matching the toolkit we build+ship against (header == runtime CUPTI,
-// since we ship libcupti from the same toolkit).
+// CUPTI fills kernel activity records as the LATEST CUpti_ActivityKernelN
+// the shipped libcupti supports — NOT the unversioned alias, which
+// cupti_activity_deprecated.h pins to an old layout with different field
+// offsets (casting to it reads garbage). Pick the version matching the
+// toolkit we build and ship against.
 #if CUDA_VERSION >= 12040
 typedef CUpti_ActivityKernel9 otelcupti_kernel_activity_t;
 #elif CUDA_VERSION >= 12000
@@ -66,16 +55,14 @@ typedef CUpti_ActivityKernel6 otelcupti_kernel_activity_t;
 static CUpti_SubscriberHandle g_subscriber;
 static int g_enabled;
 
-/* An error fired at cuInit races the profiler's USDT attach (the shim only
- * just got mapped), so keep the last error and re-emit it periodically and
- * at exit. msg is always a static string. */
+/* An error fired at cuInit races the profiler's USDT attach, so keep the
+ * last error and re-emit it periodically and at exit. msg is static. */
 static pthread_mutex_t g_err_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct otelcupti_error_rec g_last_err;
 static int g_err_started;
 static void start_error_reemit(void);
 
-/* Errors can fire from any thread (init, context callbacks, PC worker); the
- * mutex keeps the re-emitted (code, msg) pair consistent. Rare path. */
+/* The mutex keeps the re-emitted (code, msg) pair consistent. Rare path. */
 static void emit_error(int code, const char *msg) {
   struct otelcupti_error_rec rec = {
     .code    = code,
@@ -119,22 +106,19 @@ static void start_error_reemit(void) {
 }
 
 /* ─── NVTX range tracking ────────────────────────────────────────────────────
- * Workloads that emit NVTX (PyTorch ops under emit_nvtx(), manual ranges) carry
- * app-level names that stripped host stacks lack. CUPTI's NVTX callback domain
- * delivers nvtxRangePush/Pop on the calling thread; we keep a per-thread range
- * stack, intern the names, and stash the active range per correlation id at
- * launch so buffer_completed can attach it to each kernel. */
+ * NVTX ranges carry app-level names stripped host stacks lack. Keep a
+ * per-thread range stack, intern the names, and stash the active nesting per
+ * correlation id at launch so buffer_completed can attach it per kernel. */
 #define NVTX_MAX_DEPTH 64
 #define NVTX_POOL_MAX 8192
-/* Correlation ids are sequential, so this direct-mapped table is a FIFO of
- * the last SLOTS launches. It must exceed the launches outstanding between
- * stash (launch callback) and lookup (activity flush): one 8 MiB activity
- * buffer alone is ~40k records. 3 MiB BSS, zero-page until touched. */
+/* Direct-mapped on sequential correlation ids = FIFO of the last SLOTS
+ * launches. Must exceed the launches outstanding between stash and activity
+ * flush (one 8 MiB activity buffer is ~40k records). Zero-page BSS. */
 #define NVTX_CORR_SLOTS (1 << 18) /* power of two */
 
 /* Intern: dedup + strdup, NEVER freed — the agent reads the strings from
- * /proc/<pid>/mem asynchronously. Open-addressed hash, insert-only: reads are
- * lock-free (acquire-load per slot), inserts take the mutex and re-probe. */
+ * /proc/<pid>/mem asynchronously. Insert-only open-addressed hash: lock-free
+ * reads, inserts take the mutex and re-probe. */
 static pthread_mutex_t g_nvtx_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static const char *g_nvtx_pool[NVTX_POOL_MAX]; /* power-of-two slots */
 
@@ -156,8 +140,7 @@ static const char *nvtx_intern(const char *s) {
     const char *p = __atomic_load_n(&g_nvtx_pool[slot], __ATOMIC_ACQUIRE);
     if (p == NULL) {
       pthread_mutex_lock(&g_nvtx_pool_mu);
-      /* Re-probe from this slot under the lock (another thread may have
-       * inserted meanwhile). */
+      /* Re-probe under the lock: another thread may have inserted. */
       const char *found = NULL;
       for (; i < NVTX_POOL_MAX; i++) {
         slot = (h + i) & (NVTX_POOL_MAX - 1);
@@ -184,9 +167,8 @@ static const char *nvtx_intern(const char *s) {
 
 static __thread const char *t_nvtx_stack[NVTX_MAX_DEPTH];
 static __thread int t_nvtx_depth;
-/* The full active range nesting as one interned string, innermost-first,
- * '\x1f'-separated. Recomputed eagerly at push/pop (rare relative to
- * launches, which just read the pointer). */
+/* Active range nesting as one interned string, innermost-first,
+ * '\x1f'-separated. Recomputed at push/pop; launches just read it. */
 static __thread const char *t_nvtx_joined;
 
 #define NVTX_SEP '\x1f'
@@ -233,10 +215,8 @@ static void nvtx_thread_pop(void) {
   nvtx_recompute_joined();
 }
 
-/* correlation id → active NVTX range name (direct-mapped on corr & mask).
- * Best-effort by design — a collision or torn read just loses one label —
- * so plain atomics instead of a mutex: this runs on every launch (app
- * threads) and every activity record (CUPTI's flush thread). */
+/* correlation id → active NVTX nesting. Best-effort: a collision or torn
+ * read loses one label, so plain atomics suffice on this hot path. */
 static uint32_t g_corr_key[NVTX_CORR_SLOTS];
 static const char *g_corr_val[NVTX_CORR_SLOTS];
 
@@ -259,12 +239,10 @@ static const char *nvtx_for_correlation(uint32_t corr) {
   return __atomic_load_n(&g_corr_val[h], __ATOMIC_ACQUIRE);
 }
 
-/* Extract the message string from an NVTX push callback's params. The param
- * layouts are CUPTI's NVTX injection ABI (a struct of the function's args in
- * order, no documentation guarantees) — so match function names EXACTLY: a
- * substring match against a future variant with different args would read a
- * wild pointer inside the customer process. Unmatched pushes stay unnamed
- * (and still balance the later pop). */
+/* Extract the message from an NVTX push callback's params. The param layout
+ * is CUPTI's undocumented injection ABI, so match function names EXACTLY —
+ * a substring match against a future variant with different args would read
+ * a wild pointer. Unmatched pushes stay unnamed but still balance the pop. */
 static const char *nvtx_push_message(const char *fn, const void *params) {
   if (!fn || !params) {
     return NULL;
@@ -300,9 +278,8 @@ static void handle_nvtx(const CUpti_NvtxData *d) {
     const char *msg = nvtx_push_message(fn, d->functionParams);
     const char *interned = NULL;
     if (msg) {
-      // PyTorch emit_nvtx appends a per-call ", seq = N, op_id = M" suffix; drop
-      // it so identical ops aggregate into one frame (instead of thousands of
-      // unique slivers) and the intern pool stays bounded by distinct op NAMES.
+      // Drop PyTorch's per-call ", seq = N, ..." suffix so identical ops
+      // aggregate and the intern pool stays bounded by distinct names.
       char clean[128];
       size_t i = 0;
       for (; msg[i] && i < sizeof(clean) - 1; i++) {
@@ -354,16 +331,13 @@ static void CUPTIAPI buffer_completed(CUcontext ctx, uint32_t stream_id,
         rec.correlation_id = k->correlationId;
         rec.device_id      = k->deviceId;
         rec.stream_id      = k->streamId;
-        /* graphId exists on CUpti_ActivityKernel7+ (CUDA 11.6+), which is the
-         * typedef we resolve to above for any supported toolkit. */
+        /* graphId exists on CUpti_ActivityKernel7+ (CUDA 11.6+). */
 #if CUDA_VERSION >= 11060
         rec.graph_id       = k->graphId;
 #else
         rec.graph_id       = 0;
 #endif
         rec.name_ptr       = (uint64_t)(uintptr_t)(k->name ? k->name : "");
-        /* NVTX range active on the launching thread, stashed by correlation id
-         * at launch time (best-effort; 0 if the workload emits no NVTX). */
         rec.nvtx_ptr       = (uint64_t)(uintptr_t)nvtx_for_correlation(k->correlationId);
         OTELCUPTI_KERNEL_EXECUTED_REC(&rec);
         break;
@@ -452,8 +426,7 @@ static void CUPTIAPI buffer_completed(CUcontext ctx, uint32_t stream_id,
 static void CUPTIAPI api_callback(void *userdata, CUpti_CallbackDomain domain,
                                   CUpti_CallbackId cbid, const void *cbinfo) {
   (void)userdata;
-  // The NVTX domain delivers a CUpti_NvtxData (not CUpti_CallbackData) and has
-  // no enter/exit site; handle it before the launch path.
+  // NVTX delivers CUpti_NvtxData, not CUpti_CallbackData.
   if (domain == CUPTI_CB_DOMAIN_NVTX) {
     handle_nvtx((const CUpti_NvtxData *)cbinfo);
     return;
@@ -476,10 +449,8 @@ static void CUPTIAPI api_callback(void *userdata, CUpti_CallbackDomain domain,
   if (cb->callbackSite != CUPTI_API_ENTER) {
     return;
   }
-  // Both kernel launches AND memcpy calls are "tracked" sites: each fires
-  // on_launch (host stack keyed by correlationId) and stashes the active NVTX
-  // range, so kernel_executed and gpu_mem activity records both join back to
-  // the launching/copying host path.
+  // Tracked sites (launches, memcpys, allocs) fire on_launch — host stack
+  // keyed by correlation id — and stash the active NVTX nesting.
   int is_launch = 0;
   if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
     switch (cbid) {
@@ -498,8 +469,7 @@ static void CUPTIAPI api_callback(void *userdata, CUpti_CallbackDomain domain,
       break;
     }
   } else if (domain == CUPTI_CB_DOMAIN_DRIVER_API) {
-    // ggml/llama.cpp (and most native CUDA backends) launch through the DRIVER
-    // API, so these are what actually correlate the host stack to the kernels.
+    // ggml/llama.cpp and most native backends launch through the driver API.
     switch (cbid) {
     case CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel:
     case CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel_ptsz:
@@ -546,18 +516,14 @@ static void CUPTIAPI api_callback(void *userdata, CUpti_CallbackDomain domain,
     lrec.cbid           = (uint32_t)cbid;
     lrec.name_ptr       = (uint64_t)(uintptr_t)(cb->symbolName ? cb->symbolName : "");
     OTELCUPTI_ON_LAUNCH_REC(&lrec);
-    // Remember the full NVTX range nesting active on this thread so
-    // buffer_completed can attach it to the kernel(s) this launch produces.
     nvtx_stash_for_correlation(cb->correlationId, t_nvtx_joined);
   }
 }
 
 /* Unified-memory counters (migrations + page faults). Configuring before a
- * context exists fails (observed on CUDA 12.6/T4), so this runs from each
- * CONTEXT_CREATED callback — once per DEVICE: the config is per-device
- * (SCOPE_PROCESS_SINGLE_DEVICE + deviceId), so a single one-shot would
- * silently cover only device 0 in multi-GPU processes. Only produces records
- * for workloads using cudaMallocManaged. */
+ * context exists fails, so this runs from CONTEXT_CREATED — once per DEVICE
+ * (the config carries a deviceId; a single one-shot would cover only device
+ * 0 in multi-GPU processes). */
 static void uvm_configure_ctx(CUcontext ctx) {
   uint32_t dev = 0;
   if (cuptiGetDeviceId(ctx, &dev) != CUPTI_SUCCESS || dev >= 64) {
@@ -594,14 +560,10 @@ static void uvm_configure_ctx(CUcontext ctx) {
 }
 
 /* ─── PC sampling: per-kernel stall reasons ──────────────────────────────────
- * Continuous PC sampling (Volta+/CC 7.0, CUDA 11.3+): per CUDA context, the
- * hardware samples warp program counters with stall reasons. A worker thread
- * drains samples every second and emits per-(function, stall reason) sample
- * counts as gpu_event records. Needs profiling permission
- * (RmProfilingAdminOnly=0 or root); failure disables it with one error probe.
- * Source-line correlation would additionally need -lineinfo cubins; we emit
- * function-level attribution. Opt-in via OTELCUPTI_PC=1 (off by default; see
- * pc_on_context_created). */
+ * Continuous PC sampling (Volta+, CUDA 11.3+): hardware samples warp program
+ * counters with stall reasons per context; a worker thread drains them every
+ * second into gpu_event records. Needs profiling permission
+ * (RmProfilingAdminOnly=0 or root). Opt-in via OTELCUPTI_PC=1. */
 #ifdef OTELCUPTI_HAVE_PCSAMPLING
 
 #define PC_MAX_CTX 16
@@ -617,8 +579,7 @@ static int g_pc_failed;
 static char **g_pc_stall_names; /* CUPTI-owned, stable */
 static uint32_t *g_pc_stall_idx;
 static size_t g_pc_nstall;
-/* Two buffers: CUPTI fills g_pc_collect continuously (configured via
- * SAMPLING_DATA_BUFFER); GetData drains into g_pc_data. Guarded by g_pc_mu. */
+/* CUPTI fills g_pc_collect continuously; GetData drains into g_pc_data. */
 static CUpti_PCSamplingData g_pc_collect;
 static CUpti_PCSamplingData g_pc_data;
 
@@ -695,14 +656,12 @@ static void pc_drain_ctx(CUcontext ctx) {
   }
 }
 
-/* PC sampling configuration may NOT run inside a CUPTI callback (CUPTI
- * returns INVALID_OPERATION), so contexts are queued from the RESOURCE
- * callback and set up here on the worker thread. */
+/* PC sampling configuration may NOT run inside a CUPTI callback
+ * (INVALID_OPERATION), so contexts are queued and set up on the worker. */
 static void pc_setup_ctx(CUcontext ctx) {
-  /* Enable before stall-reason enumeration and configuration, per NVIDIA's
-   * pc_sampling_continuous sample. Not independently verified — sample
-   * retrieval has not produced data end-to-end yet (T4 enumerates zero stall
-   * reasons), so don't rule out ordering when debugging that. */
+  /* Enable before stall-reason enumeration, per NVIDIA's
+   * pc_sampling_continuous sample. Unverified end-to-end: T4 enumerates zero
+   * stall reasons — don't rule out ordering when debugging that. */
   CUpti_PCSamplingEnableParams ep = {
     .size = CUpti_PCSamplingEnableParamsSize,
     .ctx  = ctx,
@@ -732,8 +691,7 @@ static void pc_setup_ctx(CUcontext ctx) {
     }
   }
 
-  /* Configure: continuous collection, sampling period 2^7 cycles, all stall
-   * reasons, collection buffer. */
+  /* Continuous collection, period 2^7 cycles, all stall reasons. */
   CUpti_PCSamplingConfigurationInfo cfg[4] = {0};
   CUpti_PCSamplingCollectionMode mode = CUPTI_PC_SAMPLING_COLLECTION_MODE_CONTINUOUS;
   cfg[0].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_COLLECTION_MODE;
@@ -778,8 +736,7 @@ static void *pc_worker(void *arg) {
   return NULL;
 }
 
-/* Drop a destroyed context from both the pending and active lists so the
- * worker never touches a dangling CUcontext. */
+/* The worker must never touch a dangling CUcontext. */
 static void pc_on_context_destroy(CUcontext ctx) {
   pthread_mutex_lock(&g_pc_mu);
   for (int i = 0; i < g_pc_npending; i++) {
@@ -803,9 +760,8 @@ static void pc_on_context_destroy(CUcontext ctx) {
 }
 
 static void pc_on_context_created(CUcontext ctx) {
-  /* Opt-in (OTELCUPTI_PC=1): hardware warp sampling runs inside the customer
-   * workload and sample retrieval is not yet validated end-to-end, so the
-   * default must cost nothing. */
+  /* Opt-in: hardware warp sampling inside customer workloads must cost
+   * nothing by default. */
   if (g_pc_failed || !getenv("OTELCUPTI_PC")) {
     return;
   }
@@ -896,12 +852,10 @@ static int setup(void) {
     }
   }
 
-  // NVTX range callbacks: enabling the domain makes CUPTI register itself as the
-  // NVTX injection, so nvtxRangePush/Pop on the workload's threads flow to
-  // api_callback. Optional — workloads that emit no NVTX simply never fire it.
+  // Enabling the NVTX domain makes CUPTI register itself as the NVTX
+  // injection, routing nvtxRangePush/Pop to api_callback.
   cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_NVTX);
 #ifdef OTELCUPTI_HAVE_PCSAMPLING
-  // Context lifecycle hooks for PC sampling enable/disable.
   cuptiEnableCallback(1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE,
                       CUPTI_CBID_RESOURCE_CONTEXT_CREATED);
   cuptiEnableCallback(1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE,
@@ -919,14 +873,12 @@ static int setup(void) {
   cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMORY2);
 
 #if CUDA_VERSION >= 11010
-  /* Bound activity-buffer staleness: otherwise records sit until the 8 MiB
-   * buffer fills, delaying export and aging out the corr→NVTX stash. */
+  /* Otherwise records sit until the 8 MiB buffer fills, delaying export and
+   * aging out the corr→NVTX stash. */
   cuptiActivityFlushPeriod(1000);
 #endif
 
-  /* CUPTI PM sampling (continuous HW-metric sampling) needs Hopper+ and the
-   * profiler-host metric APIs; not implemented yet — surface the gap instead
-   * of failing silently when requested. */
+  /* PM sampling (Hopper+) is not implemented; surface the gap when asked. */
   if (getenv("OTELCUPTI_PM")) {
     emit_error(-2, "PM sampling not implemented (requires Hopper+); request noted");
   }
@@ -944,8 +896,6 @@ static void flush_at_exit(void) {
   pthread_mutex_unlock(&g_err_mu);
 }
 
-/* CUDA_INJECTION64_PATH entry point. CUDA calls this once at cuInit.
- * Exported (the rest of the lib is built -fvisibility=hidden). */
 static void fork_prepare(void) {
   pthread_mutex_lock(&g_err_mu);
   pthread_mutex_lock(&g_nvtx_pool_mu);
@@ -961,11 +911,11 @@ static void fork_parent(void) {
   pthread_mutex_unlock(&g_err_mu);
 }
 
+/* CUDA_INJECTION64_PATH entry point, called once at cuInit. Exported; the
+ * rest of the lib is -fvisibility=hidden. */
 __attribute__((visibility("default"))) int InitializeInjection(void) {
-  /* Fork children inherit mutexes in their instantaneous state; take them
-   * across fork so a child never starts with one locked by a dead thread
-   * (PyTorch DataLoader forks while other threads push NVTX ranges). The
-   * child unlocks via the same handler set. */
+  /* Hold our mutexes across fork: a child must never start with one locked
+   * by a dead thread (PyTorch DataLoader forks while threads push NVTX). */
   pthread_atfork(fork_prepare, fork_parent, fork_parent);
   g_enabled = setup();
   atexit(flush_at_exit); /* error re-emit starts from emit_error itself */

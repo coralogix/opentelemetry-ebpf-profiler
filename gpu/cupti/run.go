@@ -35,9 +35,9 @@ type Handle struct {
 	pidCh   chan int
 }
 
-// OnNewPID is for the tracer's PID-event hook. Non-blocking: the scan runs on
-// the rescan goroutine so a slow attach never stalls the trace pipeline (a
-// dropped notification is covered by the next periodic rescan).
+// OnNewPID is for the tracer's PID-event hook. Non-blocking: a slow attach
+// must never stall the trace pipeline; a dropped notification is covered by
+// the periodic rescan.
 func (h *Handle) OnNewPID(pid libpf.PID) {
 	select {
 	case h.pidCh <- int(pid):
@@ -45,11 +45,10 @@ func (h *Handle) OnNewPID(pid libpf.PID) {
 	}
 }
 
-// Stop detaches all probes, waits for the drains and flushes the remaining
-// deltas. Call before stopping the reporter so the final flush can still be
-// exported.
+// Stop detaches all probes, waits for the drains, then flushes the remaining
+// deltas. Call before stopping the reporter so the final flush still exports.
 func (h *Handle) Stop() {
-	_ = h.src.Stop() // quiesce first: events folded after a flush would be lost
+	_ = h.src.Stop() // quiesce first: events folded after the flush would be lost
 	h.matcher.Flush()
 }
 
@@ -117,8 +116,7 @@ func Run(ctx context.Context, cfg RunConfig) (*Handle, error) {
 	}
 
 	// The shim is dlopen'd at cuInit, after exec, so the PID-event hook alone
-	// races the injection; the rescan catches processes once the shim is
-	// mapped and reconciles exited PIDs.
+	// races the injection; the rescan catches late shim maps and exited PIDs.
 	rescan := func() {
 		pids := listPIDs()
 		if len(pids) == 0 {
@@ -130,18 +128,13 @@ func Run(ctx context.Context, cfg RunConfig) (*Handle, error) {
 			src.OnNewPID(p)
 		}
 		if dead := src.Reconcile(live); len(dead) > 0 {
-			// Export accumulated deltas before dropping the dead PIDs' state,
-			// or a short-lived job's final interval would be lost.
+			// Flush before pruning, or a short-lived job's last interval is lost.
 			matcher.Flush()
 			matcher.PruneDeadPIDs(dead)
 		}
-		// Caches can be repopulated for dead PIDs by late ringbuf events and
-		// hold entries for never-attached PIDs (busy sampling, fallbacks);
-		// sweep them against the live set.
 		matcher.SweepCaches(live)
 	}
-	// PID-event notifications and the periodic rescan share one goroutine so
-	// attaches are serialized off the trace pipeline.
+	// One goroutine serializes PID events and the rescan off the trace pipeline.
 	pidCh := make(chan int, 256)
 	go func() {
 		t := time.NewTicker(2 * time.Second)
@@ -159,8 +152,7 @@ func Run(ctx context.Context, cfg RunConfig) (*Handle, error) {
 	}()
 	periodiccaller.Start(ctx, 5*time.Second, matcher.Flush)
 
-	// Per-process GPU utilization via NVML: covers CUDA processes without the
-	// shim injected, at coarse granularity.
+	// NVML busy sampling covers CUDA processes without the shim, coarsely.
 	if bp := NewBusyPoller(func(pid uint32, busyNs int64) {
 		matcher.AddSample(pid, []string{"gpu:busy"}, origins.BusyTime, busyNs)
 	}); bp != nil {
@@ -181,8 +173,7 @@ func listPIDs() []int {
 	}
 	pids := make([]int, 0, len(ents))
 	for _, e := range ents {
-		// bitSize 31: PIDs always fit (kernel max is 2^22), and the result is
-		// provably in range for both int and the downstream uint32 conversions.
+		// bitSize 31 keeps the downstream int/uint32 conversions provably safe.
 		if pid, err := strconv.ParseUint(e.Name(), 10, 31); err == nil {
 			pids = append(pids, int(pid))
 		}

@@ -16,7 +16,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/traceutil"
 )
 
-// launchCtx is the (pre-collapsed) host stack captured at a tracked CUDA call
+// launchCtx is the collapsed host stack captured at a tracked CUDA call
 // site, buffered until the matching GPU activity record arrives.
 type launchCtx struct {
 	mods    []string // leaf-first module names, consecutive dups merged
@@ -24,8 +24,8 @@ type launchCtx struct {
 	meta    samples.TraceEventMeta
 }
 
-// bucketKey identifies one export bucket. Comparable struct so hot-path map
-// lookups don't build key strings.
+// bucketKey identifies one export bucket (comparable: no key strings on the
+// hot path).
 type bucketKey struct {
 	origin libpf.Origin
 	pid    libpf.PID
@@ -34,8 +34,8 @@ type bucketKey struct {
 	path   string
 }
 
-// emitBucket accumulates a value for one bucket; each flush reports only the
-// growth past the emitted watermark. The trace is built once at creation.
+// emitBucket accumulates a value; each flush reports the growth past the
+// emitted watermark.
 type emitBucket struct {
 	trace   *libpf.Trace
 	meta    samples.TraceEventMeta
@@ -45,10 +45,9 @@ type emitBucket struct {
 	idle    int // consecutive zero-delta flushes; evicted at bucketMaxIdle
 }
 
-// Matcher joins host stacks from on_launch with GPU activity records, keyed
-// by (PID, CUPTI correlation id) — correlation ids are per-process counters.
-// Aggregates per (origin, process, NVTX, leaf, host stack); Flush reports the
-// deltas. Host-stack capture is sampled; kernel timing itself is complete.
+// Matcher joins on_launch host stacks with GPU activity records, keyed by
+// (PID, correlation id) — correlation ids are per-process. Aggregates per
+// (origin, process, NVTX, leaf, host stack); Flush reports the deltas.
 type Matcher struct {
 	mu   sync.Mutex
 	buf  map[uint64]launchCtx // key: PID<<32 | correlation id
@@ -60,8 +59,7 @@ type Matcher struct {
 	emit map[bucketKey]*emitBucket
 	comm map[libpf.PID]libpf.String // fallback comm cache
 
-	// flushMu serializes Flush: concurrent flushes would snapshot the same
-	// delta and double-report it.
+	// flushMu serializes Flush: concurrent flushes would double-report.
 	flushMu sync.Mutex
 
 	matched   uint64
@@ -84,20 +82,17 @@ type Origins struct {
 	APITime      libpf.Origin
 }
 
-// launchBufCap bounds the launch buffer; the FIFO ring evicts oldest-first
-// (matching is lossy by design — evicted records count as unmatched).
+// launchBufCap bounds the launch buffer; the FIFO ring evicts oldest-first.
 const launchBufCap = 1 << 17
 
-// bucketMaxIdle evicts export buckets after this many consecutive zero-delta
-// flushes, bounding emit-map growth for long-lived processes (a bucket is
-// rebuilt on demand if its identity becomes active again).
+// bucketMaxIdle evicts a bucket after this many zero-delta flushes (rebuilt
+// on demand), bounding emit-map growth for long-lived processes.
 const bucketMaxIdle = 24 // 2 minutes at the 5s flush cadence
 
 func NewMatcher(rep TraceReporter, origins Origins, tp *NameCache) *Matcher {
 	return &Matcher{
 		buf: make(map[uint64]launchCtx),
-		// ring is allocated lazily on the first launch: an idle agent with
-		// --gpu should not pin ~4 MB of map/ring capacity.
+		// ring is allocated lazily: idle --gpu agents shouldn't pin ~4 MB.
 		tp:   tp,
 		rep:  rep,
 		orig: origins,
@@ -115,10 +110,9 @@ func bufKey(pid libpf.PID, corr uint32) uint64 {
 	return uint64(pid)<<32 | uint64(corr)
 }
 
-// OnLaunchTrace buffers the host stack for a tracked CUDA call. The
-// correlation id is carried in meta.Value (set by otel_cupti_on_launch).
-// The stack is collapsed to one frame per shared object up front — stripped
-// CUDA stacks have no symbols, so raw frames repeat the same .so name.
+// OnLaunchTrace buffers the host stack for a tracked CUDA call (correlation
+// id in meta.Value), collapsed to one frame per shared object — stripped
+// CUDA stacks just repeat the .so name.
 func (m *Matcher) OnLaunchTrace(trace *libpf.Trace, meta *samples.TraceEventMeta) {
 	corr := uint32(meta.Value)
 	if corr == 0 {
@@ -145,9 +139,8 @@ func (m *Matcher) OnLaunchTrace(trace *libpf.Trace, meta *samples.TraceEventMeta
 	m.mu.Unlock()
 }
 
-// bucket returns (creating if needed) the bucket for key. The trace is built
-// once: leaf, NVTX nesting (innermost first, '\x1f'-joined by the shim),
-// host modules. Caller must hold m.mu.
+// bucket returns (creating if needed) the bucket for key; the trace is
+// built once: leaf, NVTX frames, host modules. Caller must hold m.mu.
 func (m *Matcher) bucket(key bucketKey, mods []string,
 	meta samples.TraceEventMeta) *emitBucket {
 	eb := m.emit[key]
@@ -196,17 +189,16 @@ func (m *Matcher) OnTiming(t KernelTiming) {
 	var mods []string
 	var meta samples.TraceEventMeta
 	if lc, ok := m.buf[key]; ok {
-		// A CUDA graph launch expands into many kernels sharing one
-		// correlation id; keep the entry so all of them attribute to the
-		// graph-launch stack.
+		// Graph launches expand into many kernels sharing one correlation
+		// id; keep the entry so all attribute to the launch stack.
 		if t.GraphID == 0 {
 			delete(m.buf, key)
 		}
 		m.matched++
 		mods, bk.path, meta = lc.mods, lc.pathKey, lc.meta
 	} else {
-		// Keep the timing: kernel time is the authoritative total, so an
-		// unmatched record still counts, attributed to the process only.
+		// Kernel time is the authoritative total: unmatched records still
+		// count, attributed to the process only.
 		m.unmatched++
 		meta = m.fallbackMetaLocked(bk.pid)
 	}
@@ -229,10 +221,9 @@ func copyKindName(kind uint32) string {
 	return "memcpy:unknown"
 }
 
-// OnMem folds one memcpy/memset event into two buckets of the same identity:
-// duration under MemTime and bytes under MemBytes, host-stack-joined when the
-// correlation id matches. The buffered entry is NOT evicted: a CUDA graph
-// with memcpy nodes shares its id with the graph's kernels.
+// OnMem folds one memcpy/memset into duration (MemTime) and bytes (MemBytes)
+// buckets. The buffered launch entry is NOT evicted: a graph with memcpy
+// nodes shares its correlation id with the graph's kernels.
 func (m *Matcher) OnMem(t MemTiming) {
 	dur := int64(t.End - t.Start)
 	if dur <= 0 {
@@ -323,8 +314,6 @@ func (m *Matcher) OnEvent(e GPUEvent) {
 		}
 		name := op + cuptiMemKindName(e.V2)
 		pid := libpf.PID(e.PID)
-		// cudaMalloc/cuMemAlloc call sites are tracked, so the correlation id
-		// usually joins to a host stack.
 		m.mu.Lock()
 		mods, pathKey, meta := m.launchOrFallbackLocked(pid, e.CorrelationID)
 		m.bucket(bucketKey{
@@ -370,8 +359,8 @@ func (m *Matcher) OnEvent(e GPUEvent) {
 		m.mu.Unlock()
 	case EvAPISpan:
 		dur := int64(e.End - e.Start)
-		// A stale eBPF entry (missed uretprobe) pairs a fresh exit with an
-		// ancient start; no real cuDNN/cuBLAS call runs for minutes.
+		// A stale eBPF entry (missed uretprobe) can pair a fresh exit with an
+		// ancient start.
 		if dur > int64(time.Minute) {
 			return
 		}
@@ -389,8 +378,7 @@ func readComm(pid int) libpf.String {
 }
 
 // Flush reports each bucket's growth since the last flush. Call periodically
-// and once on shutdown. Serialized: concurrent flushes would report the same
-// delta twice.
+// and once on shutdown.
 func (m *Matcher) Flush() {
 	if m.rep == nil {
 		return
@@ -425,12 +413,11 @@ func (m *Matcher) Flush() {
 		meta.Value = p.delta
 		meta.Timestamp = now
 		if err := m.rep.ReportTraceEvent(p.eb.trace, &meta); err != nil {
-			// Watermark stays; the next flush retries this delta.
+			// Watermark stays; next flush retries.
 			log.Debugf("gpu/cupti: report GPU trace: %v", err)
 			continue
 		}
 		// Advance by delta, not to weight — it may have grown concurrently.
-		// Advancing a concurrently-pruned bucket is harmless.
 		m.mu.Lock()
 		p.eb.emitted += p.delta
 		m.mu.Unlock()
@@ -445,8 +432,8 @@ func collapsedModules(frames libpf.Frames) []string {
 	var lastMapping libpf.FrameMapping
 	for _, h := range frames {
 		f := h.Value()
-		// Consecutive frames overwhelmingly share a mapping; skip them
-		// before the (comparatively costly) name extraction.
+		// Consecutive frames usually share a mapping; skip before the
+		// costlier name extraction.
 		if f.Mapping.Valid() && f.Mapping == lastMapping {
 			continue
 		}
@@ -504,9 +491,9 @@ func (m *Matcher) PruneDeadPIDs(dead []int) {
 	m.mu.Unlock()
 }
 
-// SweepCaches drops comm and name-cache entries whose PID is not in live.
-// Late ringbuf events can repopulate them after a prune, and fallback paths
-// create entries for PIDs that were never attached.
+// SweepCaches drops comm/name-cache entries for non-live PIDs: late events
+// repopulate them after a prune, and fallback paths create entries for
+// never-attached PIDs.
 func (m *Matcher) SweepCaches(live map[int]struct{}) {
 	m.mu.Lock()
 	for pid := range m.comm {

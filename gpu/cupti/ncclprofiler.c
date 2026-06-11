@@ -2,13 +2,10 @@
 
 // SPDX-License-Identifier: Apache-2.0
 //
-// libotelnccl.so — NCCL profiler plugin (ncclProfiler_v2, NCCL >= 2.24:
-// 2.23 introduced the plugin API but its loader resolves ONLY ncclProfiler_v1;
-// the v2 fallback chain starts at 2.24 — verified in NCCL's profiler.cc).
-// Loaded via NCCL_PROFILER_PLUGIN=/path/to/libotelnccl.so; emits collective
-// and point-to-point op spans as otelcupti gpu_event USDT probes, consumed by
-// the same eBPF/agent pipeline as the CUPTI shim. Plain C, no NCCL link —
-// only the vendored ABI headers (nccl/, Apache-2.0).
+// libotelnccl.so — NCCL profiler plugin (ncclProfiler_v2; needs NCCL >= 2.24,
+// whose loader is the first to resolve the v2 symbol). Loaded via
+// NCCL_PROFILER_PLUGIN; emits collective/p2p op spans as otelcupti gpu_event
+// USDT probes. Plain C, no NCCL link — vendored ABI headers only.
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -26,12 +23,9 @@ struct otel_event {
   uint64_t bytes;
 };
 
-/* NCCL datatype name → element size; p2p events carry an element count, not
- * bytes (only coll has trafficBytes). NCCL passes its canonical names
- * ("ncclInt8", "ncclFloat16", "ncclBfloat16", ...), which carry the bit
- * width as the digit run — parse that; the digit-less aliases ncclHalf,
- * ncclFloat and ncclDouble are handled explicitly. Unknown future types
- * default to 4. */
+/* NCCL datatype name → element size; p2p events carry an element count,
+ * not bytes. Canonical names carry the bit width as a digit run
+ * ("ncclFloat16"); digit-less aliases are handled explicitly. */
 static uint64_t datatype_size(const char *dt) {
   if (!dt) {
     return 1;

@@ -241,10 +241,8 @@ func (t *Tracer) startTraceEventMonitor(ctx context.Context,
 					log.Warnf("skip trace handling: %v", err)
 					continue
 				case errors.Is(err, errRecordTooSmall), errors.Is(err, errRecordUnexpectedSize):
-					// A truncated record (e.g. a very deep host stack overflowing
-					// the perf sample — common for GPU launch traces) must not
-					// take the profiler down. Skip it; log sparsely so a
-					// systematic blob/struct mismatch doesn't spam per record.
+					// A truncated record (deep host stack overflowing the perf sample)
+					// must not take the profiler down: skip, log sparsely.
 					malformedCount++
 					if malformedCount == 1 || malformedCount%10000 == 0 {
 						log.Warnf("skipping malformed trace record (%d so far): %v",

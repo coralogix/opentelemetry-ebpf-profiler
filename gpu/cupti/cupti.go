@@ -1,15 +1,10 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-// Package cupti is the profiler side of GPU profiling. It attaches the eBPF
-// programs (support/ebpf/gpu_cupti.ebpf.c) to the USDT probes of the
-// libotelcupti.so shim and the libotelnccl.so NCCL plugin in each injected
-// CUDA process, plus uprobe/uretprobe span pairs on curated cuDNN/cuBLAS
-// symbols, and drains four event ringbufs (kernel timing, memcpys, shim
-// errors, and misc events: UVM counters, allocations, memsets, stall samples,
-// NCCL ops, API spans). A correlation matcher joins GPU-side records to the
-// host stack captured at the launch site (on_launch → collect_trace,
-// TRACE_GPU, correlation id in the trace value).
+// Package cupti is the profiler side of GPU profiling: it attaches the eBPF
+// programs in support/ebpf/gpu_cupti.ebpf.c to the USDT probes of the
+// injected CUPTI shim (and NCCL plugin), drains the event ringbufs, and joins
+// GPU records to the host stack captured at the launch site by correlation id.
 package cupti // import "go.opentelemetry.io/ebpf-profiler/gpu/cupti"
 
 import (
@@ -36,13 +31,11 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
 )
 
-// shimSoName is the injected CUPTI shim whose USDT probes we attach to.
 const shimSoName = "libotelcupti.so"
 
-// expectedArgSpec is the only USDT arg spec the eBPF consumers can decode:
-// the single struct pointer pinned to a fixed register by the shim's
-// OTELCUPTI_PROBE1_PINNED (see gpu/cupti/usdt_probes.h). A shim built
-// differently would make the eBPF read garbage, so attach refuses it.
+// expectedArgSpec is the only USDT arg spec the eBPF consumers can decode
+// (struct pointer pinned to one register, see usdt_probes.h); anything else
+// would be silently misread, so attach refuses it.
 var expectedArgSpec = map[string]string{
 	"amd64": "8@%rax",
 	"arm64": "8@x0",
@@ -78,12 +71,10 @@ type MemTiming struct {
 	_             uint32 // pad
 }
 
-// seSize is the wire size of GPUShimError, pinned by the _Static_assert in
-// gpu_cupti.ebpf.c.
+// seSize is sizeof(GPUShimError) in gpu_cupti.ebpf.c (pinned there).
 const seSize = 128
 
-// ShimError mirrors struct GPUShimError in gpu_cupti.ebpf.c (LE, 128 bytes):
-// a shim-side failure (e.g. another CUPTI subscriber already present).
+// ShimError is a shim-side failure (e.g. another CUPTI subscriber present).
 type ShimError struct {
 	Code int32
 	PID  uint32
@@ -126,18 +117,16 @@ type Config struct {
 	OnMem    func(MemTiming)
 	OnError  func(ShimError)
 	OnEvent  func(GPUEvent)
-	// OnPIDGone is invoked when an attached PID turns out to be dead (PID
-	// reuse detected via starttime) so per-PID aggregation state can be
-	// dropped before the new process's events arrive. Optional.
+	// OnPIDGone reports a detected PID reuse so per-PID state can be dropped
+	// before the new process's events arrive. Optional.
 	OnPIDGone func(pid int)
 }
 
-// ringbufs the Source drains; validated in New, opened in Start.
+// ringbufs the Source drains.
 var ringbufs = []string{"cupti_events", "cupti_mem_events", "cupti_errors",
 	"cupti_misc_events"}
 
-// USDT probe name → eBPF program name. The same programs are attached to the
-// shim; the NCCL plugin only carries gpu_event.
+// USDT probe name → eBPF program name.
 var probeProgs = map[string]string{
 	"on_launch":       "otel_cupti_on_launch",
 	"kernel_executed": "otel_cupti_kernel_executed",
@@ -146,22 +135,20 @@ var probeProgs = map[string]string{
 	"gpu_event":       "otel_cupti_gpu_event",
 }
 
-// Rescan throttles: a shimless (or attach-failed) PID's maps are re-scanned
-// with backoff capped low enough that a late cuInit is picked up quickly;
-// attached PIDs are re-scanned for late-dlopen'd libraries (cuDNN, NCCL
-// plugin) every extrasRecheck, forever.
+// Shimless/attach-failed PIDs are re-scanned with capped backoff (a late
+// cuInit must be picked up quickly); attached PIDs are re-checked for
+// late-dlopen'd libraries (cuDNN, NCCL plugin) every extrasRecheck.
 const (
 	noShimRecheckMin = 10 * time.Second
 	noShimRecheckMax = 30 * time.Second
 	extrasRecheck    = 10 * time.Second
 )
 
-// pidAttachment tracks one process's uprobe links and which instrumentable
-// libraries were already attached (more can appear later via dlopen).
+// pidAttachment tracks one process's uprobe links and attached libraries.
 type pidAttachment struct {
 	links      []link.Link
 	libs       map[string]bool
-	starttime  uint64 // /proc/<pid>/stat starttime, guards against PID reuse
+	starttime  uint64 // guards against PID reuse
 	nextExtras time.Time
 }
 
@@ -172,8 +159,7 @@ type noShimEntry struct {
 }
 
 // Source attaches to and drains the GPU profiling pipeline. Attachment is
-// serialized under mu — it happens at most every rescan tick and takes
-// milliseconds, so the simple locking wins over concurrency.
+// rare and fast, so it is simply serialized under mu.
 type Source struct {
 	cfg     Config
 	mu      sync.Mutex
@@ -189,10 +175,6 @@ func New(cfg Config) (*Source, error) {
 		return nil, errors.New(
 			"gpu/cupti: OnTiming, OnMem, OnError and OnEvent are required (OnPIDGone is optional)")
 	}
-	// Missing programs/maps mean the tracer blob was built without
-	// gpu_cupti.ebpf.c, LoadGPU is off, or the GPU program load failed
-	// non-fatally (e.g. kernel < 5.15 lacks bpf_get_attach_cookie — see the
-	// tracer's warnings).
 	required := append(slices.Collect(maps.Values(probeProgs)),
 		"otel_cupti_api_enter", "otel_cupti_api_exit")
 	for _, name := range required {
@@ -260,8 +242,7 @@ func (s *Source) drain(r *ringbuf.Reader, handle func([]byte)) {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return
 			}
-			// Persistent errors (e.g. the map torn down underneath the
-			// reader) must not hot-spin.
+			// Don't hot-spin on persistent errors.
 			if !errLogged {
 				errLogged = true
 				log.Warnf("gpu/cupti: ringbuf read: %v", err)
@@ -273,9 +254,8 @@ func (s *Source) drain(r *ringbuf.Reader, handle func([]byte)) {
 	}
 }
 
-// The wire structs mirror the C ringbuf records field-for-field (layouts
-// pinned by tests) and both supported architectures are little-endian, so a
-// direct cast replaces per-field decoding on this hot path (100k+ events/s).
+// Wire layouts are pinned by tests; both supported architectures are
+// little-endian, so the records decode with a plain copy-cast.
 
 func (s *Source) handleTiming(b []byte) {
 	if t, ok := pfunsafe.Read[KernelTiming](b); ok {
@@ -311,12 +291,10 @@ func (s *Source) handleEvent(b []byte) {
 	}
 }
 
-// OnNewPID attaches probes to a process if it maps instrumentable libraries
-// (CUPTI shim required; NCCL plugin and cuDNN/cuBLAS may be dlopen'd later
-// and are re-checked every extrasRecheck for the attachment's lifetime).
-// Detects PID reuse via starttime in both the attached and backed-off states,
-// so a reused PID neither keeps the dead owner's probes nor inherits its
-// backoff. Idempotent; serialized under s.mu.
+// OnNewPID attaches probes to a process if it maps the shim, re-checks
+// attached PIDs for late-dlopen'd libraries, and detects PID reuse via
+// starttime (a reused PID must neither keep the dead owner's probes nor
+// inherit its backoff). Idempotent.
 func (s *Source) OnNewPID(pid int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -325,9 +303,8 @@ func (s *Source) OnNewPID(pid int) {
 	}
 	now := time.Now()
 	if pa, ok := s.pids[pid]; ok {
-		// A starttime of 0 means /proc was unreadable (here or at attach):
-		// identity is unknown, so do NOT detach — a transient read failure
-		// must not be mistaken for reuse. Reconcile handles truly-dead PIDs.
+		// starttime 0 = /proc unreadable = identity unknown: never detach on
+		// it (Reconcile handles truly-dead PIDs).
 		cur := readStarttime(pid)
 		if cur == 0 || pa.starttime == 0 || cur == pa.starttime {
 			if now.After(pa.nextExtras) {
@@ -336,8 +313,7 @@ func (s *Source) OnNewPID(pid int) {
 			}
 			return
 		}
-		// PID reuse: the attachment belongs to a dead process. Detach, drop
-		// its aggregation state, and fall through to a fresh scan.
+		// PID reuse: detach the dead owner, drop its state, re-scan fresh.
 		closeLinks(pa.links)
 		delete(s.pids, pid)
 		if s.cfg.OnPIDGone != nil {
@@ -346,15 +322,15 @@ func (s *Source) OnNewPID(pid int) {
 	}
 	if e, ok := s.noShim[pid]; ok && now.Before(e.next) {
 		if cur := readStarttime(pid); cur == 0 || e.starttime == 0 || cur == e.starttime {
-			return // same (or indeterminable) owner: honor the backoff
+			return // same (or unknown) owner: honor the backoff
 		}
-		delete(s.noShim, pid) // backoff belonged to the PID's previous owner
+		delete(s.noShim, pid) // backoff belonged to the previous owner
 	}
 	s.scanAndAttachLocked(pid, now)
 }
 
-// backoffLocked schedules the next scan for a PID without the shim (or whose
-// attach failed). Effective schedule: 10s, 20s, then every 30s.
+// backoffLocked schedules the next scan for a shimless/attach-failed PID:
+// 10s, 20s, then every 30s.
 func (s *Source) backoffLocked(pid int, now time.Time) {
 	e := s.noShim[pid]
 	if e.starttime == 0 {
@@ -365,14 +341,10 @@ func (s *Source) backoffLocked(pid int, now time.Time) {
 	s.noShim[pid] = e
 }
 
-// scanAndAttachLocked scans the PID's mappings and attaches the shim probes
-// plus any instrumentable extras.
 func (s *Source) scanAndAttachLocked(pid int, now time.Time) {
 	libs, err := scanLibs(pid)
 	if err != nil {
-		// Unreadable maps (EMFILE, racing exit) is not "no shim": skip the
-		// backoff escalation and let the next rescan tick retry.
-		return
+		return // unreadable maps is not "no shim"; retry next tick
 	}
 	shim := libs[shimSoName]
 	if shim == "" {
@@ -402,14 +374,13 @@ func (s *Source) scanAndAttachLocked(pid int, now time.Time) {
 	s.attachExtrasLocked(pid, pa)
 }
 
-// readStarttime returns /proc/<pid>/stat field 22 (process start time in
-// clock ticks), or 0 if unreadable.
+// readStarttime returns /proc/<pid>/stat starttime, or 0 if unreadable.
 func readStarttime(pid int) uint64 {
 	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
 		return 0
 	}
-	// Skip past the comm field, which may contain spaces.
+	// comm may contain spaces; skip past it.
 	i := bytes.LastIndexByte(b, ')')
 	if i < 0 {
 		return 0
@@ -423,8 +394,7 @@ func readStarttime(pid int) uint64 {
 }
 
 // attachExtrasLocked attaches the optional per-library probes (NCCL plugin
-// USDT, cuDNN/cuBLAS API spans). Failures are not retried; an unreadable
-// maps file is retried at the next extras recheck.
+// USDT, cuDNN/cuBLAS API spans). Failures are not retried.
 func (s *Source) attachExtrasLocked(pid int, pa *pidAttachment) {
 	libs, err := scanLibs(pid)
 	if err != nil {
@@ -473,8 +443,7 @@ func (s *Source) attachUSDT(pid int, path string,
 			continue
 		}
 		prog := s.cfg.Progs[progName]
-		// The library may be a different build than this agent (injected
-		// independently); a probe whose arg spec is not the pinned register
+		// An independently-injected shim build with a different arg spec
 		// would be silently misdecoded — refuse it loudly.
 		if p.Arguments != expectedArgSpec {
 			closeLinks(links)
@@ -496,8 +465,7 @@ func (s *Source) attachUSDT(pid int, path string,
 }
 
 // openExecutable wraps link.OpenExecutable with a chmod fallback: cilium
-// v0.21 still requires the exec bit, but pip-installed CUDA libraries ship
-// 0644 (uprobes must target the original inode, so copying is no option).
+// v0.21 requires the exec bit, but pip-installed CUDA libraries ship 0644.
 // Drop once a cilium release without the check is pinned.
 func openExecutable(path string) (*link.Executable, error) {
 	exe, err := link.OpenExecutable(path)
@@ -512,9 +480,8 @@ func openExecutable(path string) (*link.Executable, error) {
 	return nil, err
 }
 
-// attachAPISymbols attaches enter/exit span probes to the curated API symbols
-// of a cuDNN/cuBLAS library. Missing symbols are skipped (library versions
-// differ); the attach cookie is the symbol's index into apiSymbols.
+// attachAPISymbols attaches enter/exit span probes to the curated cuDNN/
+// cuBLAS symbols; the attach cookie is the symbol's index into apiSymbols.
 func (s *Source) attachAPISymbols(pid int, lib, path string) ([]link.Link, error) {
 	exe, err := openExecutable(path)
 	if err != nil {
@@ -548,9 +515,8 @@ func closeLinks(links []link.Link) {
 	}
 }
 
-// Reconcile detaches probes from PIDs no longer alive and returns them (so
-// the caller can drop their aggregation state). Without this the uprobe fds
-// leak and a reused PID would inherit a stale attachment.
+// Reconcile detaches probes from PIDs no longer alive and returns them so
+// the caller can drop their aggregation state.
 func (s *Source) Reconcile(live map[int]struct{}) []int {
 	s.mu.Lock()
 	if s.closed {
@@ -606,18 +572,15 @@ func (s *Source) Stop() error {
 	return nil
 }
 
-// instrumentable library keys; values of scanLibs.
 const ncclSoName = "libotelnccl.so"
 
 var apiLibs = []string{"libcudnn.so", "libcublas.so", "libcublasLt.so"}
 
-// scanLibs returns the paths of instrumentable libraries mapped by pid,
-// keyed by library name (shim, NCCL plugin, API libraries). Paths are
-// resolved through /proc/<pid>/root so they reference the file in the
-// process's mount namespace — a same-named host path could be a different
-// inode, and uprobes are inode-bound. The error return distinguishes
-// "maps unreadable" from "no instrumentable libraries": callers must not
-// turn a transient read failure into backoff or detach decisions.
+// scanLibs returns the instrumentable libraries mapped by pid, keyed by
+// library name. Paths resolve through /proc/<pid>/root (uprobes are
+// inode-bound; a same-named host path could differ). The error return
+// distinguishes "maps unreadable" from "no libraries" — callers must not
+// turn a read failure into backoff or detach decisions.
 func scanLibs(pid int) (map[string]string, error) {
 	out := map[string]string{}
 	f, err := os.Open("/proc/" + strconv.Itoa(pid) + "/maps")
@@ -628,9 +591,8 @@ func scanLibs(pid int) (map[string]string, error) {
 	procRoot := "/proc/" + strconv.Itoa(pid) + "/root"
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		line := sc.Bytes() // byte view: no per-line string alloc
-		// Path starts at the first '/' (earlier columns never contain one)
-		// and may itself contain spaces, so don't field-split it.
+		line := sc.Bytes()
+		// Path starts at the first '/' and may contain spaces: no field-split.
 		i := bytes.IndexByte(line, '/')
 		if i < 0 {
 			continue
@@ -659,8 +621,7 @@ func scanLibs(pid int) (map[string]string, error) {
 			out[key] = path
 		}
 	}
-	// A mid-stream scan failure means partial results: the shim could be in
-	// the unread remainder, so it must not be reported as "not mapped".
+	// Partial results must not read as "shim not mapped".
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}

@@ -11,26 +11,21 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
 
-// TracerMaps is the set of loaded eBPF maps owned by the main tracer.
-// Custom probes receive a read-only view; they must not close or replace maps.
+// TracerMaps is the tracer's loaded eBPF map set. Probes get a read-only
+// view: never close or replace entries.
 type TracerMaps = map[string]*cebpf.Map
 
-// ReporterMetadata is an alias for the probe-origin metadata type in the
-// reporter/samples package. Defined here so probe implementations only need
-// to import this package, not reporter/samples.
+// ReporterMetadata aliases the probe-origin metadata type so probe
+// implementations only import this package.
 type ReporterMetadata = samples.ProbeOriginMetadata
 
-// Probe is implemented by any custom profiling source that integrates with
-// the tracer. The pattern follows the RFC in PR #1326 of the upstream repo:
-// each probe is self-contained, loads its own BPF programs, and receives a
-// dynamically assigned origin ID so the reporter can emit correct sample types.
+// Probe is a self-contained custom profiling source (upstream PR #1326
+// pattern): it loads its own BPF programs and receives a dynamically
+// assigned origin ID.
 type Probe interface {
-	// Load attaches the probe. The tracer assigns origin so the probe can tag
-	// emitted samples. maps is the tracer's shared map collection (read-only).
-	// Returns a link whose Close() tears down all probe resources.
+	// Load attaches the probe; the returned link's Close() tears it down.
 	Load(origin libpf.Origin, maps TracerMaps) (link.Link, error)
 
-	// ReportMetadata returns pprof sample-type metadata for this probe.
-	// Called once by Enable() to register the origin with the reporter.
+	// ReportMetadata returns the probe's pprof sample-type metadata.
 	ReportMetadata() ReporterMetadata
 }

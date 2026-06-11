@@ -80,8 +80,7 @@ func (p *Pdata) Generate(tree samples.TraceEventsTree,
 
 	attrMgr := samples.NewAttrTableManager(stringSet, dic.AttributeTable())
 
-	// Build a stable, sorted list of all dynamic probe origins so that
-	// Generate() produces deterministic profile ordering across runs.
+	// Sort dynamic probe origins for deterministic profile ordering.
 	dynamicOrigins := make([]libpf.Origin, 0, len(p.ProbeOrigins))
 	for origin := range p.ProbeOrigins {
 		dynamicOrigins = append(dynamicOrigins, origin)
@@ -119,10 +118,8 @@ func (p *Pdata) Generate(tree samples.TraceEventsTree,
 				continue
 			}
 			if !p.originSupported(origin) {
-				// An origin with events but no registered sample type (e.g. a
-				// dynamic probe origin whose metadata has not yet synced). Skip
-				// just this profile rather than failing the whole report, which
-				// would drop every other profile too.
+				// Origin with events but no registered sample type (metadata
+				// not yet synced): skip this profile, not the whole report.
 				log.Errorf("skipping profile for unsupported origin %d", origin)
 				continue
 			}
@@ -159,10 +156,8 @@ func (p *Pdata) Generate(tree samples.TraceEventsTree,
 	return profiles, nil
 }
 
-// originSupported reports whether setProfile can assign a sample type for the
-// origin: the three static origins are always supported, and a dynamic probe
-// origin is supported once its metadata has been registered via
-// RegisterProbeOrigin (mirrored into ProbeOrigins).
+// originSupported reports whether setProfile can assign a sample type:
+// static origins always; dynamic ones once their metadata is registered.
 func (p *Pdata) originSupported(origin libpf.Origin) bool {
 	switch origin {
 	case support.TraceOriginSampling, support.TraceOriginOffCPU, support.TraceOriginProbe,
@@ -207,8 +202,8 @@ func (p *Pdata) setProfile(
 		st.SetTypeStrindex(stringSet.Add("events"))
 		st.SetUnitStrindex(stringSet.Add("count"))
 	case support.TraceOriginGPU:
-		// Sampled host stacks at CUDA launch sites; each sample's Value is the
-		// sample rate, so the summed count approximates total kernel launches.
+		// Host stacks at CUDA launch sites; summed Values approximate total
+		// kernel launches.
 		st.SetTypeStrindex(stringSet.Add("gpu_kernel_launches"))
 		st.SetUnitStrindex(stringSet.Add("count"))
 	default:

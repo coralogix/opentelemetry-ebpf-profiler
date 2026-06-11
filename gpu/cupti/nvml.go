@@ -14,17 +14,16 @@ import (
 )
 
 // BusyPoller samples per-process GPU utilization via `nvidia-smi pmon`
-// (util% × interval = estimated GPU busy time). Covers CUDA processes
-// without the shim injected. nvidia-smi instead of libnvidia-ml because the
-// profiler builds CGO_ENABLED=0.
+// (util% × interval ≈ busy time); covers processes without the shim.
+// nvidia-smi rather than libnvidia-ml: the profiler builds CGO_ENABLED=0.
 type BusyPoller struct {
 	report   func(pid uint32, busyNs int64)
 	interval time.Duration
 	argv     []string
 }
 
-// NewBusyPoller locates nvidia-smi (PATH, then the host rootfs for
-// containerized agents with hostPID); nil if unavailable.
+// NewBusyPoller locates nvidia-smi (PATH, then the host rootfs); nil if
+// unavailable.
 func NewBusyPoller(report func(pid uint32, busyNs int64)) *BusyPoller {
 	if p, err := exec.LookPath("nvidia-smi"); err == nil {
 		return &BusyPoller{report: report, interval: 5 * time.Second,
@@ -32,8 +31,8 @@ func NewBusyPoller(report func(pid uint32, busyNs int64)) *BusyPoller {
 	}
 	for _, hostPath := range []string{"/usr/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi"} {
 		if _, err := os.Stat("/proc/1/root" + hostPath); err == nil {
-			// Host binary needs the host's libnvidia-ml → enter its mount ns,
-			// running the discovered host path (it may not be in PATH there).
+			// The host binary needs the host's libnvidia-ml → run it in the
+			// host mount namespace.
 			if ns, err := exec.LookPath("nsenter"); err == nil {
 				return &BusyPoller{report: report, interval: 5 * time.Second,
 					argv: []string{ns, "-t", "1", "-m", "--", hostPath, "pmon", "-c", "1"}}
@@ -44,7 +43,7 @@ func NewBusyPoller(report func(pid uint32, busyNs int64)) *BusyPoller {
 }
 
 func (b *BusyPoller) poll() {
-	// nvidia-smi hangs when the driver is wedged; never block the poller.
+	// nvidia-smi can hang on a wedged driver; never block the poller.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, b.argv[0], b.argv[1:]...).Output()

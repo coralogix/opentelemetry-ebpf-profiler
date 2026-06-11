@@ -399,8 +399,7 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 	meta.APMServiceName = pm.maybeNotifyAPMAgent(bpfTrace, trace.Hash, 1)
 
 	// TRACE_GPU traces carry a correlation id in meta.Value, not a metric:
-	// hand them to the GPU matcher (which owns GPU reporting) and never
-	// report them raw — even with no observer registered.
+	// hand them to the GPU matcher, never report them raw.
 	if meta.Origin == support.TraceOriginGPU {
 		if obs := pm.gpuLaunchObserver.Load(); obs != nil {
 			(*obs)(trace, meta)
