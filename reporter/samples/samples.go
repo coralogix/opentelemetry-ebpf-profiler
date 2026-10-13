@@ -67,6 +67,18 @@ type ResourceKey struct {
 	PID int64
 }
 
+// ProbeOriginMetadata describes the sample type emitted by a custom probe.
+// It mirrors the fields needed to populate a pprof SampleType entry.
+type ProbeOriginMetadata struct {
+	// Typ is the pprof sample type string (e.g. "gpu_kernel_count").
+	Typ string
+	// Unit is the pprof sample unit string (e.g. "count", "nanoseconds").
+	Unit string
+	// ReportValues controls whether per-sample values are emitted (true)
+	// or only counts (false).
+	ReportValues bool
+}
+
 // SampleKey holds a unique trace hash and its dedicated meta data.
 type SampleKey struct {
 	// ExtraMeta stores extra meta info that may have been produced by a

@@ -14,3 +14,14 @@ cmd/otelcol-ebpf-profiler/*.go
 cmd/otelcol-ebpf-profiler/go.mod
 cmd/otelcol-ebpf-profiler/go.sum
 otelcol-ebpf-profiler
+
+# GPU profiling (gpu/cupti): NVIDIA redistributables staged at deploy time
+# (licensing), bare local builds, and compiled test binaries. The per-(arch,
+# CUDA) shim and NCCL plugin artifacts ARE committed, like the eBPF blobs.
+gpu/cupti/libcupti.so.*
+gpu/cupti/libnvToolsExt.so.*
+gpu/cupti/libotelcupti.so
+gpu/cupti/libotelnccl.so
+gpu/cupti/test/nvtx_app
+gpu/cupti/test/usdt_producer
+gpu/cupti/test/uvm_app

@@ -25,6 +25,10 @@ const (
 	FrameMarkerLuaJIT  = 0xd
 	FrameMarkerBEAM    = 0xc
 	FrameMarkerGo      = 0xb
+
+	FrameMarkerGPUKernel = 0xe
+
+	FrameMarkerGPUMetric = 0xf
 )
 
 const (
@@ -89,10 +93,12 @@ const (
 )
 
 const (
-	TraceOriginUnknown  = 0x0
-	TraceOriginSampling = 0x1
-	TraceOriginOffCPU   = 0x2
-	TraceOriginProbe    = 0x3
+	TraceOriginUnknown   = 0x0
+	TraceOriginSampling  = 0x1
+	TraceOriginOffCPU    = 0x2
+	TraceOriginProbe     = 0x3
+	TraceOriginGPU       = 0x4
+	TraceOriginGPUMetric = 0x5
 )
 
 type ApmSpanID [8]byte

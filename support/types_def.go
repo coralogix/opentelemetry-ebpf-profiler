@@ -31,6 +31,10 @@ const (
 	FrameMarkerLuaJIT  = C.FRAME_MARKER_LUAJIT
 	FrameMarkerBEAM    = C.FRAME_MARKER_BEAM
 	FrameMarkerGo      = C.FRAME_MARKER_GO
+	// FrameMarkerGPUKernel marks a synthetic GPU kernel frame.
+	FrameMarkerGPUKernel = C.FRAME_MARKER_GPU_KERNEL
+	// FrameMarkerGPUMetric marks a synthetic GPU utilisation/metric frame.
+	FrameMarkerGPUMetric = C.FRAME_MARKER_GPU_METRIC
 )
 
 const (
@@ -98,10 +102,12 @@ const (
 )
 
 const (
-	TraceOriginUnknown  = C.TRACE_UNKNOWN
-	TraceOriginSampling = C.TRACE_SAMPLING
-	TraceOriginOffCPU   = C.TRACE_OFF_CPU
-	TraceOriginProbe    = C.TRACE_PROBE
+	TraceOriginUnknown   = C.TRACE_UNKNOWN
+	TraceOriginSampling  = C.TRACE_SAMPLING
+	TraceOriginOffCPU    = C.TRACE_OFF_CPU
+	TraceOriginProbe     = C.TRACE_PROBE
+	TraceOriginGPU       = C.TRACE_GPU
+	TraceOriginGPUMetric = C.TRACE_GPU_METRIC
 )
 
 type ApmSpanID C.ApmSpanID

@@ -27,6 +27,19 @@ func FromSlice[T any](data []T) []byte {
 	)
 }
 
+// Read copies b's prefix into a value of type T, returning false if b is too
+// short. For decoding fixed-layout kernel records. Copying (not casting the
+// slice pointer) keeps it valid for unaligned b.
+func Read[T any](b []byte) (T, bool) {
+	var v T
+	size := int(unsafe.Sizeof(v))
+	if len(b) < size {
+		return v, false
+	}
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), size), b)
+	return v, true
+}
+
 // ToString converts a byte slice into a string without a heap allocation.
 // Be aware that the byte slice and the string share the same memory - which makes
 // the string mutable.

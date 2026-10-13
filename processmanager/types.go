@@ -18,9 +18,14 @@ import (
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	eim "go.opentelemetry.io/ebpf-profiler/processmanager/execinfomanager"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/times"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
+
+// GPULaunchObserver receives every TRACE_GPU trace: the host launch stack
+// plus meta whose Value carries the CUPTI correlation id.
+type GPULaunchObserver func(*libpf.Trace, *samples.TraceEventMeta)
 
 // elfInfo contains cached data from an executable needed for processing mappings.
 // A negative cache entry may also be recorded with err set to indicate permanent
@@ -74,6 +79,10 @@ type ProcessManager struct {
 	// frame conversion
 	frameCacheHit  atomic.Uint64
 	frameCacheMiss atomic.Uint64
+
+	// gpuLaunchObserver, if set, is invoked for each TRACE_GPU trace before it
+	// is reported (see GPULaunchObserver). nil = no observer.
+	gpuLaunchObserver atomic.Pointer[GPULaunchObserver]
 
 	// mappingStats are statistics for parsing process mappings
 	mappingStats struct {

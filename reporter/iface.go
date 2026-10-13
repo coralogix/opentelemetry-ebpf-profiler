@@ -50,6 +50,12 @@ type ExecutableMetadata struct {
 	DebuglinkFileName string
 }
 
+// ProbeRegistrar is implemented by reporters that accept dynamic probe
+// origins with pprof sample-type metadata.
+type ProbeRegistrar interface {
+	RegisterProbeOrigin(libpf.Origin, samples.ProbeOriginMetadata) error
+}
+
 // ExecutableReporter is an optional interface to allow uploading files. There is
 // no implementation in opentelemetry-ebpf-profiler for this, but it is kept to
 // support this functionality in other (non-tree) protocol implementations.
