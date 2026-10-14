@@ -139,6 +139,14 @@ type Intervals interface {
 	ExecutableUnloadDelay() time.Duration
 }
 
+// probeOwnedMaps are created on demand by the probes using them, not at startup.
+var probeOwnedMaps = libpf.Set[string]{
+	// Off-CPU probe.
+	"sched_times": {},
+	// GPU probe.
+	"gpu_events": {},
+}
+
 // onlineCPUs once resolves and caches the list of online CPUs.
 var onlineCPUsOnce = sync.OnceValues(getOnlineCPUIDs)
 
@@ -730,8 +738,7 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 	noPrealloc := probeNoPrealloc()
 
 	for mapName, mapSpec := range coll.Maps {
-		if mapName == "sched_times" {
-			// sched_times is owned by the off-CPU probe and created there on demand.
+		if _, ok := probeOwnedMaps[mapName]; ok {
 			continue
 		}
 		if mapName == obiSpanTracesMap {

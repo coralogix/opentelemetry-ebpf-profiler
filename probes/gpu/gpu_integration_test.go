@@ -6,9 +6,11 @@
 package gpu_test
 
 import (
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -193,6 +195,61 @@ func TestLaunchStacks(t *testing.T) {
 		}
 	}
 	require.Equal(t, fired.launchWeights, weights)
+}
+
+// collectGPUProfiles collects the snapshot samples of pid until the totals by
+// profile type reach want. It returns the totals by profile type, then by leaf.
+func collectGPUProfiles(t *testing.T, trc *tracer.Tracer, pid libpf.PID,
+	want map[string]int64,
+) map[string]map[string]int64 {
+	t.Helper()
+	totals := make(map[string]int64)
+	byLeaf := make(map[string]map[string]int64)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		for _, profile := range trc.CollectSnapshots() {
+			sampleType := profile.ProfileType.SampleType
+			for _, sample := range profile.Samples {
+				if sample.PID != pid {
+					continue
+				}
+				leaf := sample.Frames[0].Value()
+				require.Equal(t, libpf.GPUFrame, leaf.Type)
+				require.True(t, inProducer(t, sample.Frames[1:]),
+					"%s %s has no launch stack", sampleType, leaf.FunctionName)
+				require.NotNil(t, sample.ProcessMeta)
+				require.Equal(t, "producer",
+					filepath.Base(sample.ProcessMeta.ExecutablePath.String()))
+				if byLeaf[sampleType] == nil {
+					byLeaf[sampleType] = make(map[string]int64)
+				}
+				byLeaf[sampleType][leaf.FunctionName.String()] += sample.Value
+				totals[sampleType] += sample.Value
+			}
+		}
+		if maps.Equal(totals, want) {
+			break
+		}
+	}
+	require.Equal(t, want, totals)
+	return byLeaf
+}
+
+func TestGPUProfiles(t *testing.T) {
+	rep := &recordingReporter{}
+	trc, _ := startTracer(t, rep, gpu.Config{})
+	fired := runProducer(t, 3)
+
+	byLeaf := collectGPUProfiles(t, trc, fired.pid, map[string]int64{
+		"gpu_kernel_time": fired.kernelNs,
+		"gpu_mem_time":    fired.memNs,
+		"gpu_mem_bytes":   fired.memBytes,
+	})
+	require.Equal(t, []string{"graph_step", "vector_add"},
+		slices.Sorted(maps.Keys(byLeaf["gpu_kernel_time"])))
+	require.Equal(t, []string{"memcpy:HtoD", "memset"},
+		slices.Sorted(maps.Keys(byLeaf["gpu_mem_time"])))
 }
 
 // inProducer reports whether frames run code of the producer executable.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"runtime"
 	"slices"
+	"time"
 
 	"github.com/cilium/ebpf/link"
 
@@ -70,6 +71,7 @@ func (p *probe) Detach(pid libpf.PID) {
 	delete(p.links, pid)
 	p.mu.Unlock()
 
+	p.matcher.processExited(pid, time.Now())
 	for _, links := range files {
 		if err := closeLinks(links); err != nil {
 			log.Debugf("gpu: detaching PID %d: %v", pid, err)
