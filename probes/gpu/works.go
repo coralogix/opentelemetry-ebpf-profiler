@@ -14,6 +14,8 @@ var (
 	memTimeProfileType    = gpuProfileType("gpu_mem_time", "nanoseconds")
 	memBytesProfileType   = gpuProfileType("gpu_mem_bytes", "bytes")
 	allocBytesProfileType = gpuProfileType("gpu_alloc_bytes", "bytes")
+	uvmBytesProfileType   = gpuProfileType("gpu_uvm_bytes", "bytes")
+	uvmFaultsProfileType  = gpuProfileType("gpu_uvm_faults", "count")
 )
 
 // gpuProfileType describes a profile of GPU work. Its samples aggregate GPU
@@ -115,7 +117,21 @@ func memcpyWork(rec memcpyRecord, ranges string) gpuWork {
 // eventWork translates GPU events; ok is false for unknown kinds.
 func eventWork(rec eventRecord) (work gpuWork, ok bool) {
 	work = gpuWork{pid: rec.pid, correlationID: rec.correlationID}
+	// Unified memory counters are reported for the process as a whole.
+	uvm := gpuWork{pid: rec.pid, noLaunch: true}
 	switch rec.kind {
+	case eventUVMHtoD:
+		uvm.leaf = "uvm:HtoD"
+		return uvm.withValue(uvmBytesProfileType, int64(rec.v1)), true
+	case eventUVMDtoH:
+		uvm.leaf = "uvm:DtoH"
+		return uvm.withValue(uvmBytesProfileType, int64(rec.v1)), true
+	case eventUVMCPUFault:
+		uvm.leaf = "uvm:cpu_fault"
+		return uvm.withValue(uvmFaultsProfileType, int64(rec.v1)), true
+	case eventUVMGPUFault:
+		uvm.leaf = "uvm:gpu_fault"
+		return uvm.withValue(uvmFaultsProfileType, int64(rec.v1)), true
 	case eventAlloc:
 		work.leaf = "alloc:" + kindName(memoryKinds[:], rec.v2)
 		return work.withValue(allocBytesProfileType, int64(rec.v1)).scaled(rec.sampleWeight), true

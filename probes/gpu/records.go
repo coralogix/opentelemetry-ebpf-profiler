@@ -30,9 +30,13 @@ const (
 
 // Kinds of otel_gpu event records.
 const (
-	eventAlloc  uint32 = 5
-	eventFree   uint32 = 6
-	eventMemset uint32 = 7
+	eventUVMHtoD     uint32 = 1
+	eventUVMDtoH     uint32 = 2
+	eventUVMCPUFault uint32 = 3
+	eventUVMGPUFault uint32 = 4
+	eventAlloc       uint32 = 5
+	eventFree        uint32 = 6
+	eventMemset      uint32 = 7
 )
 
 // kernelRecord is one kernel execution measured on the GPU.
