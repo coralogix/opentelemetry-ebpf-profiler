@@ -25,6 +25,7 @@ func TestDecodeKernelRecord(t *testing.T) {
 	le.PutUint32(b[24:], 7)
 	le.PutUint32(b[36:], 3)
 	le.PutUint64(b[40:], 0xdead)
+	le.PutUint64(b[48:], 0xbeef)
 	le.PutUint32(b[56:], 5)
 
 	recordType, pid, ok := recordHeader(b)
@@ -41,6 +42,7 @@ func TestDecodeKernelRecord(t *testing.T) {
 		correlationID: 7,
 		graphID:       3,
 		namePtr:       0xdead,
+		rangesPtr:     0xbeef,
 		sampleWeight:  5,
 	}, rec)
 
@@ -110,7 +112,8 @@ func TestDecodeMemcpyAndEventRecords(t *testing.T) {
 	memcpy, ok := decodeMemcpyRecord(5, b)
 	require.True(t, ok)
 	assert.Equal(t, memcpyRecord{
-		pid: 5, start: 100, end: 160, correlationID: 9, copyKind: 2, bytes: 4096, sampleWeight: 2,
+		pid: 5, start: 100, end: 160, correlationID: 9, copyKind: 2, bytes: 4096, rangesPtr: 0xbeef,
+		sampleWeight: 2,
 	}, memcpy)
 
 	le.PutUint32(b[24:], eventMemset)

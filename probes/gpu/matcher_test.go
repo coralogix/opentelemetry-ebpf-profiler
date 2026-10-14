@@ -30,7 +30,7 @@ func kernel(correlationID uint32, duration uint64) kernelRecord {
 
 // addKernel adds a kernel execution to m.
 func addKernel(m *matcher, rec kernelRecord, name string, now time.Time) {
-	m.addWork(kernelWork(rec, name), now)
+	m.addWork(kernelWork(rec, name, ""), now)
 }
 
 // liveProcesses fakes the tracer's process metadata for the PIDs in it.
@@ -199,7 +199,7 @@ func TestMatcherMemoryOperationsKeepLaunch(t *testing.T) {
 	m.addLaunch(testPID, 1, hostTrace(0x10), now)
 	// A graph's copy and kernel share the correlation id.
 	m.addWork(memcpyWork(memcpyRecord{pid: testPID, correlationID: 1, end: 5, copyKind: 1,
-		bytes: 64}), now)
+		bytes: 64}, ""), now)
 	graphKernel := kernel(1, 3)
 	graphKernel.graphID = 2
 	addKernel(m, graphKernel, "k", now)
@@ -216,6 +216,32 @@ func TestMatcherMemoryOperationsKeepLaunch(t *testing.T) {
 		"gpu_mem_bytes":   64,
 		"gpu_kernel_time": 3,
 	}, byType)
+}
+
+func TestMatcherRanges(t *testing.T) {
+	m := newTestMatcher(t, liveProcesses{testPID: "/bin/app"})
+	now := time.Now()
+	m.addLaunch(testPID, 1, hostTrace(0x10), now)
+	m.addWork(kernelWork(kernel(1, 5), "k", "aten::mm\x1faten::matmul\x1ftrain_step"), now)
+	m.addLaunch(testPID, 2, hostTrace(0x10), now)
+	m.addWork(kernelWork(kernel(2, 7), "k", ""), now)
+
+	profiles := m.snapshot(now)
+	require.Len(t, profiles, 1)
+	require.Len(t, profiles[0].Samples, 2, "ranges split samples")
+	var names [][]string
+	for _, s := range profiles[0].Samples {
+		var frameNames []string
+		for _, frame := range s.Frames {
+			frameNames = append(frameNames, frame.Value().FunctionName.String())
+		}
+		names = append(names, frameNames)
+	}
+	assert.ElementsMatch(t, [][]string{
+		{"k", "range:aten::mm", "range:aten::matmul", "range:train_step", ""},
+		{"k", ""},
+	}, names)
+	assert.NotEqual(t, profiles[0].Samples[0].TraceHash, profiles[0].Samples[1].TraceHash)
 }
 
 func TestMatcherMergesPendingGraphWork(t *testing.T) {

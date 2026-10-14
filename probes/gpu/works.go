@@ -80,7 +80,7 @@ func (w gpuWork) scaled(sampleWeight uint32) gpuWork {
 	return w
 }
 
-func kernelWork(rec kernelRecord, name string) gpuWork {
+func kernelWork(rec kernelRecord, name, ranges string) gpuWork {
 	if name == "" {
 		name = unknownKernel
 	}
@@ -88,6 +88,7 @@ func kernelWork(rec kernelRecord, name string) gpuWork {
 		pid:            rec.pid,
 		correlationID:  rec.correlationID,
 		leaf:           name,
+		ranges:         ranges,
 		consumesLaunch: rec.graphID == 0,
 	}.withValue(kernelTimeProfileType, duration(rec.start, rec.end)).scaled(rec.sampleWeight)
 }
@@ -95,11 +96,12 @@ func kernelWork(rec kernelRecord, name string) gpuWork {
 // memcpyWork is a memory copy. Its launch is kept: a CUDA graph shares one
 // correlation id between its kernels and memory copies, and copy records do not
 // say whether they ran in a graph.
-func memcpyWork(rec memcpyRecord) gpuWork {
+func memcpyWork(rec memcpyRecord, ranges string) gpuWork {
 	return gpuWork{
 		pid:           rec.pid,
 		correlationID: rec.correlationID,
 		leaf:          "memcpy:" + kindName(copyKinds[:], uint64(rec.copyKind)),
+		ranges:        ranges,
 	}.withValue(memTimeProfileType, duration(rec.start, rec.end)).
 		withValue(memBytesProfileType, int64(rec.bytes)).
 		scaled(rec.sampleWeight)
