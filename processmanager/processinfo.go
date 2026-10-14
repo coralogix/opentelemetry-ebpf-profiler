@@ -455,7 +455,6 @@ func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapp
 			anonymousMappingsWanted = updatedAnonymousMappingsWanted
 		}
 	}
-	pm.attachProbesForMapping(pr, m)
 	pm.mu.Unlock()
 
 	return libpf.NewFrameMapping(libpf.FrameMappingData{
@@ -665,6 +664,8 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	capHint := max(32, min(len(oldMappings), 256))
 	mappings := make([]Mapping, 0, capHint)
 	mpAdd := make([]*Mapping, 0, capHint)
+	// attach holds the new mappings to attach probes to, once eBPF knows them.
+	var attach []process.RawMapping
 
 	pm.mappingStats.numProcAttempts.Add(1)
 	start := time.Now()
@@ -732,6 +733,7 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 				})
 				if newMapping {
 					mpAdd = append(mpAdd, &mappings[len(mappings)-1])
+					attach = append(attach, m)
 				}
 			}
 		}
@@ -831,6 +833,10 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 			info.meta = meta
 		}
 		info.processContext = newProcessContextInfo
+		// Probes fire right after attaching: their traces must find the process.
+		for i := range attach {
+			pm.attachProbesForMapping(pr, &attach[i])
+		}
 	}
 	interpreters := pm.interpreters[pid]
 	pm.mu.Unlock()
