@@ -219,6 +219,8 @@ func (p *probe) handleRecord(b []byte) {
 		case eventStall:
 			p.matcher.addWork(stallWork(rec, p.names.resolve(pid, rec.namePtr),
 				p.names.resolve(pid, rec.v1)), now)
+		case eventCollective:
+			p.matcher.addWork(collectiveWork(rec, p.names.resolve(pid, rec.namePtr)), now)
 		default:
 			if work, ok := eventWork(rec); ok {
 				p.matcher.addWork(work, now)

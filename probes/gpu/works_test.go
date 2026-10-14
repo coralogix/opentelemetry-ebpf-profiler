@@ -109,3 +109,17 @@ func TestStallWork(t *testing.T) {
 	assert.Empty(t, stallWork(eventRecord{v2: 12}, "", "reason").values)
 	assert.Empty(t, stallWork(eventRecord{v2: 12}, "fn", "").values)
 }
+
+func TestCollectiveWork(t *testing.T) {
+	work := collectiveWork(eventRecord{pid: 1, kind: eventCollective, start: 100, end: 400, v1: 1 << 20},
+		"AllReduce")
+	assert.Equal(t, gpuWork{
+		pid:      1,
+		leaf:     "collective:AllReduce",
+		noLaunch: true,
+		values: []profileValue{
+			{collectiveTimeProfileType, 300}, {collectiveBytesProfileType, 1 << 20},
+		},
+	}, work)
+	assert.Equal(t, "collective:unknown", collectiveWork(eventRecord{}, "").leaf)
+}

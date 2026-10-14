@@ -199,9 +199,11 @@ func TestLaunchStacks(t *testing.T) {
 
 // processLevel are the profile types whose samples have no launch stack.
 var processLevel = map[string]bool{
-	"gpu_uvm_bytes":     true,
-	"gpu_uvm_faults":    true,
-	"gpu_stall_samples": true,
+	"gpu_uvm_bytes":        true,
+	"gpu_uvm_faults":       true,
+	"gpu_stall_samples":    true,
+	"gpu_collective_time":  true,
+	"gpu_collective_bytes": true,
 }
 
 // collectGPUProfiles collects the snapshot samples of pid until the totals by
@@ -270,12 +272,14 @@ func TestGPUProfiles(t *testing.T) {
 	fired := runProducer(t, 3)
 
 	byLeaf, byStack := collectGPUProfiles(t, trc, fired.pid, map[string]int64{
-		"gpu_kernel_time":   fired.kernelNs,
-		"gpu_mem_time":      fired.memNs,
-		"gpu_mem_bytes":     fired.memBytes,
-		"gpu_alloc_bytes":   fired.allocBytes,
-		"gpu_uvm_bytes":     fired.uvmBytes,
-		"gpu_stall_samples": fired.stalls,
+		"gpu_kernel_time":      fired.kernelNs,
+		"gpu_mem_time":         fired.memNs,
+		"gpu_mem_bytes":        fired.memBytes,
+		"gpu_alloc_bytes":      fired.allocBytes,
+		"gpu_uvm_bytes":        fired.uvmBytes,
+		"gpu_stall_samples":    fired.stalls,
+		"gpu_collective_time":  fired.collectiveNs,
+		"gpu_collective_bytes": fired.collectiveBytes,
 	})
 	require.Equal(t, []string{"graph_step", "vector_add"},
 		slices.Sorted(maps.Keys(byLeaf["gpu_kernel_time"])))
@@ -292,6 +296,8 @@ func TestGPUProfiles(t *testing.T) {
 		slices.Sorted(maps.Keys(byStack["gpu_mem_time"])))
 	require.Equal(t, []string{"stall:memory_dependency > vector_add"},
 		slices.Sorted(maps.Keys(byStack["gpu_stall_samples"])))
+	require.Equal(t, []string{"collective:AllReduce"},
+		slices.Sorted(maps.Keys(byStack["gpu_collective_time"])))
 }
 
 // inProducer reports whether frames run code of the producer executable.
