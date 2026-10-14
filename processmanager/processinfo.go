@@ -395,14 +395,14 @@ func (pm *ProcessManager) processRemovedInterpreters(pid libpf.PID,
 
 var errInvalidVirtualAddress = errors.New("invalid ELF virtual address")
 
-func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapping,
-	anonymousMappingsWanted bool,
-) (libpf.FrameMapping, bool, error) {
+// mappingELFReference returns a reference to the ELF file of a mapping, opened
+// on first use.
+func mappingELFReference(pr process.Process, m *process.RawMapping) *pfelf.Reference {
 	// Open the mapping's own file via OpenMappingFile, which can open deleted
 	// or replaced files (e.g. via /proc/<pid>/map_files) and VDSO from process
 	// memory. Auxiliary opens such as .gnu_debuglink targets go through the
 	// pr fs.FS.
-	elfRef := pfelf.NewReferenceWithOpenFunc(m.Path, pr, func() (*pfelf.File, error) {
+	return pfelf.NewReferenceWithOpenFunc(m.Path, pr, func() (*pfelf.File, error) {
 		f, err := pr.OpenMappingFile(m)
 		if err != nil {
 			return nil, fmt.Errorf("OpenMappingFile path=%q vaddr=%#x: %w",
@@ -410,6 +410,18 @@ func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapp
 		}
 		return pfelf.NewFileFromFS(f)
 	})
+}
+
+// addedMapping is a mapping new to a process, whose file is fileID.
+type addedMapping struct {
+	mapping process.RawMapping
+	fileID  libpf.FileID
+}
+
+func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapping,
+	anonymousMappingsWanted bool,
+) (libpf.FrameMapping, bool, error) {
+	elfRef := mappingELFReference(pr, m)
 	defer elfRef.Close()
 
 	info := pm.getELFInfo(pr, m, elfRef)
@@ -457,7 +469,6 @@ func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapp
 			anonymousMappingsWanted = updatedAnonymousMappingsWanted
 		}
 	}
-	pm.attachProbesForMapping(pr, m, info.mappingFile.Value().FileID, elfRef)
 	pm.mu.Unlock()
 
 	return libpf.NewFrameMapping(libpf.FrameMappingData{
@@ -667,6 +678,8 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	capHint := max(32, min(len(oldMappings), 256))
 	mappings := make([]Mapping, 0, capHint)
 	mpAdd := make([]*Mapping, 0, capHint)
+	// attach holds the new mappings to attach probes to, once eBPF knows them.
+	var attach []addedMapping
 
 	pm.mappingStats.numProcAttempts.Add(1)
 	start := time.Now()
@@ -734,6 +747,10 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 				})
 				if newMapping {
 					mpAdd = append(mpAdd, &mappings[len(mappings)-1])
+					attach = append(attach, addedMapping{
+						mapping: m,
+						fileID:  fm.Value().File.Value().FileID,
+					})
 				}
 			}
 		}
@@ -833,6 +850,13 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 			info.meta = meta
 		}
 		info.processContext = newProcessContextInfo
+		// Probes fire right after attaching: their traces must find the process.
+		for i := range attach {
+			m := &attach[i].mapping
+			elfRef := mappingELFReference(pr, m)
+			pm.attachProbesForMapping(pr, m, attach[i].fileID, elfRef)
+			elfRef.Close()
+		}
 	}
 	interpreters := pm.interpreters[pid]
 	pm.mu.Unlock()
