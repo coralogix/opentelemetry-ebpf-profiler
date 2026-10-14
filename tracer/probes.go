@@ -6,6 +6,7 @@ package tracer // import "go.opentelemetry.io/ebpf-profiler/tracer"
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 
 	cebpf "github.com/cilium/ebpf"
@@ -486,17 +487,7 @@ func (t *Tracer) Enable(ctx context.Context, p Probe) error {
 		return fmt.Errorf("failed to load probe: %w", err)
 	}
 
-	if pth, ok := p.(PreTraceHandler); ok {
-		for _, origin := range pth.PreOrigins() {
-			t.preTraceHandlers[origin] = append(t.preTraceHandlers[origin], pth)
-		}
-	}
-
-	if pth, ok := p.(PostTraceHandler); ok {
-		for _, origin := range pth.PostOrigins() {
-			t.postTraceHandlers[origin] = append(t.postTraceHandlers[origin], pth)
-		}
-	}
+	t.addTraceHandlers(p)
 
 	if ss, ok := p.(SnapshotSource); ok {
 		t.snapshotSourcesMu.Lock()
@@ -505,6 +496,34 @@ func (t *Tracer) Enable(ctx context.Context, p Probe) error {
 	}
 
 	return nil
+}
+
+// traceHandlers holds the pre- and post-trace handlers registered per origin.
+// It is never modified once published.
+type traceHandlers struct {
+	pre  map[uint16][]PreTraceHandler
+	post map[uint16][]PostTraceHandler
+}
+
+// addTraceHandlers registers p for the origins it handles. Traces may be handled
+// concurrently, so it publishes updated copies of the handler maps.
+func (t *Tracer) addTraceHandlers(p Probe) {
+	t.traceHandlersMu.Lock()
+	defer t.traceHandlersMu.Unlock()
+
+	current := t.traceHandlers.Load()
+	next := &traceHandlers{pre: maps.Clone(current.pre), post: maps.Clone(current.post)}
+	if pth, ok := p.(PreTraceHandler); ok {
+		for _, origin := range pth.PreOrigins() {
+			next.pre[origin] = append(slices.Clip(next.pre[origin]), pth)
+		}
+	}
+	if pth, ok := p.(PostTraceHandler); ok {
+		for _, origin := range pth.PostOrigins() {
+			next.post[origin] = append(slices.Clip(next.post[origin]), pth)
+		}
+	}
+	t.traceHandlers.Store(next)
 }
 
 // CollectSnapshots returns the snapshot profiles of all enabled probes that

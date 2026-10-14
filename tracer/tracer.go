@@ -209,13 +209,10 @@ type Tracer struct {
 	// profile type metadata is looked up by.
 	origins *originRegistry
 
-	// preTraceHandlers maps origin ID to pre-trace handlers registered for
-	// that origin. Only traces with a matching origin are dispatched.
-	preTraceHandlers map[uint16][]PreTraceHandler
-
-	// postTraceHandlers maps origin ID to post-trace handlers registered for
-	// that origin. Only traces with a matching origin are dispatched.
-	postTraceHandlers map[uint16][]PostTraceHandler
+	// traceHandlers holds the pre- and post-trace handlers by origin. Enable
+	// replaces it while traces are handled; traceHandlersMu serializes Enable.
+	traceHandlers   atomic.Pointer[traceHandlers]
+	traceHandlersMu sync.Mutex
 
 	// snapshotSources are the enabled probes that satisfy SnapshotSource.
 	// Enable appends while the reporter collects, hence the lock.
@@ -399,9 +396,11 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		done:                   make(chan libpf.Void),
 		origins:                origins,
 		sysConfigVars:          sysConfigVars,
-		preTraceHandlers:       make(map[uint16][]PreTraceHandler),
-		postTraceHandlers:      make(map[uint16][]PostTraceHandler),
 	}
+	tracer.traceHandlers.Store(&traceHandlers{
+		pre:  make(map[uint16][]PreTraceHandler),
+		post: make(map[uint16][]PostTraceHandler),
+	})
 	tracer.mmapEventOnce = sync.OnceValue(func() error {
 		return tracer.startMmapEventMonitor(tracer.lifecycleCtx)
 	})
@@ -1375,8 +1374,10 @@ func (t *Tracer) StartProbabilisticProfiling(ctx context.Context) {
 }
 
 func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
+	handlers := t.traceHandlers.Load()
+
 	// Pre-handlers gated by origin may consume traces before symbolization.
-	for _, h := range t.preTraceHandlers[bpfTrace.Origin] {
+	for _, h := range handlers.pre[bpfTrace.Origin] {
 		if !h.PreHandleTrace(bpfTrace) {
 			t.tracePool.Put(bpfTrace)
 			return
@@ -1388,7 +1389,7 @@ func (t *Tracer) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 	t.tracePool.Put(bpfTrace)
 
 	// Post-handlers gated by origin receive the symbolized result.
-	for _, h := range t.postTraceHandlers[origin] {
+	for _, h := range handlers.post[origin] {
 		h.PostHandleTrace(trace)
 	}
 }
