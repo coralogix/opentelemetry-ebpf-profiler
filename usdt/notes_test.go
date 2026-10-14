@@ -22,10 +22,20 @@ func TestParseSDTDescriptor(t *testing.T) {
 	assert.Equal(t, sdtNote{
 		provider:  "otel_memory",
 		name:      "alloc",
+		arguments: "8@%rdi",
 		location:  0x1200,
 		base:      0x1000,
 		semaphore: 0x2100,
 	}, note)
+}
+
+func TestParseSDTDescriptorWithoutArguments(t *testing.T) {
+	desc := buildSDTDescriptor(0x1300, 0x1000, 0, "provider", "probe", "")
+	// Drop the empty argument string and its terminator.
+	note, err := parseSDTDescriptor(desc[:len(desc)-1])
+	require.NoError(t, err)
+	assert.Equal(t, "probe", note.name)
+	assert.Empty(t, note.arguments)
 }
 
 func TestParseSDTDescriptorNoSemaphore(t *testing.T) {
@@ -133,8 +143,8 @@ func TestAttachmentPointsFromNotesContinuesAfterError(t *testing.T) {
 	}}
 	notes := []sdtNote{
 		{provider: "provider", name: "bad", location: 0x3000, base: 0x1000},
-		{provider: "provider", name: "alloc", location: 0x1020, base: 0x1000,
-			semaphore: 0x2020},
+		{provider: "provider", name: "alloc", arguments: "8@%rdi", location: 0x1020,
+			base: 0x1000, semaphore: 0x2020},
 	}
 
 	points, err := attachmentPointsFromNotes(f, 0x1000, notes)
@@ -144,6 +154,7 @@ func TestAttachmentPointsFromNotesContinuesAfterError(t *testing.T) {
 		Name:            "alloc",
 		Location:        0x220,
 		SemaphoreOffset: 0x420,
+		Arguments:       "8@%rdi",
 	}}, points)
 }
 

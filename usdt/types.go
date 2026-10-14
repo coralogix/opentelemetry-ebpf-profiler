@@ -12,4 +12,6 @@ type AttachmentPoint struct {
 	Name            string
 	Location        uint64
 	SemaphoreOffset uint64
+	// Arguments is the raw SDT argument descriptor, e.g. "8@%rdi -4@-8(%rbp)".
+	Arguments string
 }
