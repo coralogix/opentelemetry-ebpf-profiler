@@ -90,6 +90,7 @@ func attachmentPointsFromNotes(
 			Name:            note.name,
 			Location:        location,
 			SemaphoreOffset: semaphoreOffset,
+			Arguments:       note.arguments,
 		})
 	}
 	return points, errors.Join(discoveryErrs...)
