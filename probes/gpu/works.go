@@ -10,13 +10,15 @@ import (
 )
 
 var (
-	kernelTimeProfileType = gpuProfileType("gpu_kernel_time", "nanoseconds")
-	memTimeProfileType    = gpuProfileType("gpu_mem_time", "nanoseconds")
-	memBytesProfileType   = gpuProfileType("gpu_mem_bytes", "bytes")
-	allocBytesProfileType = gpuProfileType("gpu_alloc_bytes", "bytes")
-	uvmBytesProfileType   = gpuProfileType("gpu_uvm_bytes", "bytes")
-	uvmFaultsProfileType  = gpuProfileType("gpu_uvm_faults", "count")
-	stallsProfileType     = gpuProfileType("gpu_stall_samples", "count")
+	kernelTimeProfileType      = gpuProfileType("gpu_kernel_time", "nanoseconds")
+	memTimeProfileType         = gpuProfileType("gpu_mem_time", "nanoseconds")
+	memBytesProfileType        = gpuProfileType("gpu_mem_bytes", "bytes")
+	allocBytesProfileType      = gpuProfileType("gpu_alloc_bytes", "bytes")
+	uvmBytesProfileType        = gpuProfileType("gpu_uvm_bytes", "bytes")
+	uvmFaultsProfileType       = gpuProfileType("gpu_uvm_faults", "count")
+	stallsProfileType          = gpuProfileType("gpu_stall_samples", "count")
+	collectiveTimeProfileType  = gpuProfileType("gpu_collective_time", "nanoseconds")
+	collectiveBytesProfileType = gpuProfileType("gpu_collective_bytes", "bytes")
 )
 
 // gpuProfileType describes a profile of GPU work. Its samples aggregate GPU
@@ -127,6 +129,20 @@ func stallWork(rec eventRecord, function, reason string) gpuWork {
 		function: function,
 		noLaunch: true,
 	}.withValue(stallsProfileType, int64(rec.v2))
+}
+
+// collectiveWork is one collective or point-to-point operation between GPUs,
+// reported without a call site.
+func collectiveWork(rec eventRecord, operation string) gpuWork {
+	if operation == "" {
+		operation = "unknown"
+	}
+	return gpuWork{
+		pid:      rec.pid,
+		leaf:     "collective:" + operation,
+		noLaunch: true,
+	}.withValue(collectiveTimeProfileType, duration(rec.start, rec.end)).
+		withValue(collectiveBytesProfileType, int64(rec.v1))
 }
 
 // eventWork translates GPU events; ok is false for unknown kinds.
