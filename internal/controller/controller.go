@@ -111,6 +111,10 @@ func (c *Controller) Start(ctx context.Context) error {
 	c.tracer = trc
 	log.Info("eBPF tracer loaded")
 
+	if merger, ok := c.reporter.(reporter.SnapshotMerger); ok {
+		merger.SetSnapshotSources(trc.CollectSnapshots, trc.ProcessMeta)
+	}
+
 	now := time.Now()
 
 	trc.StartPIDEventProcessor(ctx)

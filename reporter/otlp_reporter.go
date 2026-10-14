@@ -122,6 +122,8 @@ func (r *OTLPReporter) reportOTLPProfile(ctx context.Context) error {
 	r.collectionStartTime = collectionEndTime
 	r.traceEvents.WUnlock(&traceEventsPtr)
 
+	r.mergeSnapshots(reportedEvents, collectionEndTime)
+
 	profiles, err := r.pdata.Generate(reportedEvents, r.name, r.version,
 		collectionStartTime, collectionEndTime)
 	if err != nil {

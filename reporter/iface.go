@@ -33,6 +33,14 @@ type TraceReporter interface {
 	ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error
 }
 
+// SnapshotMerger is implemented by reporters that merge probe-produced snapshot
+// profiles into each report. collect returns the profiles accumulated since the
+// previous call; processMeta resolves a PID to its resource metadata.
+type SnapshotMerger interface {
+	SetSnapshotSources(collect func() []samples.SnapshotProfile,
+		processMeta func(libpf.PID) samples.ProcessMeta)
+}
+
 type ExecutableMetadata struct {
 	// MappingFile is the reference to mapping file data.
 	MappingFile libpf.FrameMappingFile

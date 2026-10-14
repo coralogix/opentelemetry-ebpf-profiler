@@ -6,6 +6,7 @@ package tracer // import "go.opentelemetry.io/ebpf-profiler/tracer"
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	cebpf "github.com/cilium/ebpf"
 
@@ -22,6 +23,7 @@ type ProbeContext struct {
 	maps             map[string]*cebpf.Map
 	sysVars          SysConfigVars
 	registerAttacher func(pm.ProbeAttacher) error
+	processMeta      func(libpf.PID) samples.ProcessMeta
 	KernelSymbolizer *kallsyms.Symbolizer
 	reg              ProbeRegistrar
 }
@@ -365,6 +367,13 @@ func (c *ProbeContext) RegisterCollectTrampoline(meta *samples.TypeMetadata, kin
 	}, nil
 }
 
+// ProcessMeta returns the metadata the tracer tracks for pid. Probes reporting
+// snapshot samples use it to attribute samples of processes that may exit
+// before the next report.
+func (c *ProbeContext) ProcessMeta(pid libpf.PID) samples.ProcessMeta {
+	return c.processMeta(pid)
+}
+
 // AddAttacher registers a per-process attacher with the process manager.
 // ProcessManager calls Match/Attach as new mappings appear and Detach on process exit.
 func (c *ProbeContext) AddAttacher(a pm.ProbeAttacher) error {
@@ -431,13 +440,22 @@ type PostTraceHandler interface {
 	PostHandleTrace(trace *libpf.Trace)
 }
 
+// SnapshotSource is an optional interface that Probe implementations may
+// satisfy to contribute samples that do not map to a single trace, such as
+// values aggregated in Go. The reporter calls ProduceSnapshots once per report
+// interval; it must return only what accumulated since the previous call.
+type SnapshotSource interface {
+	ProduceSnapshots() []samples.SnapshotProfile
+}
+
 // Enable builds a ProbeContext from the tracer's current state and calls p.Load.
 // Attachers registered via AddAttacher receive per-process lifecycle callbacks
 // from the ProcessManager.
 //
 // If the probe satisfies PreTraceHandler and/or PostTraceHandler, it is
 // registered to intercept traces before symbolization or receive them after
-// symbolization, respectively.
+// symbolization, respectively. If it satisfies SnapshotSource, its snapshots
+// are included in CollectSnapshots.
 //
 // Enable requires that the kprobe tail-call unwinder chain was loaded at tracer
 // startup, which happens when off-CPU profiling is enabled (OffCPUThreshold > 0).
@@ -460,6 +478,7 @@ func (t *Tracer) Enable(ctx context.Context, p Probe) error {
 			t.processManager.RegisterProbeAttacher(a)
 			return nil
 		},
+		processMeta:      t.ProcessMeta,
 		KernelSymbolizer: t.kernelSymbolizer,
 	}
 
@@ -479,5 +498,36 @@ func (t *Tracer) Enable(ctx context.Context, p Probe) error {
 		}
 	}
 
+	if ss, ok := p.(SnapshotSource); ok {
+		t.snapshotSourcesMu.Lock()
+		t.snapshotSources = append(t.snapshotSources, ss)
+		t.snapshotSourcesMu.Unlock()
+	}
+
 	return nil
+}
+
+// CollectSnapshots returns the snapshot profiles of all enabled probes that
+// satisfy SnapshotSource.
+func (t *Tracer) CollectSnapshots() []samples.SnapshotProfile {
+	t.snapshotSourcesMu.Lock()
+	sources := slices.Clone(t.snapshotSources)
+	t.snapshotSourcesMu.Unlock()
+
+	var profiles []samples.SnapshotProfile
+	for _, source := range sources {
+		profiles = append(profiles, source.ProduceSnapshots()...)
+	}
+	return profiles
+}
+
+// ProcessMeta returns the metadata the tracer tracks for pid.
+func (t *Tracer) ProcessMeta(pid libpf.PID) samples.ProcessMeta {
+	meta, resourceAttrs := t.processManager.MetaForPID(pid)
+	return samples.ProcessMeta{
+		ExecutablePath: meta.Executable,
+		ContainerID:    meta.ContainerID,
+		EnvVars:        meta.EnvVariables,
+		ResourceAttrs:  resourceAttrs,
+	}
 }

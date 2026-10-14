@@ -6,8 +6,10 @@ package reporter // import "go.opentelemetry.io/ebpf-profiler/reporter"
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/pdata"
@@ -37,6 +39,14 @@ type baseReporter struct {
 	// Initialized when Start() is called. The duration of the first profile may be
 	// slightly overestimated as it includes tracer setup time before samples arrive.
 	collectionStartTime time.Time
+
+	// snapshots holds the callbacks set by SetSnapshotSources, or nil.
+	snapshots atomic.Pointer[snapshotHooks]
+}
+
+type snapshotHooks struct {
+	collect     func() []samples.SnapshotProfile
+	processMeta func(libpf.PID) samples.ProcessMeta
 }
 
 var errUnknownProfileType = errors.New("unknown trace profile type")
@@ -105,4 +115,76 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 		Labels:     trace.CustomLabels,
 	}
 	return nil
+}
+
+// SetSnapshotSources implements SnapshotMerger.
+func (b *baseReporter) SetSnapshotSources(collect func() []samples.SnapshotProfile,
+	processMeta func(libpf.PID) samples.ProcessMeta) {
+	b.snapshots.Store(&snapshotHooks{collect: collect, processMeta: processMeta})
+}
+
+// mergeSnapshots folds probe-produced snapshot samples into tree so they are
+// exported by the same path as trace events. Every snapshot sample is stamped
+// with ts, the end of the collection interval.
+func (b *baseReporter) mergeSnapshots(tree samples.TraceEventsTree, ts time.Time) {
+	hooks := b.snapshots.Load()
+	if hooks == nil {
+		return
+	}
+
+	timestamp := uint64(ts.UnixNano())
+	for _, profile := range hooks.collect() {
+		if profile.ProfileType == nil {
+			log.Warnf("Skipping snapshot profile without profile type")
+			continue
+		}
+		for _, sample := range profile.Samples {
+			var meta samples.ProcessMeta
+			if sample.ProcessMeta != nil {
+				meta = *sample.ProcessMeta
+			} else {
+				meta = hooks.processMeta(sample.PID)
+			}
+			events := snapshotEventsFor(tree, profile.ProfileType, sample.PID, meta)
+			key := samples.SampleKey{Hash: sample.TraceHash}
+			if existing, ok := events[key]; ok {
+				existing.Timestamps = append(existing.Timestamps, timestamp)
+				existing.Values = append(existing.Values, sample.Value)
+				continue
+			}
+			events[key] = &samples.TraceEvents{
+				Frames:     sample.Frames,
+				Timestamps: []uint64{timestamp},
+				Values:     []int64{sample.Value},
+			}
+		}
+	}
+}
+
+// snapshotEventsFor returns the samples of profileType for the process's
+// resource, creating the resource and profile type entries if needed.
+func snapshotEventsFor(tree samples.TraceEventsTree, profileType *samples.TypeMetadata,
+	pid libpf.PID, meta samples.ProcessMeta,
+) samples.SampleToEvents {
+	key := samples.ResourceKey{
+		ContainerID:    meta.ContainerID,
+		ExecutablePath: meta.ExecutablePath,
+		PID:            int64(pid),
+	}
+	rtp, ok := tree[key]
+	if !ok {
+		rtp = samples.ResourceToProfiles{
+			EnvVars:       meta.EnvVars,
+			ResourceAttrs: meta.ResourceAttrs,
+			Events:        make(map[*samples.TypeMetadata]samples.SampleToEvents),
+		}
+		tree[key] = rtp
+	}
+
+	events, ok := rtp.Events[profileType]
+	if !ok {
+		events = make(samples.SampleToEvents)
+		rtp.Events[profileType] = events
+	}
+	return events
 }

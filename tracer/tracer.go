@@ -217,6 +217,11 @@ type Tracer struct {
 	// that origin. Only traces with a matching origin are dispatched.
 	postTraceHandlers map[uint16][]PostTraceHandler
 
+	// snapshotSources are the enabled probes that satisfy SnapshotSource.
+	// Enable appends while the reporter collects, hence the lock.
+	snapshotSourcesMu sync.Mutex
+	snapshotSources   []SnapshotSource
+
 	// done is closed when the tracer encounters an unrecoverable error.
 	// Use Done() to obtain a read-only channel for use in select statements.
 	done     chan libpf.Void

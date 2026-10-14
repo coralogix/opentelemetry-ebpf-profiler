@@ -409,3 +409,118 @@ func TestCustomLabelsArePartOfSampleIdentity(t *testing.T) {
 		"tenant-b": 1,
 	}, timestampsByLabel)
 }
+
+func TestMergeSnapshots(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	snapshotType := &samples.TypeMetadata{
+		SampleType:        "gpu_kernel_time",
+		SampleUnit:        "nanoseconds",
+		ReportValues:      true,
+		OmitThreadContext: true,
+	}
+
+	// A CPU sample of PID 1000 creates the resource the snapshot must join.
+	cpuMeta := baseMetaWithResourceAttrs(attribute.Set{})
+	cpuMeta.PID = 1000
+	require.NoError(t, reporter.ReportTraceEvent(singleNativeFrameTrace(), cpuMeta))
+
+	processMeta := map[libpf.PID]samples.ProcessMeta{
+		1000: {ExecutablePath: cpuMeta.ExecutablePath, ContainerID: cpuMeta.ContainerID},
+		2000: {
+			ExecutablePath: libpf.Intern("/usr/bin/gpu"),
+			ResourceAttrs:  serviceAttrs("gpu-svc"),
+		},
+	}
+	kernelA := libpf.NewTraceHash(1, 1)
+	kernelB := libpf.NewTraceHash(2, 2)
+	reporter.SetSnapshotSources(func() []samples.SnapshotProfile {
+		return []samples.SnapshotProfile{{
+			ProfileType: snapshotType,
+			Samples: []samples.SnapshotSample{
+				{PID: 1000, TraceHash: kernelA, Frames: singleNativeFrameTrace().Frames, Value: 10},
+				{PID: 1000, TraceHash: kernelA, Frames: singleNativeFrameTrace().Frames, Value: 5},
+				{PID: 2000, TraceHash: kernelB, Frames: singleNativeFrameTrace().Frames, Value: 7},
+			},
+		}}
+	}, func(pid libpf.PID) samples.ProcessMeta { return processMeta[pid] })
+
+	treePtr := reporter.traceEvents.RLock()
+	tree := *treePtr
+	reporter.traceEvents.RUnlock(&treePtr)
+	end := time.Now()
+	reporter.mergeSnapshots(tree, end)
+	require.Len(t, tree, 2)
+
+	existing := tree[samples.ResourceKey{
+		ContainerID:    cpuMeta.ContainerID,
+		ExecutablePath: cpuMeta.ExecutablePath,
+		PID:            1000,
+	}]
+	require.Len(t, existing.Events, 2, "snapshot joins the CPU sample's resource")
+	merged := existing.Events[snapshotType][samples.SampleKey{Hash: kernelA}]
+	require.NotNil(t, merged)
+	assert.Equal(t, []int64{10, 5}, merged.Values)
+	assert.Equal(t, []uint64{uint64(end.UnixNano()), uint64(end.UnixNano())}, merged.Timestamps)
+
+	created := tree[samples.ResourceKey{ExecutablePath: libpf.Intern("/usr/bin/gpu"), PID: 2000}]
+	v, _ := created.ResourceAttrs.Value(semconv.ServiceNameKey)
+	assert.Equal(t, "gpu-svc", v.AsString())
+	assert.Equal(t, []int64{7}, created.Events[snapshotType][samples.SampleKey{Hash: kernelB}].Values)
+
+	profiles, err := reporter.pdata.Generate(tree, reporter.name, reporter.version,
+		reporter.collectionStartTime, end)
+	require.NoError(t, err)
+	dictionary := profiles.Dictionary()
+	for i := 0; i < profiles.ResourceProfiles().Len(); i++ {
+		profs := profiles.ResourceProfiles().At(i).ScopeProfiles().At(0).Profiles()
+		for j := 0; j < profs.Len(); j++ {
+			prof := profs.At(j)
+			if dictionary.StringTable().At(int(prof.SampleType().TypeStrindex())) != "gpu_kernel_time" {
+				continue
+			}
+			for k := 0; k < prof.Samples().Len(); k++ {
+				indices := prof.Samples().At(k).AttributeIndices()
+				for l := 0; l < indices.Len(); l++ {
+					attr := dictionary.AttributeTable().At(int(indices.At(l)))
+					key := dictionary.StringTable().At(int(attr.KeyStrindex()))
+					assert.NotEqual(t, string(semconv.ThreadIDKey), key)
+					assert.NotEqual(t, string(semconv.CPULogicalNumberKey), key)
+				}
+			}
+		}
+	}
+}
+
+func TestMergeSnapshotsWithoutSources(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	tree := make(samples.TraceEventsTree)
+	reporter.mergeSnapshots(tree, time.Now())
+	assert.Empty(t, tree)
+}
+
+func TestMergeSnapshotsPrefersSampleProcessMeta(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	reporter.SetSnapshotSources(func() []samples.SnapshotProfile {
+		return []samples.SnapshotProfile{{
+			ProfileType: profileTypeOffCPU,
+			Samples: []samples.SnapshotSample{{
+				PID:       3000,
+				TraceHash: libpf.NewTraceHash(3, 3),
+				Value:     1,
+				// Captured while the process was alive.
+				ProcessMeta: &samples.ProcessMeta{
+					ExecutablePath: libpf.Intern("/usr/bin/exited"),
+				},
+			}},
+		}}
+	}, func(libpf.PID) samples.ProcessMeta {
+		// The process has exited, so the report-time lookup knows nothing.
+		return samples.ProcessMeta{}
+	})
+
+	tree := make(samples.TraceEventsTree)
+	reporter.mergeSnapshots(tree, time.Now())
+	require.Len(t, tree, 1)
+	_, ok := tree[samples.ResourceKey{ExecutablePath: libpf.Intern("/usr/bin/exited"), PID: 3000}]
+	assert.True(t, ok)
+}
