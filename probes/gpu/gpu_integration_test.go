@@ -262,11 +262,14 @@ func TestGPUProfiles(t *testing.T) {
 		"gpu_kernel_time": fired.kernelNs,
 		"gpu_mem_time":    fired.memNs,
 		"gpu_mem_bytes":   fired.memBytes,
+		"gpu_alloc_bytes": fired.allocBytes,
 	})
 	require.Equal(t, []string{"graph_step", "vector_add"},
 		slices.Sorted(maps.Keys(byLeaf["gpu_kernel_time"])))
 	require.Equal(t, []string{"memcpy:HtoD", "memset"},
 		slices.Sorted(maps.Keys(byLeaf["gpu_mem_time"])))
+	require.Equal(t, []string{"alloc:device"},
+		slices.Sorted(maps.Keys(byLeaf["gpu_alloc_bytes"])))
 	require.Equal(t, []string{
 		"graph_step",
 		"vector_add",
