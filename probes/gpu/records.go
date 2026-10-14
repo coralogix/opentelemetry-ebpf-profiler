@@ -28,8 +28,12 @@ const (
 	errorRecordSize    = recordHeaderSize + 8 + errorMessageSize
 )
 
-// eventMemset is the otel_gpu event kind of a memory set.
-const eventMemset uint32 = 7
+// Kinds of otel_gpu event records.
+const (
+	eventAlloc  uint32 = 5
+	eventFree   uint32 = 6
+	eventMemset uint32 = 7
+)
 
 // kernelRecord is one kernel execution measured on the GPU.
 type kernelRecord struct {

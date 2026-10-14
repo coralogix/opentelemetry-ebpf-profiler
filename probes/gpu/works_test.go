@@ -33,6 +33,10 @@ func TestWorkSampleWeight(t *testing.T) {
 	memcpy := memcpyWork(memcpyRecord{end: 50, bytes: 4096, sampleWeight: 2}, "")
 	assert.Equal(t, []profileValue{{memTimeProfileType, 100}, {memBytesProfileType, 8192}},
 		memcpy.values)
+
+	alloc, ok := eventWork(eventRecord{kind: eventAlloc, v1: 64, sampleWeight: 4})
+	assert.True(t, ok)
+	assert.Equal(t, []profileValue{{allocBytesProfileType, 256}}, alloc.values)
 }
 
 func TestMemcpyWork(t *testing.T) {
@@ -46,6 +50,15 @@ func TestMemcpyWork(t *testing.T) {
 }
 
 func TestEventWork(t *testing.T) {
+	alloc, ok := eventWork(eventRecord{pid: 1, kind: eventAlloc, v1: 1 << 20, v2: 3})
+	assert.True(t, ok)
+	assert.Equal(t, "alloc:device", alloc.leaf)
+	assert.Equal(t, []profileValue{{allocBytesProfileType, 1 << 20}}, alloc.values)
+
+	free, ok := eventWork(eventRecord{kind: eventFree, v1: 64, v2: 2})
+	assert.True(t, ok)
+	assert.Equal(t, "free:pinned", free.leaf)
+
 	memset, ok := eventWork(eventRecord{kind: eventMemset, start: 5, end: 9, v1: 128})
 	assert.True(t, ok)
 	assert.Equal(t, "memset", memset.leaf)

@@ -13,6 +13,7 @@ var (
 	kernelTimeProfileType = gpuProfileType("gpu_kernel_time", "nanoseconds")
 	memTimeProfileType    = gpuProfileType("gpu_mem_time", "nanoseconds")
 	memBytesProfileType   = gpuProfileType("gpu_mem_bytes", "bytes")
+	allocBytesProfileType = gpuProfileType("gpu_alloc_bytes", "bytes")
 )
 
 // gpuProfileType describes a profile of GPU work. Its samples aggregate GPU
@@ -32,6 +33,10 @@ const unknownKernel = "[unknown kernel]"
 // copyKinds names the otel_gpu_copy_kind values.
 var copyKinds = [...]string{1: "HtoD", 2: "DtoH", 3: "HtoA", 4: "AtoH", 5: "AtoA",
 	6: "AtoD", 7: "DtoA", 8: "DtoD", 9: "HtoH", 10: "PtoP"}
+
+// memoryKinds names the otel_gpu_memory_kind values.
+var memoryKinds = [...]string{1: "pageable", 2: "pinned", 3: "device", 4: "array",
+	5: "managed", 6: "device_static", 7: "managed_static"}
 
 func kindName(names []string, kind uint64) string {
 	if kind < uint64(len(names)) && names[kind] != "" {
@@ -109,14 +114,19 @@ func memcpyWork(rec memcpyRecord, ranges string) gpuWork {
 
 // eventWork translates GPU events; ok is false for unknown kinds.
 func eventWork(rec eventRecord) (work gpuWork, ok bool) {
-	if rec.kind != eventMemset {
-		return gpuWork{}, false
+	work = gpuWork{pid: rec.pid, correlationID: rec.correlationID}
+	switch rec.kind {
+	case eventAlloc:
+		work.leaf = "alloc:" + kindName(memoryKinds[:], rec.v2)
+		return work.withValue(allocBytesProfileType, int64(rec.v1)).scaled(rec.sampleWeight), true
+	case eventFree:
+		work.leaf = "free:" + kindName(memoryKinds[:], rec.v2)
+		return work.withValue(allocBytesProfileType, int64(rec.v1)).scaled(rec.sampleWeight), true
+	case eventMemset:
+		work.leaf = "memset"
+		return work.withValue(memTimeProfileType, duration(rec.start, rec.end)).
+			withValue(memBytesProfileType, int64(rec.v1)).
+			scaled(rec.sampleWeight), true
 	}
-	return gpuWork{
-		pid:           rec.pid,
-		correlationID: rec.correlationID,
-		leaf:          "memset",
-	}.withValue(memTimeProfileType, duration(rec.start, rec.end)).
-		withValue(memBytesProfileType, int64(rec.v1)).
-		scaled(rec.sampleWeight), true
+	return gpuWork{}, false
 }

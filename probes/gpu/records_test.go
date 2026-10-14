@@ -116,14 +116,14 @@ func TestDecodeMemcpyAndEventRecords(t *testing.T) {
 		sampleWeight: 2,
 	}, memcpy)
 
-	le.PutUint32(b[24:], eventMemset)
+	le.PutUint32(b[24:], eventAlloc)
 	le.PutUint32(b[28:], 11)
 	le.PutUint64(b[32:], 1<<20)
 	le.PutUint64(b[40:], 3)
 	event, ok := decodeEventRecord(5, b)
 	require.True(t, ok)
 	assert.Equal(t, eventRecord{
-		pid: 5, start: 100, end: 160, kind: eventMemset, correlationID: 11,
+		pid: 5, start: 100, end: 160, kind: eventAlloc, correlationID: 11,
 		v1: 1 << 20, v2: 3, namePtr: 0xbeef, sampleWeight: 2,
 	}, event)
 }
