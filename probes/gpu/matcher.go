@@ -38,6 +38,8 @@ type gpuWork struct {
 	correlationID uint32
 	// leaf names the work in the leaf frame, e.g. the kernel name.
 	leaf string
+	// function, if set, names the GPU function the work ran in.
+	function string
 	// ranges is the stack of annotation ranges active at the call site, such
 	// as NVTX ranges, or empty.
 	ranges string
@@ -83,9 +85,10 @@ type bucketKey struct {
 	profileType *samples.TypeMetadata
 	pid         libpf.PID
 	// stack is the hash of the host stack, zero if the launch was not captured.
-	stack  libpf.TraceHash
-	leaf   string
-	ranges string
+	stack    libpf.TraceHash
+	leaf     string
+	function string
+	ranges   string
 }
 
 type bucket struct {
@@ -100,8 +103,9 @@ type bucket struct {
 // for the launch stack: a CUDA graph launch runs hundreds of kernels, mostly
 // repeating a few.
 type workKey struct {
-	leaf   string
-	ranges string
+	leaf     string
+	function string
+	ranges   string
 }
 
 // pendingWork is GPU work whose launch stack has not arrived yet.
@@ -234,7 +238,7 @@ func (m *matcher) addWork(work gpuWork, now time.Time) {
 		}
 	}
 	works := m.pending[key]
-	wk := workKey{leaf: work.leaf, ranges: work.ranges}
+	wk := workKey{leaf: work.leaf, function: work.function, ranges: work.ranges}
 	if p, ok := works[wk]; ok {
 		p.work.merge(work)
 		return
@@ -260,6 +264,7 @@ func (m *matcher) foldLocked(work gpuWork, stack libpf.TraceHash, hostFrames lib
 			pid:         work.pid,
 			stack:       stack,
 			leaf:        work.leaf,
+			function:    work.function,
 			ranges:      work.ranges,
 		}
 		b, ok := m.buckets[key]
@@ -278,11 +283,14 @@ func (m *matcher) foldLocked(work gpuWork, stack libpf.TraceHash, hostFrames lib
 // rangeSeparator separates the ranges of a range stack.
 const rangeSeparator = "\x1f"
 
-// sampleFrames returns the frames of a sample: the work, the annotation ranges
-// it ran in from the innermost outwards, then the host stack.
+// sampleFrames returns the frames of a sample: the work, its GPU function, the
+// annotation ranges it ran in from the innermost outwards, then the host stack.
 func sampleFrames(work gpuWork, hostFrames libpf.Frames) libpf.Frames {
-	frames := make(libpf.Frames, 0, len(hostFrames)+1)
+	frames := make(libpf.Frames, 0, len(hostFrames)+2)
 	frames.Append(&libpf.Frame{Type: libpf.GPUFrame, FunctionName: libpf.Intern(work.leaf)})
+	if work.function != "" {
+		frames.Append(&libpf.Frame{Type: libpf.GPUFrame, FunctionName: libpf.Intern(work.function)})
+	}
 	for name := range strings.SplitSeq(work.ranges, rangeSeparator) {
 		if name != "" {
 			frames.Append(&libpf.Frame{
@@ -315,6 +323,8 @@ func sampleHash(stack libpf.TraceHash, work gpuWork) libpf.TraceHash {
 	_, _ = h.Write(stack.Bytes())
 	// The separators keep "a"+"bc" apart from "ab"+"c".
 	_, _ = h.WriteString(work.leaf)
+	_, _ = h.WriteString(rangeSeparator)
+	_, _ = h.WriteString(work.function)
 	_, _ = h.WriteString(rangeSeparator)
 	_, _ = h.WriteString(work.ranges)
 	sum := h.Sum128()

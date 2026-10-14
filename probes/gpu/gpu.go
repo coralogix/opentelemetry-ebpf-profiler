@@ -215,8 +215,14 @@ func (p *probe) handleRecord(b []byte) {
 		if !ok {
 			return
 		}
-		if work, ok := eventWork(rec); ok {
-			p.matcher.addWork(work, now)
+		switch rec.kind {
+		case eventStall:
+			p.matcher.addWork(stallWork(rec, p.names.resolve(pid, rec.namePtr),
+				p.names.resolve(pid, rec.v1)), now)
+		default:
+			if work, ok := eventWork(rec); ok {
+				p.matcher.addWork(work, now)
+			}
 		}
 	case recordError:
 		// Producers re-emit errors periodically, which bounds this logging.

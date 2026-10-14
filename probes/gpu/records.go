@@ -37,6 +37,7 @@ const (
 	eventAlloc       uint32 = 5
 	eventFree        uint32 = 6
 	eventMemset      uint32 = 7
+	eventStall       uint32 = 8
 )
 
 // kernelRecord is one kernel execution measured on the GPU.
