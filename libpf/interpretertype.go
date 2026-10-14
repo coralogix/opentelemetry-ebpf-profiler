@@ -39,6 +39,15 @@ const (
 	BEAM InterpreterType = support.FrameMarkerBEAM
 )
 
+// Interpreters whose frames are synthesized in Go by probes instead of being
+// unwound in eBPF. eBPF frame headers hold the frame type in 4 bits, so these
+// start above that range.
+const (
+	// GPU identifies work run on GPUs and other accelerators, such as kernels
+	// and memory operations, reported by GPU probes.
+	GPU InterpreterType = 0x10
+)
+
 // Pseudo-interpreters without a corresponding frame type.
 const (
 	// pseudoInterpreterStart marks the start of the pseudo interpreter ID space.
@@ -78,6 +87,7 @@ var interpreterTypeToString = map[InterpreterType]string{
 	ThreadContext: "thread-context",
 	LuaJIT:        "luajit",
 	Go:            "go",
+	GPU:           "gpu",
 }
 
 var stringToInterpreterType = make(map[string]InterpreterType, len(interpreterTypeToString))
