@@ -16,6 +16,7 @@ var (
 	allocBytesProfileType = gpuProfileType("gpu_alloc_bytes", "bytes")
 	uvmBytesProfileType   = gpuProfileType("gpu_uvm_bytes", "bytes")
 	uvmFaultsProfileType  = gpuProfileType("gpu_uvm_faults", "count")
+	stallsProfileType     = gpuProfileType("gpu_stall_samples", "count")
 )
 
 // gpuProfileType describes a profile of GPU work. Its samples aggregate GPU
@@ -112,6 +113,20 @@ func memcpyWork(rec memcpyRecord, ranges string) gpuWork {
 	}.withValue(memTimeProfileType, duration(rec.start, rec.end)).
 		withValue(memBytesProfileType, int64(rec.bytes)).
 		scaled(rec.sampleWeight)
+}
+
+// stallWork is a PC sampling result: the samples that found a GPU function
+// stalled for a reason. Samples have no call site.
+func stallWork(rec eventRecord, function, reason string) gpuWork {
+	if function == "" || reason == "" {
+		return gpuWork{}
+	}
+	return gpuWork{
+		pid:      rec.pid,
+		leaf:     "stall:" + reason,
+		function: function,
+		noLaunch: true,
+	}.withValue(stallsProfileType, int64(rec.v2))
 }
 
 // eventWork translates GPU events; ok is false for unknown kinds.

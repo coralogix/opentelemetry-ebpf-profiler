@@ -94,3 +94,18 @@ func TestUnifiedMemoryWork(t *testing.T) {
 		assert.Equal(t, int64(8), work.values[0].value)
 	}
 }
+
+func TestStallWork(t *testing.T) {
+	work := stallWork(eventRecord{pid: 1, kind: eventStall, v2: 12}, "vector_add",
+		"memory_dependency")
+	assert.Equal(t, gpuWork{
+		pid:      1,
+		leaf:     "stall:memory_dependency",
+		function: "vector_add",
+		noLaunch: true,
+		values:   []profileValue{{stallsProfileType, 12}},
+	}, work)
+
+	assert.Empty(t, stallWork(eventRecord{v2: 12}, "", "reason").values)
+	assert.Empty(t, stallWork(eventRecord{v2: 12}, "fn", "").values)
+}

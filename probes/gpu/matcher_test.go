@@ -257,6 +257,22 @@ func TestMatcherWorkWithoutLaunch(t *testing.T) {
 	assert.Len(t, profiles[0].Samples[0].Frames, 1)
 }
 
+func TestMatcherFunctionFrame(t *testing.T) {
+	m := newTestMatcher(t, liveProcesses{testPID: "/bin/app"})
+	now := time.Now()
+	m.addWork(stallWork(eventRecord{pid: testPID, v2: 3}, "vector_add", "wait"), now)
+	m.addWork(stallWork(eventRecord{pid: testPID, v2: 4}, "reduce", "wait"), now)
+
+	profiles := m.snapshot(now)
+	require.Len(t, profiles, 1)
+	require.Len(t, profiles[0].Samples, 2, "functions split samples")
+	for _, s := range profiles[0].Samples {
+		require.Len(t, s.Frames, 2)
+		assert.Equal(t, "stall:wait", s.Frames[0].Value().FunctionName.String())
+	}
+	assert.NotEqual(t, profiles[0].Samples[0].TraceHash, profiles[0].Samples[1].TraceHash)
+}
+
 func TestMatcherMergesPendingGraphWork(t *testing.T) {
 	m := newTestMatcher(t, liveProcesses{testPID: "/bin/app"})
 	now := time.Now()
