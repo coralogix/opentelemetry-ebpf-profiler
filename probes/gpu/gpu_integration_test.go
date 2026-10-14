@@ -312,3 +312,46 @@ func inProducer(t *testing.T, frames libpf.Frames) bool {
 	}
 	return false
 }
+
+func TestAPISpans(t *testing.T) {
+	trc, _ := startTracer(t, &recordingReporter{}, gpu.Config{APISpans: true})
+
+	dir := t.TempDir()
+	library := filepath.Join(dir, "libcudnn.so.9")
+	out, err := exec.Command("cc", "-O2", "-shared", "-fPIC", "-o", library,
+		"testdata/fake_cudnn.c").CombinedOutput()
+	require.NoError(t, err, string(out))
+	user := filepath.Join(dir, "cudnn_user")
+	out, err = exec.Command("cc", "-O2", "-o", user, "testdata/cudnn_user.c",
+		"-L"+dir, "-l:libcudnn.so.9", "-Wl,-rpath,"+dir).CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	cmd := exec.Command(user)
+	var stdout strings.Builder
+	cmd.Stdout = &stdout
+	require.NoError(t, cmd.Run())
+	calls, err := strconv.ParseInt(strings.TrimSpace(stdout.String()), 10, 64)
+	require.NoError(t, err)
+	pid := libpf.PID(cmd.Process.Pid)
+
+	// Each call sleeps at least callDuration, so missing spans lower the total.
+	const callDuration = 500 * time.Microsecond
+	var total int64
+	deadline := time.Now().Add(10 * time.Second)
+	for total < calls*int64(callDuration) && time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		for _, profile := range trc.CollectSnapshots() {
+			for _, sample := range profile.Samples {
+				if sample.PID != pid {
+					continue
+				}
+				require.Equal(t, "gpu_api_time", profile.ProfileType.SampleType)
+				require.Equal(t, "cudnn:ConvolutionForward",
+					sample.Frames[0].Value().FunctionName.String())
+				total += sample.Value
+			}
+		}
+	}
+	require.GreaterOrEqual(t, total, calls*int64(callDuration))
+	require.Less(t, total, calls*int64(100*callDuration))
+}

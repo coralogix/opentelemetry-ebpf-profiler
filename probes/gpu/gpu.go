@@ -15,7 +15,8 @@
 //	      - gpu
 //
 //	extensions:
-//	  gpu: {}
+//	  gpu:
+//	    api_spans: true	# optional: spans of cuDNN and cuBLAS calls
 package gpu // import "go.opentelemetry.io/ebpf-profiler/probes/gpu"
 
 import (
@@ -38,7 +39,11 @@ import (
 )
 
 // Config is the configuration of the gpu probe.
-type Config struct{}
+type Config struct {
+	// APISpans reports the time spent in cuDNN and cuBLAS calls. It adds a
+	// uprobe and a uretprobe to every call, and needs Linux 5.15 or newer.
+	APISpans bool `mapstructure:"api_spans"`
+}
 
 // launchProfileType counts GPU call sites per host stack. PreHandleTrace leaves
 // the sample weight of the launch as the trace value.
@@ -79,11 +84,12 @@ type probe struct {
 		correlationID uint32
 	}
 
-	matcher *matcher
-	names   *nameCache
-	events  *cebpf.Map
-	reader  *ringbuf.Reader
-	drained sync.WaitGroup
+	matcher   *matcher
+	names     *nameCache
+	events    *cebpf.Map
+	apiStarts *cebpf.Map
+	reader    *ringbuf.Reader
+	drained   sync.WaitGroup
 
 	// mu serializes attaching with Unload, which closes the programs.
 	mu       sync.Mutex
@@ -154,6 +160,11 @@ func (p *probe) Load(_ context.Context, reg tracer.ProbeRegistrar, probeCtx *tra
 		return err
 	}
 	p.programs = programs
+	if p.config.APISpans {
+		if err := p.loadAPISpans(probeCtx); err != nil {
+			log.Warnf("gpu: cuDNN and cuBLAS API spans are disabled: %v", err)
+		}
+	}
 
 	if p.reader, err = ringbuf.NewReader(p.events); err != nil {
 		p.closePrograms()
@@ -226,6 +237,10 @@ func (p *probe) handleRecord(b []byte) {
 				p.matcher.addWork(work, now)
 			}
 		}
+	case recordAPISpan:
+		if rec, ok := decodeAPISpanRecord(pid, b); ok {
+			p.matcher.addWork(apiWork(rec), now)
+		}
 	case recordError:
 		// Producers re-emit errors periodically, which bounds this logging.
 		if rec, ok := decodeErrorRecord(pid, b); ok {
@@ -284,7 +299,11 @@ func (p *probe) Unload() error {
 	}
 	p.stopDrain()
 	p.closePrograms()
-	return errors.Join(errs, p.events.Close())
+	errs = errors.Join(errs, p.events.Close())
+	if p.apiStarts != nil {
+		errs = errors.Join(errs, p.apiStarts.Close())
+	}
+	return errs
 }
 
 func (p *probe) closePrograms() {

@@ -23,10 +23,12 @@ BPF_RODATA_VAR(u16, origin_id_gpu_launch, 0)
 // Records sent to the gpu probe start with this header; the type selects the
 // payload. Layouts are pinned by the probe's decoder.
 enum gpu_record_type {
-  GPU_RECORD_KERNEL = 1,
-  GPU_RECORD_MEMCPY = 2,
-  GPU_RECORD_EVENT  = 3,
-  GPU_RECORD_ERROR  = 4,
+  GPU_RECORD_KERNEL   = 1,
+  GPU_RECORD_MEMCPY   = 2,
+  GPU_RECORD_EVENT    = 3,
+  GPU_RECORD_ERROR    = 4,
+  // payload: start ns, end ns, attach cookie of the API function.
+  GPU_RECORD_API_SPAN = 5,
 };
 
 typedef struct GPURecordHeader {
@@ -62,6 +64,22 @@ struct otel_gpu_error_rec {
 // Not among the helpers bpfdefs.h declares for the unwinders.
 static long (*bpf_probe_read_user_str)(void *dst, u32 size, const void *unsafe_ptr) = (void *)
   BPF_FUNC_probe_read_user_str;
+static u64 (*bpf_get_attach_cookie)(void *ctx) = (void *)BPF_FUNC_get_attach_cookie;
+
+// An API call in progress on a thread; the attach cookie identifies the
+// instrumented function.
+struct gpu_api_start {
+  u64 ts;
+  u64 cookie;
+};
+
+// gpu_api_starts is created by the gpu probe when API spans are enabled.
+struct gpu_api_starts_t {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, u64);
+  __type(value, struct gpu_api_start);
+  __uint(max_entries, 16384);
+} gpu_api_starts SEC(".maps");
 
 // gpu_events carries GPU records to the gpu probe, which creates it on load.
 // Producers flush GPU activity in bursts of tens of thousands of records.
@@ -161,5 +179,41 @@ int uprobe__gpu_error(struct pt_regs *ctx)
     bpf_probe_read_user_str(record.message, sizeof(record.message), (void *)error.msg_ptr);
   }
   bpf_ringbuf_output(&gpu_events, &record, sizeof(record), 0);
+  return 0;
+}
+
+// API spans of host GPU libraries such as cuDNN and cuBLAS: the entry time is
+// kept per thread and the span is sent when the function returns.
+SEC("uprobe/gpu_api_enter")
+int uprobe__gpu_api_enter(struct pt_regs *ctx)
+{
+  u64 pid_tgid               = bpf_get_current_pid_tgid();
+  struct gpu_api_start start = {.ts = bpf_ktime_get_ns(), .cookie = bpf_get_attach_cookie(ctx)};
+  // Instrumented functions call each other: keep the outermost call.
+  bpf_map_update_elem(&gpu_api_starts, &pid_tgid, &start, BPF_NOEXIST);
+  return 0;
+}
+
+SEC("uprobe/gpu_api_exit")
+int uretprobe__gpu_api_exit(struct pt_regs *ctx)
+{
+  u64 pid_tgid                = bpf_get_current_pid_tgid();
+  struct gpu_api_start *start = bpf_map_lookup_elem(&gpu_api_starts, &pid_tgid);
+  if (!start || start->cookie != bpf_get_attach_cookie(ctx)) {
+    // A nested call returns while the outermost one continues.
+    return 0;
+  }
+
+  u32 pid          = 0;
+  u32 tid          = 0;
+  u64 group_leader = 0;
+  if (get_pid_tgid_leader(&pid, &tid, &group_leader)) {
+    GPURecord record  = {.header = {.type = GPU_RECORD_API_SPAN, .pid = pid}};
+    record.payload[0] = start->ts;
+    record.payload[1] = bpf_ktime_get_ns();
+    record.payload[2] = start->cookie;
+    bpf_ringbuf_output(&gpu_events, &record, sizeof(record), 0);
+  }
+  bpf_map_delete_elem(&gpu_api_starts, &pid_tgid);
   return 0;
 }

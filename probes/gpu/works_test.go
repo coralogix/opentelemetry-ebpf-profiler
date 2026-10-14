@@ -123,3 +123,17 @@ func TestCollectiveWork(t *testing.T) {
 	}, work)
 	assert.Equal(t, "collective:unknown", collectiveWork(eventRecord{}, "").leaf)
 }
+
+func TestAPIWork(t *testing.T) {
+	work := apiWork(apiSpanRecord{pid: 1, start: 100, end: 350, cookie: 0})
+	assert.Equal(t, gpuWork{
+		pid:      1,
+		leaf:     "cudnn:ConvolutionForward",
+		noLaunch: true,
+		values:   []profileValue{{apiTimeProfileType, 250}},
+	}, work)
+	assert.Equal(t, "api:unknown", apiWork(apiSpanRecord{end: 1, cookie: 999}).leaf)
+
+	stale := apiSpanRecord{start: 1, end: 2 + uint64(maxAPISpan)}
+	assert.Empty(t, apiWork(stale).values)
+}
