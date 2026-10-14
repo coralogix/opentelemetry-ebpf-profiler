@@ -244,6 +244,19 @@ func TestMatcherRanges(t *testing.T) {
 	assert.NotEqual(t, profiles[0].Samples[0].TraceHash, profiles[0].Samples[1].TraceHash)
 }
 
+func TestMatcherWorkWithoutLaunch(t *testing.T) {
+	m := newTestMatcher(t, liveProcesses{testPID: "/bin/app"})
+	now := time.Now()
+	work, _ := eventWork(eventRecord{pid: testPID, kind: eventUVMHtoD, v1: 4096})
+	m.addWork(work, now)
+
+	profiles := m.snapshot(now)
+	require.Len(t, profiles, 1, "reported without waiting for a launch")
+	require.Len(t, profiles[0].Samples, 1)
+	assert.Equal(t, int64(4096), profiles[0].Samples[0].Value)
+	assert.Len(t, profiles[0].Samples[0].Frames, 1)
+}
+
 func TestMatcherMergesPendingGraphWork(t *testing.T) {
 	m := newTestMatcher(t, liveProcesses{testPID: "/bin/app"})
 	now := time.Now()

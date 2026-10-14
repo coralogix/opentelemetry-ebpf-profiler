@@ -197,6 +197,12 @@ func TestLaunchStacks(t *testing.T) {
 	require.Equal(t, fired.launchWeights, weights)
 }
 
+// processLevel are the profile types whose samples have no launch stack.
+var processLevel = map[string]bool{
+	"gpu_uvm_bytes":  true,
+	"gpu_uvm_faults": true,
+}
+
 // collectGPUProfiles collects the snapshot samples of pid until the totals by
 // profile type reach want. It returns the totals by profile type, then by leaf
 // or by the GPU frames above the host stack.
@@ -218,8 +224,12 @@ func collectGPUProfiles(t *testing.T, trc *tracer.Tracer, pid libpf.PID,
 				}
 				leaf := sample.Frames[0].Value()
 				require.Equal(t, libpf.GPUFrame, leaf.Type)
-				require.True(t, inProducer(t, sample.Frames[1:]),
-					"%s %s has no launch stack", sampleType, leaf.FunctionName)
+				if processLevel[sampleType] {
+					require.False(t, inProducer(t, sample.Frames))
+				} else {
+					require.True(t, inProducer(t, sample.Frames[1:]),
+						"%s %s has no launch stack", sampleType, leaf.FunctionName)
+				}
 				require.NotNil(t, sample.ProcessMeta)
 				require.Equal(t, "producer",
 					filepath.Base(sample.ProcessMeta.ExecutablePath.String()))
@@ -263,6 +273,7 @@ func TestGPUProfiles(t *testing.T) {
 		"gpu_mem_time":    fired.memNs,
 		"gpu_mem_bytes":   fired.memBytes,
 		"gpu_alloc_bytes": fired.allocBytes,
+		"gpu_uvm_bytes":   fired.uvmBytes,
 	})
 	require.Equal(t, []string{"graph_step", "vector_add"},
 		slices.Sorted(maps.Keys(byLeaf["gpu_kernel_time"])))

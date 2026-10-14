@@ -45,6 +45,9 @@ type gpuWork struct {
 	// consumesLaunch is set for the only work of its launch, a kernel
 	// launched outside of a CUDA graph.
 	consumesLaunch bool
+	// noLaunch is set for work without a call site, attributed to the
+	// process only.
+	noLaunch bool
 }
 
 // profileValue is what gpuWork adds to a profile.
@@ -215,6 +218,11 @@ func (m *matcher) addWork(work gpuWork, now time.Time) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if work.noLaunch {
+		m.processKeyLocked(work.pid, now)
+		m.foldLocked(work, libpf.TraceHash{}, nil)
+		return
+	}
 	key := m.launchKeyLocked(work.pid, work.correlationID, now)
 	if stack, ok := m.launches.Get(key); ok {
 		if frames, ok := m.stacks.Get(stack); ok {

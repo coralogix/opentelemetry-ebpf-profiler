@@ -37,6 +37,11 @@ func TestWorkSampleWeight(t *testing.T) {
 	alloc, ok := eventWork(eventRecord{kind: eventAlloc, v1: 64, sampleWeight: 4})
 	assert.True(t, ok)
 	assert.Equal(t, []profileValue{{allocBytesProfileType, 256}}, alloc.values)
+
+	// Unified memory counters have no call site to sample.
+	uvm, ok := eventWork(eventRecord{kind: eventUVMHtoD, v1: 8, sampleWeight: 4})
+	assert.True(t, ok)
+	assert.Equal(t, []profileValue{{uvmBytesProfileType, 8}}, uvm.values)
 }
 
 func TestMemcpyWork(t *testing.T) {
@@ -67,4 +72,25 @@ func TestEventWork(t *testing.T) {
 
 	_, ok = eventWork(eventRecord{kind: 99})
 	assert.False(t, ok)
+}
+
+func TestUnifiedMemoryWork(t *testing.T) {
+	tests := map[uint32]struct {
+		leaf        string
+		profileType string
+	}{
+		eventUVMHtoD:     {"uvm:HtoD", "gpu_uvm_bytes"},
+		eventUVMDtoH:     {"uvm:DtoH", "gpu_uvm_bytes"},
+		eventUVMCPUFault: {"uvm:cpu_fault", "gpu_uvm_faults"},
+		eventUVMGPUFault: {"uvm:gpu_fault", "gpu_uvm_faults"},
+	}
+	for kind, want := range tests {
+		work, ok := eventWork(eventRecord{pid: 1, kind: kind, v1: 8})
+		assert.True(t, ok)
+		assert.True(t, work.noLaunch)
+		assert.Equal(t, want.leaf, work.leaf)
+		assert.Len(t, work.values, 1)
+		assert.Equal(t, want.profileType, work.values[0].profileType.SampleType)
+		assert.Equal(t, int64(8), work.values[0].value)
+	}
 }
