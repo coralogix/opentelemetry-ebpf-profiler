@@ -17,6 +17,8 @@ const (
 	recordMemcpy uint32 = 2
 	recordEvent  uint32 = 3
 	recordError  uint32 = 4
+	// recordAPISpan is a call of a host GPU library function such as cuDNN's.
+	recordAPISpan uint32 = 5
 )
 
 const (
@@ -72,6 +74,14 @@ type eventRecord struct {
 	v1, v2        uint64
 	namePtr       uint64
 	sampleWeight  uint32
+}
+
+// apiSpanRecord is one call of an instrumented host library function.
+type apiSpanRecord struct {
+	pid        libpf.PID
+	start, end uint64
+	// cookie indexes apiFunctions.
+	cookie uint64
 }
 
 // errorRecord is a producer-side failure.
@@ -156,5 +166,19 @@ func decodeErrorRecord(pid libpf.PID, b []byte) (errorRecord, bool) {
 		pid:     pid,
 		code:    int32(binary.LittleEndian.Uint32(b[recordHeaderSize:])),
 		message: string(message),
+	}, true
+}
+
+func decodeAPISpanRecord(pid libpf.PID, b []byte) (apiSpanRecord, bool) {
+	if len(b) < producerRecordSize {
+		return apiSpanRecord{}, false
+	}
+	le := binary.LittleEndian
+	rec := b[recordHeaderSize:]
+	return apiSpanRecord{
+		pid:    pid,
+		start:  le.Uint64(rec[0:]),
+		end:    le.Uint64(rec[8:]),
+		cookie: le.Uint64(rec[16:]),
 	}, true
 }

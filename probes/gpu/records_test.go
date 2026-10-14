@@ -139,3 +139,14 @@ func TestDecodeErrorRecord(t *testing.T) {
 	_, ok = decodeErrorRecord(7, b[:errorRecordSize-1])
 	assert.False(t, ok)
 }
+
+func TestDecodeAPISpanRecord(t *testing.T) {
+	b := make([]byte, producerRecordSize)
+	le := binary.LittleEndian
+	le.PutUint64(b[8:], 10)
+	le.PutUint64(b[16:], 30)
+	le.PutUint64(b[24:], 4)
+	rec, ok := decodeAPISpanRecord(3, b)
+	require.True(t, ok)
+	assert.Equal(t, apiSpanRecord{pid: 3, start: 10, end: 30, cookie: 4}, rec)
+}

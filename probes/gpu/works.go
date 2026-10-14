@@ -5,6 +5,7 @@ package gpu // import "go.opentelemetry.io/ebpf-profiler/probes/gpu"
 
 import (
 	"slices"
+	"time"
 
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
@@ -19,7 +20,12 @@ var (
 	stallsProfileType          = gpuProfileType("gpu_stall_samples", "count")
 	collectiveTimeProfileType  = gpuProfileType("gpu_collective_time", "nanoseconds")
 	collectiveBytesProfileType = gpuProfileType("gpu_collective_bytes", "bytes")
+	apiTimeProfileType         = gpuProfileType("gpu_api_time", "nanoseconds")
 )
+
+// maxAPISpan bounds API spans: a span outlives this only if its return was
+// missed and its start stayed in the eBPF map.
+const maxAPISpan = time.Minute
 
 // gpuProfileType describes a profile of GPU work. Its samples aggregate GPU
 // activity, which runs on no CPU and in no thread.
@@ -143,6 +149,19 @@ func collectiveWork(rec eventRecord, operation string) gpuWork {
 		noLaunch: true,
 	}.withValue(collectiveTimeProfileType, duration(rec.start, rec.end)).
 		withValue(collectiveBytesProfileType, int64(rec.v1))
+}
+
+// apiWork is a call of an instrumented host library function.
+func apiWork(rec apiSpanRecord) gpuWork {
+	span := duration(rec.start, rec.end)
+	if span > int64(maxAPISpan) {
+		return gpuWork{}
+	}
+	return gpuWork{
+		pid:      rec.pid,
+		leaf:     apiFunctionName(rec.cookie),
+		noLaunch: true,
+	}.withValue(apiTimeProfileType, span)
 }
 
 // eventWork translates GPU events; ok is false for unknown kinds.

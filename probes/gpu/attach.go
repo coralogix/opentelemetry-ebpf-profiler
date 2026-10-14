@@ -36,7 +36,8 @@ func (p *probe) Match(process.Process, *process.RawMapping) bool {
 // Attach implements processmanager.ProbeAttacher.
 func (p *probe) Attach(pr process.Process, mapping *process.RawMapping) error {
 	points := p.discover(pr, mapping)
-	if len(points) == 0 {
+	apiLibrary := p.apiLibrary(mapping)
+	if len(points) == 0 && apiLibrary == "" {
 		return nil
 	}
 
@@ -52,7 +53,7 @@ func (p *probe) Attach(pr process.Process, mapping *process.RawMapping) error {
 		return nil
 	}
 
-	links, err := p.attachMapping(pr, mapping, points)
+	links, err := p.attachMapping(pr, mapping, points, apiLibrary)
 	if err != nil {
 		return err
 	}
@@ -107,10 +108,11 @@ func (p *probe) discover(pr process.Process, mapping *process.RawMapping) []usdt
 	return consumed
 }
 
-// attachMapping attaches the consuming eBPF program to each USDT point,
-// restricted to the process. The caller must hold p.mu.
+// attachMapping attaches the consuming eBPF program to each USDT point and,
+// for an instrumented library, the API span probes, restricted to the process.
+// The caller must hold p.mu.
 func (p *probe) attachMapping(pr process.Process, mapping *process.RawMapping,
-	points []usdt.AttachmentPoint,
+	points []usdt.AttachmentPoint, apiLibrary string,
 ) ([]link.Link, error) {
 	for _, point := range points {
 		if err := checkArguments(point); err != nil {
@@ -158,6 +160,9 @@ func (p *probe) attachMapping(pr process.Process, mapping *process.RawMapping,
 				point.Provider, point.Name, mapping.Path, err)
 		}
 		links = append(links, l)
+	}
+	if apiLibrary != "" {
+		links = append(links, p.attachAPI(exe, apiLibrary, int(pr.PID()))...)
 	}
 	return links, nil
 }

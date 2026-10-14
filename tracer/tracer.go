@@ -144,7 +144,8 @@ var probeOwnedMaps = libpf.Set[string]{
 	// Off-CPU probe.
 	"sched_times": {},
 	// GPU probe.
-	"gpu_events": {},
+	"gpu_events":     {},
+	"gpu_api_starts": {},
 }
 
 // onlineCPUs once resolves and caches the list of online CPUs.
