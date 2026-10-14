@@ -203,11 +203,12 @@ func (p *probe) handleRecord(b []byte) {
 	switch recordType {
 	case recordKernel:
 		if rec, ok := decodeKernelRecord(pid, b); ok {
-			p.matcher.addWork(kernelWork(rec, p.names.resolve(pid, rec.namePtr)), now)
+			p.matcher.addWork(kernelWork(rec, p.names.resolve(pid, rec.namePtr),
+				p.names.resolve(pid, rec.rangesPtr)), now)
 		}
 	case recordMemcpy:
 		if rec, ok := decodeMemcpyRecord(pid, b); ok {
-			p.matcher.addWork(memcpyWork(rec), now)
+			p.matcher.addWork(memcpyWork(rec, p.names.resolve(pid, rec.rangesPtr)), now)
 		}
 	case recordEvent:
 		rec, ok := decodeEventRecord(pid, b)

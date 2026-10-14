@@ -198,13 +198,15 @@ func TestLaunchStacks(t *testing.T) {
 }
 
 // collectGPUProfiles collects the snapshot samples of pid until the totals by
-// profile type reach want. It returns the totals by profile type, then by leaf.
+// profile type reach want. It returns the totals by profile type, then by leaf
+// or by the GPU frames above the host stack.
 func collectGPUProfiles(t *testing.T, trc *tracer.Tracer, pid libpf.PID,
 	want map[string]int64,
-) map[string]map[string]int64 {
+) (byLeaf, byStack map[string]map[string]int64) {
 	t.Helper()
 	totals := make(map[string]int64)
-	byLeaf := make(map[string]map[string]int64)
+	byLeaf = make(map[string]map[string]int64)
+	byStack = make(map[string]map[string]int64)
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(500 * time.Millisecond)
@@ -223,8 +225,10 @@ func collectGPUProfiles(t *testing.T, trc *tracer.Tracer, pid libpf.PID,
 					filepath.Base(sample.ProcessMeta.ExecutablePath.String()))
 				if byLeaf[sampleType] == nil {
 					byLeaf[sampleType] = make(map[string]int64)
+					byStack[sampleType] = make(map[string]int64)
 				}
 				byLeaf[sampleType][leaf.FunctionName.String()] += sample.Value
+				byStack[sampleType][gpuFrames(sample.Frames)] += sample.Value
 				totals[sampleType] += sample.Value
 			}
 		}
@@ -233,7 +237,20 @@ func collectGPUProfiles(t *testing.T, trc *tracer.Tracer, pid libpf.PID,
 		}
 	}
 	require.Equal(t, want, totals)
-	return byLeaf
+	return byLeaf, byStack
+}
+
+// gpuFrames joins the names of the GPU frames of a sample.
+func gpuFrames(frames libpf.Frames) string {
+	var names []string
+	for _, handle := range frames {
+		frame := handle.Value()
+		if frame.Type != libpf.GPUFrame {
+			break
+		}
+		names = append(names, frame.FunctionName.String())
+	}
+	return strings.Join(names, " > ")
 }
 
 func TestGPUProfiles(t *testing.T) {
@@ -241,7 +258,7 @@ func TestGPUProfiles(t *testing.T) {
 	trc, _ := startTracer(t, rep, gpu.Config{})
 	fired := runProducer(t, 3)
 
-	byLeaf := collectGPUProfiles(t, trc, fired.pid, map[string]int64{
+	byLeaf, byStack := collectGPUProfiles(t, trc, fired.pid, map[string]int64{
 		"gpu_kernel_time": fired.kernelNs,
 		"gpu_mem_time":    fired.memNs,
 		"gpu_mem_bytes":   fired.memBytes,
@@ -250,6 +267,13 @@ func TestGPUProfiles(t *testing.T) {
 		slices.Sorted(maps.Keys(byLeaf["gpu_kernel_time"])))
 	require.Equal(t, []string{"memcpy:HtoD", "memset"},
 		slices.Sorted(maps.Keys(byLeaf["gpu_mem_time"])))
+	require.Equal(t, []string{
+		"graph_step",
+		"vector_add",
+		"vector_add > range:aten::mm > range:aten::matmul > range:train_step",
+	}, slices.Sorted(maps.Keys(byStack["gpu_kernel_time"])))
+	require.Equal(t, []string{"memcpy:HtoD > range:train_step", "memset"},
+		slices.Sorted(maps.Keys(byStack["gpu_mem_time"])))
 }
 
 // inProducer reports whether frames run code of the producer executable.

@@ -38,6 +38,7 @@ type kernelRecord struct {
 	correlationID uint32
 	graphID       uint32
 	namePtr       uint64
+	rangesPtr     uint64
 	sampleWeight  uint32
 }
 
@@ -48,6 +49,7 @@ type memcpyRecord struct {
 	correlationID uint32
 	copyKind      uint32
 	bytes         uint64
+	rangesPtr     uint64
 	sampleWeight  uint32
 }
 
@@ -90,6 +92,7 @@ func decodeKernelRecord(pid libpf.PID, b []byte) (kernelRecord, bool) {
 		correlationID: le.Uint32(rec[16:]),
 		graphID:       le.Uint32(rec[28:]),
 		namePtr:       le.Uint64(rec[32:]),
+		rangesPtr:     le.Uint64(rec[40:]),
 		sampleWeight:  le.Uint32(rec[48:]),
 	}, true
 }
@@ -107,6 +110,7 @@ func decodeMemcpyRecord(pid libpf.PID, b []byte) (memcpyRecord, bool) {
 		correlationID: le.Uint32(rec[16:]),
 		copyKind:      le.Uint32(rec[28:]),
 		bytes:         le.Uint64(rec[32:]),
+		rangesPtr:     le.Uint64(rec[40:]),
 		sampleWeight:  le.Uint32(rec[48:]),
 	}, true
 }
