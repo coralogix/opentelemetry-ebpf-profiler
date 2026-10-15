@@ -61,7 +61,7 @@ const (
 const UnwindInfoMaxEntries = 0x4000
 
 const (
-	MetricIDBeginCumulative = 0x75
+	MetricIDBeginCumulative = 0x76
 )
 
 const (
@@ -522,4 +522,5 @@ var MetricsTranslation = []metrics.MetricID{
 	0x72: metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
 	0x73: metrics.IDUnwindThreadContextReadSuccesses,
 	0x74: metrics.IDUnwindThreadContextAttrsTruncated,
+	0x75: metrics.IDBPFProbeRingbufOutputErr,
 }

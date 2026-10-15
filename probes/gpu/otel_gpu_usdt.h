@@ -30,6 +30,7 @@
 // so producers profile while OTEL_GPU_ENABLED(ready) is true.
 #pragma once
 
+#include <assert.h>
 #include <stdint.h>
 
 #ifdef OTEL_GPU_SEMAPHORES
@@ -164,8 +165,8 @@ struct otel_gpu_error_rec {
   uint64_t msg_ptr; // const char *: static message
 };
 
-_Static_assert(sizeof(struct otel_gpu_launch_rec) == 8, "otel_gpu contract");
-_Static_assert(sizeof(struct otel_gpu_kernel_rec) == 56, "otel_gpu contract");
-_Static_assert(sizeof(struct otel_gpu_mem_rec) == 56, "otel_gpu contract");
-_Static_assert(sizeof(struct otel_gpu_event_rec) == 56, "otel_gpu contract");
-_Static_assert(sizeof(struct otel_gpu_error_rec) == 16, "otel_gpu contract");
+static_assert(sizeof(struct otel_gpu_launch_rec) == 8, "otel_gpu contract");
+static_assert(sizeof(struct otel_gpu_kernel_rec) == 56, "otel_gpu contract");
+static_assert(sizeof(struct otel_gpu_mem_rec) == 56, "otel_gpu contract");
+static_assert(sizeof(struct otel_gpu_event_rec) == 56, "otel_gpu contract");
+static_assert(sizeof(struct otel_gpu_error_rec) == 16, "otel_gpu contract");

@@ -2284,5 +2284,12 @@
     "name": "ThreadContextSchemaRejected",
     "field": "agent.threadctx.schema_rejected",
     "id": 312
+  },
+  {
+    "description": "Number of bpf_ringbuf_output failures when sending the traces of probes",
+    "type": "counter",
+    "name": "BPFProbeRingbufOutputErr",
+    "field": "bpf.errors.probe_ringbuf_output",
+    "id": 313
   }
 ]

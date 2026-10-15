@@ -10,184 +10,265 @@ GPU Profiling
 
 # Abstract
 
-An opt-in probe that reports GPU time per kernel under the code that launched
-it. A library loaded into the workload reports GPU activity through USDT
-probes; the profiler captures the host stack at each GPU call and joins it with
-the GPU time reported later. Only that library is vendor specific.
+This document proposes opt-in GPU profiling: GPU time shown under the stack of
+the code that caused it, next to CPU time. All vendor specific code lives in a
+small library loaded into the application, so the profiler side works for any
+GPU vendor.
+
+# Glossary
+
+| Term | Meaning |
+| --- | --- |
+| Call id | The number CUDA gives each GPU call. GPU timings carry the same number, which is how the profiler pairs them with the stack of the call. |
+| Collective operation | GPUs exchanging data with each other during multi-GPU training, for example adding up their results. |
+| CUDA | NVIDIA's platform for running work on its GPUs. Applications and frameworks such as PyTorch call its runtime library. |
+| CUDA graph | A recorded sequence of kernels that an application replays with a single call, to save the cost of launching each one. |
+| cuDNN, cuBLAS | NVIDIA's libraries of neural network and matrix routines, used by most machine learning frameworks. |
+| CUPTI | NVIDIA's tracing interface for CUDA. It calls a tool library at every CUDA call, and later reports when the resulting GPU work started and ended. |
+| eBPF | Small programs that the Linux kernel runs safely when an event happens. The profiler uses them to capture stacks. |
+| Flame graph | A chart of stacks: each bar is a function, its width is the time spent in it, and the bars on top of it are the functions it called. |
+| Frame | One function in a stack. Each frame of a profile has a type saying what produced it, such as native code or Python. |
+| GPU call | A call into CUDA that starts work on the GPU: launching a kernel, copying or filling memory, or allocating it. |
+| Kernel | A small program that runs on the GPU. Applications start thousands of them per second, and each runs for microseconds to milliseconds. Not to be confused with the Linux kernel. |
+| Memory copy, memory fill | Moving data between CPU and GPU memory, or between GPUs; setting a block of GPU memory to one value. |
+| NCCL | NVIDIA's library for collective operations. |
+| Nsight | NVIDIA's profiling tools for developers. |
+| NVTX range | A named region that a program marks around a piece of its code, such as `train_step`. Ranges can nest. PyTorch can mark every operation it runs, such as `aten::linear`, so the ranges active when a kernel is launched tell which part of a model it belongs to. |
+| OTLP | OpenTelemetry's format for sending telemetry, profiles included. |
+| Producer | Our name for the library loaded into the application that reports GPU activity to the profiler. |
+| Sample weight | How many GPU calls a reported call stands for. The profiler multiplies its time and bytes by it. |
+| Stack | The chain of function calls that led to a point in a program, such as `main` → `train` → `forward`. |
+| Stall sample | A sample the GPU takes of a running kernel, recording what it was waiting for, such as data from memory. |
+| Unified memory | Memory used by both CPU and GPU, which the driver moves to whichever side touches it. A touch that causes a move is a page fault. |
+| Uprobe | An eBPF program attached to a function of an application or library. |
+| USDT probe | A marker compiled into a program. It costs almost nothing until a tool attaches to it; the tool's eBPF program then runs every time the program passes the marker. |
 
 # Problem
 
-GPU work is asynchronous: a kernel launch returns before the kernel runs. A CPU
-profiler sees the launching thread, not the GPU time it causes, and GPU
-utilization metrics do not say which code is responsible.
+Applications do not run code on the GPU directly. They ask the driver to start a
+kernel, and the call returns right away while the kernel runs later. A CPU
+profiler therefore sees the application start kernels and wait for them, but not
+the GPU time those kernels take.
+
+![Host thread with short launches and long waits, above a GPU busy with kernels](problem.svg)
+
+*A CPU profile of this thread shows six short launches and two waits. The real
+cost is the GPU time below, and no stack owns it.*
+
+In machine learning workloads most of the cost is on the GPU, so this is the
+question that matters: which line of Python, or which function of a C++ service,
+is responsible for the GPU time? GPU utilization metrics only say that the GPU
+is busy. Vendor tools such as NVIDIA Nsight answer the question for a developer
+running one program on demand, not for always-on profiling of a whole fleet.
+
+The eBPF profiler already captures stacks in many languages, Python included,
+from outside the process, and already runs on every host. What it lacks is a way
+to learn when a GPU call happens and how long the resulting GPU work took. eBPF
+cannot see either: the timing comes from the GPU, and only the vendor's tracing
+library reports it.
 
 # Success Criteria
 
-- GPU time is attributed to the host stack that launched the work, in every
-  language the profiler unwinds.
-- Opt-in, with bounded cost on the workload and the agent, also at thousands of
-  kernel launches per second.
-- No vendor code in the profiler.
-- Existing unwinding, symbolization and export are reused; memory is bounded.
+- GPU time shows up under the stack of the code that caused it, in every
+  language the profiler supports.
+- The feature is opt-in, and its cost on the application and on the profiler
+  stays bounded, also at thousands of kernels per second.
+- The profiler contains no vendor specific code.
+- The profiler's existing stack capture and export are reused, and all new
+  memory use is bounded.
 
 ## Scope
 
-Out of scope: the libraries loaded into workloads (they live in their own
-repositories), how they are loaded (environment variable, Kubernetes webhook),
-and accelerators without a per-call tracing API.
+In scope: the profiler side, and the contract that a library inside the
+application must follow.
+
+Out of scope: the libraries themselves; how they get loaded into applications,
+for example through an environment variable or a Kubernetes webhook; and
+accelerators that cannot report individual GPU calls.
 
 # Proposed Solution
 
-## Architecture
+## How it works
 
-Three parts. Only the first is vendor specific.
+The work is split into three parts, and only the first one knows the vendor.
 
-1. **Producer library**, in its own repository. It is loaded into the workload
-   at startup; for NVIDIA, CUDA loads it from `CUDA_INJECTION64_PATH`. It uses
-   the vendor's tracing API (CUPTI) to learn about each GPU call and each
-   finished kernel, and reports both through USDT probes. The workload's code
-   does not change.
-2. **eBPF programs**, in this repository, attached to those probes in each
-   process. When the app makes a GPU call, they capture its stack like a CPU
-   sample. When GPU work finishes, they pass its record to the agent.
-3. **Agent**, in this repository. It matches each GPU record to the stack of
-   the call that caused it, adds the GPU time to that stack, and exports the
-   result as OTLP profiles.
+![Architecture: a library inside the application, eBPF programs, and the profiler](architecture.svg)
 
-For one kernel:
+**A library inside the application, the producer.** Applications use NVIDIA
+GPUs through CUDA, which loads the library named in the `CUDA_INJECTION64_PATH`
+environment variable into every process that uses it, without any change to
+the application. The producer uses CUPTI, which calls it on the application's
+thread at every GPU call and later hands it the start and end time of every
+finished kernel. The producer passes both on through USDT probes, as in the
+memory profiling proposal (00003).
 
-1. The app launches a kernel. CUDA gives the call an id.
-2. The producer fires `on_launch` with that id, and the profiler captures the
-   app thread's stack.
-3. The kernel runs. CUPTI later reports its start and end times, with the same
-   id.
-4. The producer fires `kernel_executed` with the id and the times.
-5. The agent finds the stack saved under that id and adds the kernel's GPU time
+**eBPF programs.** The profiler attaches small programs to these probes in each
+process. When the application makes a GPU call, they capture the stack, exactly
+like a CPU sample. When GPU work finishes, they forward its timing.
+
+**The profiler.** It pairs each piece of finished GPU work with the stack of
+the call that started it, adds the GPU time to that stack, and exports the
+result with the regular OTLP profiles.
+
+The pairing relies on the call id. Following one kernel through the system:
+
+![Timeline of one kernel across the application thread, producer, eBPF, profiler and GPU](one-kernel.svg)
+
+1. The application launches a kernel. CUDA gives the call an id, say 42.
+2. The producer fires the `on_launch` probe with id 42, still on the
+   application's thread, and the profiler captures the stack.
+3. The kernel runs on the GPU. Later, CUPTI reports its start and end times,
+   with id 42.
+4. The producer fires the `kernel_executed` probe with id 42 and those times.
+5. The profiler finds the stack it saved under id 42 and adds the kernel's time
    to it.
 
-## Contract
+Copies between CPU and GPU memory, memory fills and allocations take the same
+path.
 
-The contract is `probes/gpu/otel_gpu_usdt.h`. It is used by producer authors,
-not by workloads, which run unchanged. The producer and the profiler are built
-and released separately but read the same bytes, so the header fixes the probe
-names, the record layouts and how a record is passed.
+GPU timings usually reach the profiler before the stack does, because stacks go
+through the same processing as CPU samples. Finished GPU work therefore waits up
+to 2 seconds for its stack; if none arrives, the time still counts for the
+process, without a stack. All kernels of a CUDA graph share one call id and land
+on the same stack. After a process exits, the profiler keeps what it knows about
+it for 5 more seconds, for work still in flight. Everything it keeps lives in
+maps of fixed size.
 
-| Probe | Fired when | Profiler action |
-| --- | --- | --- |
-| `ready` | Once, when the producer starts | Nothing; attached last, see rule 1 |
-| `on_launch` | The app makes a GPU call (kernel launch, memory copy or set, allocation), on the app's thread | Captures the stack, keyed by the call's id |
-| `kernel_executed` | A kernel finished on the GPU | Adds its GPU time to its call's stack |
-| `gpu_mem` | A memory copy finished | Adds its time and bytes to its call's stack |
-| `gpu_event` | Other activity, by kind (memory sets, allocations, ...) | Same, by kind |
-| `error` | The producer cannot profile | Logs it |
+## The contract between producer and profiler
 
-| Record field | Meaning |
+The producer and the profiler are built and released separately, so they agree
+on a small contract, a C header in this repository:
+`probes/gpu/otel_gpu_usdt.h`. Producer authors include it; applications never
+see it. All probes are grouped under the name `otel_gpu`, their USDT provider.
+
+| Probe | Fired when |
 | --- | --- |
-| `correlation_id` | The id CUDA gives each call; joins GPU records to the stack |
-| `sample_weight` | How many calls this one stands for; 0 counts as 1 |
-| `start`, `end` | GPU timestamps, nanoseconds |
-| `device_id`, `stream_id`, `graph_id` | Where the work ran; `graph_id` is 0 outside CUDA graphs |
-| `name_ptr`, `ranges_ptr` | Kernel name and NVTX ranges, as strings in the producer's memory |
+| `ready` | Once, when the producer starts |
+| `on_launch` | The application makes a GPU call; fired on its thread |
+| `kernel_executed` | A kernel finished on the GPU |
+| `gpu_mem` | A memory copy finished |
+| `gpu_event` | Other GPU activity, such as memory fills and allocations |
+| `error` | The producer cannot profile, for example because another tool already uses CUPTI |
 
-Rules:
+Each probe passes one pointer to a fixed-size record: the call's id, the GPU
+start and end times and, where they apply, the kernel name, the bytes copied
+and the NVTX ranges active at the call. Names are pointers into the
+application's memory, which the profiler reads once per process.
 
-1. Producers profile calls only while `OTEL_GPU_ENABLED(ready)` is true. The
-   kernel raises it when the profiler attaches to `ready`, which the profiler
-   does last, once every other probe works.
-2. A call that is not sampled fires nothing: no stack, no GPU records.
-3. Strings stay valid while the process runs.
-4. `OTEL_GPU_PROBE` passes the record pointer in a fixed register; the
-   profiler refuses probes that pass it any other way.
-5. Breaking changes use new probe names (`_v2`).
+Three rules keep both sides in step:
 
-## Sampling
+- The producer reports nothing until the profiler is fully attached. Linux
+  raises a counter on a USDT probe while a tool is attached to it; the profiler
+  attaches to `ready` last, and the producer waits for that counter. Otherwise,
+  work started earlier would report GPU time without a stack.
+- The header fixes the CPU register that carries the record pointer, so the
+  profiler never has to work out where a compiler put it.
+- Incompatible changes get new probe names with a `_v2` suffix, so old and new
+  producers keep working with old and new profilers.
 
-Capturing a stack at every launch costs too much at thousands of launches per
-second, so producers sample.
+Because the profiler only knows this contract, another vendor needs a producer
+library, not profiler changes. It takes a way to load a library into unmodified
+applications, and a tracing interface that calls it on the thread making each
+GPU call with an id that the later timing reports repeat. NVIDIA provides both.
 
-- Each thread samples each kind of call on its own: kernel launches, graph
-  launches, memory operations, allocations. Defaults: 200 sampled calls per
-  second per thread and kind, 20 for graph launches.
-- A call is sampled with probability 1/N and carries weight N, where N follows
-  the call rate of the last second. The profiler multiplies times and bytes by
-  the weight.
+## Keeping the cost down
 
-| Approach | Agent load | Totals |
-| --- | --- | --- |
-| Every call | Unbounded | Exact, until overload drops stacks |
-| First call per time slot | Bounded | Biased toward calls after a pause |
-| Random 1 in N, weighted (proposed) | Bounded | Unbiased estimate |
+Capturing a stack costs a few microseconds, about as much as a CPU sample, while
+training and inference jobs can launch thousands of kernels per second on one
+thread. So the producer samples the calls it reports.
 
-## Joining
+Each thread counts its own calls, separately for kernel launches, CUDA graph
+launches, memory operations and allocations. If a thread made N times more calls
+of one kind in the last second than the target rate allows, each call is
+reported with probability 1/N and counts N times: the producer passes N along as
+the call's weight, and the profiler multiplies the GPU time and bytes by it.
+Totals stay right on average, and the cost is capped: by default 200 calls per
+second per thread and kind, 20 for CUDA graph launches. A call that is not
+sampled fires nothing.
 
-- GPU records usually arrive before their stack. They wait up to 2 s, then
-  count for the process without a stack.
-- All kernels of a CUDA graph share one call id and join the same stack.
-  Waiting records of one call and kernel are merged into one entry.
-- After a process exits, its state is kept 5 s for records in flight; a
-  process reusing the PID never matches its stacks.
-- Stacks, waiting records and process metadata live in bounded maps.
+On an NVIDIA T4 with these defaults, PyTorch training ran about 2% slower and
+ollama inference about 1.5% slower, the profiler used about 0.05 CPU cores, and
+all GPU time landed under a stack in both.
 
-## Output
+## What gets reported
 
-Samples are added to each report as aggregated values, without thread or CPU
-attributes. A new frame type `gpu` marks the frames the probe creates: the
-kernel or operation, then NVTX ranges as `range:` frames, then the host stack.
+GPU samples are added to each report next to the CPU samples. A sample's stack
+starts with the kernel, then the NVTX ranges from the innermost outwards, then
+the application stack captured at the call. A new frame type, `gpu`, marks the
+frames the profiler adds. GPU samples carry no thread or CPU, since GPU work
+runs on neither.
 
-| Profile | Unit | Step |
-| --- | --- | --- |
-| `gpu_launches` | count | 3 |
-| `gpu_kernel_time` | nanoseconds | 4 |
-| `gpu_mem_time`, `gpu_mem_bytes` | nanoseconds, bytes | 4 |
-| `gpu_alloc_bytes` | bytes | 6 |
-| `gpu_uvm_bytes`, `gpu_uvm_faults` | bytes, count | 6 |
-| `gpu_stall_samples` | count | 6 |
-| `gpu_collective_time`, `gpu_collective_bytes` | nanoseconds, bytes | 6 |
-| `gpu_api_time` | nanoseconds | 6 |
+![Flame graph of GPU kernel time of a PyTorch training job](example-profile.svg)
 
-## Changes to the profiler
+*GPU kernel time of a PyTorch training job on an NVIDIA T4, over 52 seconds.
+Kernels are on top, NVTX ranges below them, then the producer and the Python
+code that made each call. Frames of native libraries are hidden for
+readability.*
 
-| Change | Why |
-| --- | --- |
-| `usdt` exposes each probe's argument string | Check how the record is passed before attaching |
-| Frame types made in Go, starting with `gpu`, above the eBPF frame type range | GPU frames are not unwound |
-| Probes can add aggregated samples to each report, keeping the metadata of exited processes | GPU time arrives after the launch, sometimes after the process exited |
-| Trace handlers can be added while traces are handled | Today this races with the trace loop |
-| Probes attach after a process's mappings reach eBPF | Otherwise the first stacks cannot be unwound |
+Each kind of GPU activity is its own profile, such as `gpu_kernel_time`; the
+plan below lists them.
 
-## Vendor support
+## Limitations
 
-A vendor needs a way to load a library into unmodified workloads and a tracing
-API that calls it on the launching thread with an id the GPU records repeat.
-NVIDIA provides both (`CUDA_INJECTION64_PATH` and CUPTI). Other vendors with
-both can add a library without profiler changes.
+- Only NVIDIA has a producer today.
+- Only processes that load the producer are profiled.
+- CUPTI serves one tool per process, so the producer cannot run next to another
+  tool that uses it, such as NVIDIA Nsight; it reports this through `error`.
+- Each stack ends with a few frames of the producer and NVIDIA's libraries,
+  between the application code and the GPU frames.
 
-## Plan
+# Plan
 
-| Step | Content |
-| --- | --- |
-| 1 | The profiler changes above, one PR each |
-| 2 | This document |
-| 3 | `gpu` probe: contract, attaching, launch stacks |
-| 4 | Kernel and memory copy time, join, weights, errors |
-| 5 | NVTX ranges |
-| 6 | On demand, one PR each: allocations, unified memory, stall samples, collectives, GPU library call time |
+The work splits into pull requests that can be reviewed one at a time. Steps 3
+to 5 deliver the feature; step 6 lists extras to add only if there is interest.
 
-# Testing Strategy
-
-- Unit tests for decoding, the join, weights and the sampler.
-- Integration tests with a fake producer, a C program firing the probes with
-  fixed records, so CI needs no GPU. Totals must match exactly.
-- Manual runs on GPU hosts with the NVIDIA library.
-
-The probe is opt-in and creates its eBPF maps only when loaded.
+1. Small, general changes to the profiler, one pull request each:
+   - the profiler can check how a USDT probe passes its data before attaching
+     to it;
+   - profiles can contain frames that the profiler creates itself, starting
+     with GPU frames;
+   - probes can add their own totals to each report, and keep labeling a
+     process's data after it exits;
+   - probes can be enabled while the profiler is already processing stacks,
+     which today can conflict;
+   - probes attach to a process only once the profiler knows its memory
+     layout, otherwise the first stacks cannot be read;
+   - probes attach without holding the lock that stack processing needs:
+     attaching can take seconds, and stopped all stacks in the meantime, CPU
+     samples included;
+   - stacks captured for probes go through a buffer of their own, so a burst of
+     GPU calls cannot crowd out CPU samples.
+2. This document.
+3. **Stacks of GPU calls.** The `gpu` probe with the contract header: it finds
+   the probes in each process, attaches to them and captures the stack at every
+   GPU call. The `gpu_launches` profile counts GPU calls per stack. No GPU time
+   yet.
+4. **GPU time.** Kernel durations, and the duration and size of memory copies
+   and fills, paired with the stacks of step 3 and multiplied by the sample
+   weights: `gpu_kernel_time`, `gpu_mem_time` and `gpu_mem_bytes`. Producer
+   errors are logged. From here on, the profiler answers which code uses the
+   GPU.
+5. **Model layers.** The producer passes the NVTX ranges active at each GPU
+   call, and the profiler adds them as `range:` frames between the kernel and
+   the application stack, so a profile shows which part of a model a kernel
+   belongs to.
+6. **Extras**, one pull request each:
+   - GPU memory allocated and freed, per stack and kind of memory:
+     `gpu_alloc_bytes`.
+   - Unified memory: bytes moved and page faults, per process, in
+     `gpu_uvm_bytes` and `gpu_uvm_faults`.
+   - Stall samples, counted per kernel and reason, per process, in
+     `gpu_stall_samples`.
+   - Collective operations, as reported by NCCL: time and bytes per operation
+     and process, in `gpu_collective_time` and `gpu_collective_bytes`.
+   - Time spent in cuDNN and cuBLAS calls, measured with uprobes on their main
+     functions: `gpu_api_time`, per process. Opt-in, and needs Linux 5.15.
 
 # Open Questions
 
-- Provider name: `otel_gpu`?
-- A `gpu` value for `profile.frame.type` in the semantic conventions.
-- Where producer libraries live.
-- Default sampling rates on hosts with many GPUs or launching threads.
+- Should `gpu` become a value of `profile.frame.type` in the semantic
+  conventions?
+- Where should producer libraries live?
 
 # Decision
 

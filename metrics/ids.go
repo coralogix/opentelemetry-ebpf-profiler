@@ -710,6 +710,9 @@ const (
 	// Number of processes whose published thread-context label schema was rejected
 	IDThreadContextSchemaRejected = 312
 
+	// Number of bpf_ringbuf_output failures when sending the traces of probes
+	IDBPFProbeRingbufOutputErr = 313
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 313
+	IDMax = 314
 )
