@@ -270,7 +270,12 @@ func (pm *ProcessManager) attachProbesForMapping(pr process.Process, m *process.
 			continue
 		}
 		if err := a.Attach(pr, m); err != nil {
-			log.Errorf("Failed to attach probe for PID %d, mapping %s: %v", pid, m.Path, err)
+			if alive, _ := isPIDLive(pid); alive {
+				log.Errorf("Failed to attach probe for PID %d, mapping %s: %v", pid, m.Path, err)
+			} else {
+				log.Debugf("Failed to attach probe for PID %d, mapping %s: process exited",
+					pid, m.Path)
+			}
 			continue
 		}
 		if pm.attachedProbes[pid] == nil {
