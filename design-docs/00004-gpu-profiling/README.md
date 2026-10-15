@@ -15,34 +15,6 @@ the code that caused it, next to CPU time. All vendor specific code lives in a
 small library loaded into the application, so the profiler side works for any
 GPU vendor.
 
-# Glossary
-
-| Term | Meaning |
-| --- | --- |
-| Call id | The number CUDA gives each GPU call. GPU timings carry the same number, which is how the profiler pairs them with the stack of the call. |
-| Collective operation | GPUs exchanging data with each other during multi-GPU training, for example adding up their results. |
-| CUDA | NVIDIA's platform for running work on its GPUs. Applications and frameworks such as PyTorch call its runtime library. |
-| CUDA graph | A recorded sequence of kernels that an application replays with a single call, to save the cost of launching each one. |
-| cuDNN, cuBLAS | NVIDIA's libraries of neural network and matrix routines, used by most machine learning frameworks. |
-| CUPTI | NVIDIA's tracing interface for CUDA. It calls a tool library at every CUDA call, and later reports when the resulting GPU work started and ended. |
-| eBPF | Small programs that the Linux kernel runs safely when an event happens. The profiler uses them to capture stacks. |
-| Flame graph | A chart of stacks: each bar is a function, its width is the time spent in it, and the bars on top of it are the functions it called. |
-| Frame | One function in a stack. Each frame of a profile has a type saying what produced it, such as native code or Python. |
-| GPU call | A call into CUDA that starts work on the GPU: launching a kernel, copying or filling memory, or allocating it. |
-| Kernel | A small program that runs on the GPU. Applications start thousands of them per second, and each runs for microseconds to milliseconds. Not to be confused with the Linux kernel. |
-| Memory copy, memory fill | Moving data between CPU and GPU memory, or between GPUs; setting a block of GPU memory to one value. |
-| NCCL | NVIDIA's library for collective operations. |
-| Nsight | NVIDIA's profiling tools for developers. |
-| NVTX range | A named region that a program marks around a piece of its code, such as `train_step`. Ranges can nest. PyTorch can mark every operation it runs, such as `aten::linear`, so the ranges active when a kernel is launched tell which part of a model it belongs to. |
-| OTLP | OpenTelemetry's format for sending telemetry, profiles included. |
-| Producer | Our name for the library loaded into the application that reports GPU activity to the profiler. |
-| Sample weight | How many GPU calls a reported call stands for. The profiler multiplies its time and bytes by it. |
-| Stack | The chain of function calls that led to a point in a program, such as `main` → `train` → `forward`. |
-| Stall sample | A sample the GPU takes of a running kernel, recording what it was waiting for, such as data from memory. |
-| Unified memory | Memory used by both CPU and GPU, which the driver moves to whichever side touches it. A touch that causes a move is a page fault. |
-| Uprobe | An eBPF program attached to a function of an application or library. |
-| USDT probe | A marker compiled into a program. It costs almost nothing until a tool attaches to it; the tool's eBPF program then runs every time the program passes the marker. |
-
 # Problem
 
 Applications do not run code on the GPU directly. They ask the driver to start a
@@ -99,7 +71,8 @@ GPUs through CUDA, which loads the library named in the `CUDA_INJECTION64_PATH`
 environment variable into every process that uses it, without any change to
 the application. The producer uses CUPTI, which calls it on the application's
 thread at every GPU call and later hands it the start and end time of every
-finished kernel. The producer passes both on through USDT probes, as in the
+finished kernel. The producer passes both on through USDT probes, markers
+compiled into it that cost nothing until a tool attaches to them, as in the
 memory profiling proposal (00003).
 
 **eBPF programs.** The profiler attaches small programs to these probes in each
@@ -110,7 +83,8 @@ like a CPU sample. When GPU work finishes, they forward its timing.
 the call that started it, adds the GPU time to that stack, and exports the
 result with the regular OTLP profiles.
 
-The pairing relies on the call id. Following one kernel through the system:
+The pairing relies on an id that CUDA gives every GPU call. Following one kernel
+through the system:
 
 ![Timeline of one kernel across the application thread, producer, eBPF, profiler and GPU](one-kernel.svg)
 
@@ -255,12 +229,14 @@ to 5 deliver the feature; step 6 lists extras to add only if there is interest.
 6. **Extras**, one pull request each:
    - GPU memory allocated and freed, per stack and kind of memory:
      `gpu_alloc_bytes`.
-   - Unified memory: bytes moved and page faults, per process, in
-     `gpu_uvm_bytes` and `gpu_uvm_faults`.
-   - Stall samples, counted per kernel and reason, per process, in
-     `gpu_stall_samples`.
-   - Collective operations, as reported by NCCL: time and bytes per operation
-     and process, in `gpu_collective_time` and `gpu_collective_bytes`.
+   - Unified memory, which the driver moves between CPU and GPU on its own:
+     bytes moved and page faults, per process, in `gpu_uvm_bytes` and
+     `gpu_uvm_faults`.
+   - Stall samples, what running kernels were waiting for, such as memory:
+     counted per kernel and reason, per process, in `gpu_stall_samples`.
+   - Collective operations, GPUs exchanging data in multi-GPU training, as
+     reported by NCCL: time and bytes per operation and process, in
+     `gpu_collective_time` and `gpu_collective_bytes`.
    - Time spent in cuDNN and cuBLAS calls, measured with uprobes on their main
      functions: `gpu_api_time`, per process. Opt-in, and needs Linux 5.15.
 
@@ -273,3 +249,18 @@ to 5 deliver the feature; step 6 lists extras to add only if there is interest.
 # Decision
 
 TBD.
+
+# Glossary
+
+| Term | Meaning |
+| --- | --- |
+| CUDA | NVIDIA's platform for running work on its GPUs. Applications and frameworks such as PyTorch call its runtime library. |
+| CUDA graph | A recorded sequence of kernels that an application replays with a single call, to save the cost of launching each one. |
+| cuDNN, cuBLAS | NVIDIA's libraries of neural network and matrix routines, used by most machine learning frameworks. |
+| CUPTI | NVIDIA's tracing interface for CUDA. It calls a tool library at every CUDA call, and later reports when the resulting GPU work started and ended. |
+| Frame | One function in a stack. Each frame of a profile has a type saying what produced it, such as native code or Python. |
+| GPU call | A call into CUDA that starts work on the GPU: launching a kernel, copying or filling memory, or allocating it. |
+| Kernel | A small program that runs on the GPU. Applications start thousands of them per second, and each runs for microseconds to milliseconds. Not to be confused with the Linux kernel. |
+| NCCL | NVIDIA's library for GPUs exchanging data in multi-GPU training. |
+| Nsight | NVIDIA's profiling tools for developers. |
+| NVTX range | A named region that a program marks around a piece of its code, such as `train_step`. Ranges can nest. PyTorch can mark every operation it runs, such as `aten::linear`, so the ranges active when a kernel is launched tell which part of a model it belongs to. |
