@@ -129,6 +129,15 @@ struct trace_events_t {
   __uint(max_entries, 0);
 } trace_events SEC(".maps");
 
+// Ring buffer for the traces of probes, such as GPU calls and off-CPU events.
+// The probe unwinders are loaded with their trace_events references pointed at
+// this map, so a burst of probe traces cannot crowd out sampled traces.
+// Sized at load time like trace_events.
+struct probe_trace_events_t {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 0);
+} probe_trace_events SEC(".maps");
+
 // End shared maps
 
 // Implements the specification to share span/trace IDs according to:

@@ -14,8 +14,9 @@ import (
 // the same PID if the process has more than one matching mapping.
 // Detach is called exactly once per PID when the process exits.
 //
-// Implementations must not call back into ProcessManager during Attach or Detach,
-// as those methods are invoked while the ProcessManager's internal lock is held.
+// Attach and Detach are serialized, but called without the lock that trace handling
+// uses, so slow attaching does not hold up traces. Implementations must not call back
+// into ProcessManager during Attach or Detach.
 type ProbeAttacher interface {
 	// Match returns true if this probe wants to attach to a process that has the
 	// given executable mapping. Must be cheap and must not block.
@@ -37,7 +38,7 @@ type ProbeAttacher interface {
 // calls Match for each new executable mapping and Attach for every matching mapping.
 // Detach is called on process exit.
 func (pm *ProcessManager) RegisterProbeAttacher(a ProbeAttacher) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
+	pm.attachMu.Lock()
+	defer pm.attachMu.Unlock()
 	pm.probeAttachers = append(pm.probeAttachers, a)
 }

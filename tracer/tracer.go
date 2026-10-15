@@ -551,12 +551,12 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config, origins *orig
 	}
 
 	// Load the tail call destinations so custom probes can use it.
-	// loadProbeUnwinders repoints the probe unwinder's per_cpu_records references
-	// to per_cpu_records_kp so a perf sampler can't clobber an in-flight uprobe unwind;
-	// the perf unwinder keeps per_cpu_records.
+	probeMaps, err := probeUnwinderMaps(ebpfMaps)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], tailCallProgs,
-		cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD(),
-		ebpfMaps["per_cpu_records"].FD(), ebpfMaps["per_cpu_records_kp"]); err != nil {
+		cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD(), probeMaps); err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to load kprobe eBPF programs: %v", err)
 	}
 
@@ -730,6 +730,7 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 	}
 	ringbufSize := uint64(cfg.SamplesPerSecond * len(onlineCPUs) * support.Sizeof_TraceWithData)
 	adaption["trace_events"] = uint32(min(util.NextPowerOfTwo(ringbufSize), 1<<31))
+	adaption["probe_trace_events"] = adaption["trace_events"]
 
 	for i := support.StackDeltaBucketSmallest; i <= support.StackDeltaBucketLargest; i++ {
 		mapName := fmt.Sprintf("exe_id_to_%d_stack_deltas", i)
@@ -883,13 +884,34 @@ func progArrayReferences(perfTailCallMapFD int, insns asm.Instructions) []int {
 	return insNos
 }
 
+// probeUnwinderMaps returns the maps the probe unwinders use in place of the
+// perf unwinders' ones, keyed by the FD of the map they replace: their own
+// per-CPU record, so a perf sampler cannot clobber an in-flight probe unwind,
+// and their own trace buffer, so probe traces cannot crowd out sampled ones.
+func probeUnwinderMaps(maps map[string]*cebpf.Map) (map[int]*cebpf.Map, error) {
+	replacements := map[string]string{
+		"per_cpu_records": "per_cpu_records_kp",
+		"trace_events":    "probe_trace_events",
+	}
+	probeMaps := make(map[int]*cebpf.Map, len(replacements))
+	for perfName, probeName := range replacements {
+		perfMap, probeMap := maps[perfName], maps[probeName]
+		if perfMap == nil || probeMap == nil {
+			return nil, fmt.Errorf("%s or %s map not available", perfName, probeName)
+		}
+		probeMaps[perfMap.FD()] = probeMap
+	}
+	return probeMaps, nil
+}
+
 // loadProbeUnwinders reuses large parts of loadPerfUnwinders. By default all eBPF programs
 // are written as perf event eBPF programs. loadProbeUnwinders dynamically rewrites the
 // specification of these programs to xProbe eBPF programs and adjusts tail call maps if needed.
+// probeMaps, from probeUnwinderMaps, replaces the perf unwinders' maps.
 func loadProbeUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.Program,
 	tailcallMap *cebpf.Map, progs []ProgLoaderHelper,
 	bpfVerifierLogLevel uint32, perfTailCallMapFD int,
-	perCPURecordsFD int, perCPURecordsKprobeMap *cebpf.Map,
+	probeMaps map[int]*cebpf.Map,
 ) error {
 	programOptions := cebpf.ProgramOptions{
 		LogLevel: cebpf.LogLevel(bpfVerifierLogLevel),
@@ -920,11 +942,11 @@ func loadProbeUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.
 				}
 			}
 
-			// Repoint per_cpu_records to the probe unwinder's own record map.
-			recInsns := progArrayReferences(perCPURecordsFD, progSpec.Instructions)
-			for _, ins := range recInsns {
-				if err := progSpec.Instructions[ins].AssociateMap(perCPURecordsKprobeMap); err != nil {
-					return fmt.Errorf("failed to rewrite per_cpu_records ptr: %v", err)
+			for perfMapFD, probeMap := range probeMaps {
+				for _, ins := range progArrayReferences(perfMapFD, progSpec.Instructions) {
+					if err := progSpec.Instructions[ins].AssociateMap(probeMap); err != nil {
+						return fmt.Errorf("failed to rewrite %s ptr: %v", probeMap, err)
+					}
 				}
 			}
 		}

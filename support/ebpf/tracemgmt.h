@@ -744,7 +744,9 @@ static inline EBPF_INLINE void push_kernel_frames(void *ctx, Trace *trace)
   }
 }
 
-// Send a trace to userspace via the `trace_events` ringbuffer.
+// Send a trace to userspace via the `trace_events` ringbuffer, or via
+// `probe_trace_events` from the probe unwinders, which are loaded with that map in
+// place of `trace_events`.
 static inline EBPF_INLINE void send_trace(UNUSED void *ctx, Trace *trace)
 {
   u64 send_size = __builtin_offsetof(struct Trace, variable_data) +
@@ -761,7 +763,9 @@ static inline EBPF_INLINE void send_trace(UNUSED void *ctx, Trace *trace)
   // there's no "lost events" counter that userspace can access. We can however
   // capture an error here and increment the associated metric.
   if (bpf_ringbuf_output(&trace_events, trace, send_size, BPF_RB_NO_WAKEUP) < 0) {
-    increment_metric(metricID_BPFRingbufOutputErr);
+    increment_metric(
+      trace->origin == origin_id_sampling ? metricID_BPFRingbufOutputErr
+                                          : metricID_BPFProbeRingbufOutputErr);
   }
 }
 

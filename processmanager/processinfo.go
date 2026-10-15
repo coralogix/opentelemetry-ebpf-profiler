@@ -226,6 +226,39 @@ func (pm *ProcessManager) handleNewInterpreter(pr process.Process, bias libpf.Ad
 	return anonymousMappingsWanted || instance.UsesAnonymousMappings(), nil
 }
 
+// attachProbes attaches the registered ProbeAttachers to the given new mappings of
+// a process, unless the process exited in the meantime: its probes were then
+// already detached, and attaching now would leak them.
+func (pm *ProcessManager) attachProbes(pr process.Process, mappings []process.RawMapping) {
+	if len(mappings) == 0 {
+		return
+	}
+	pm.attachMu.Lock()
+	defer pm.attachMu.Unlock()
+
+	pid := pr.PID()
+	pm.mu.RLock()
+	_, exited := pm.exitEvents[pid]
+	_, known := pm.pidToProcessInfo[pid]
+	pm.mu.RUnlock()
+	if exited || !known {
+		return
+	}
+	for i := range mappings {
+		pm.attachProbesForMapping(pr, &mappings[i])
+	}
+}
+
+// detachProbes detaches the ProbeAttachers attached to an exited process.
+func (pm *ProcessManager) detachProbes(pid libpf.PID) {
+	pm.attachMu.Lock()
+	defer pm.attachMu.Unlock()
+	for a := range pm.attachedProbes[pid] {
+		a.Detach(pid)
+	}
+	delete(pm.attachedProbes, pid)
+}
+
 // attachProbesForMapping iterates the registered ProbeAttachers and calls Attach
 // for every attacher whose Match returns true for the given mapping.
 // Attach may be called multiple times for the same attacher if the process
@@ -498,6 +531,8 @@ func (pm *ProcessManager) processPIDExit(pid libpf.PID) {
 		}
 	}()
 	defer pm.ebpf.RemoveReportedPID(pid)
+	// Detach probes once mu is released: detaching can take seconds.
+	defer pm.detachProbes(pid)
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -528,11 +563,6 @@ func (pm *ProcessManager) processPIDExit(pid libpf.PID) {
 	}
 	pm.pidPageToMappingInfoSize -= min(pm.pidPageToMappingInfoSize, deleted)
 	pm.processRemovedInterpreters(pid, libpf.Set[util.OnDiskFileIdentifier]{})
-
-	for a := range pm.attachedProbes[pid] {
-		a.Detach(pid)
-	}
-	delete(pm.attachedProbes, pid)
 }
 
 // isInterpreterMapping reports whether a mapping should be passed to interpreter
@@ -833,13 +863,13 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 			info.meta = meta
 		}
 		info.processContext = newProcessContextInfo
-		// Probes fire right after attaching: their traces must find the process.
-		for i := range attach {
-			pm.attachProbesForMapping(pr, &attach[i])
-		}
 	}
 	interpreters := pm.interpreters[pid]
 	pm.mu.Unlock()
+
+	// Probes fire right after attaching: their traces must find the process, so
+	// attach only now that its mappings are published.
+	pm.attachProbes(pr, attach)
 
 	// Synchronize all interpreters with updated mappings
 	for _, instance := range interpreters {

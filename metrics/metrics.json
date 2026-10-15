@@ -2258,5 +2258,12 @@
     "name": "UnwindThreadContextAttrsTruncated",
     "field": "bpf.threadctx.attrs_truncated",
     "id": 309
+  },
+  {
+    "description": "Number of bpf_ringbuf_output failures when sending the traces of probes",
+    "type": "counter",
+    "name": "BPFProbeRingbufOutputErr",
+    "field": "bpf.errors.probe_ringbuf_output",
+    "id": 310
   }
 ]

@@ -133,13 +133,18 @@ type ProcessManager struct {
 
 	metaEnrichers []process.MetaEnricher
 
+	// attachMu serializes probe attaching and detaching, which can take seconds,
+	// apart from mu so that trace handling does not wait for it. It is taken
+	// before mu when both are held.
+	attachMu sync.Mutex
+
 	// probeAttachers is the set of per-process probe attachers registered via
-	// RegisterProbeAttacher. Protected by mu.
+	// RegisterProbeAttacher. Protected by attachMu.
 	probeAttachers []ProbeAttacher
 
 	// attachedProbes tracks which ProbeAttacher have been successfully attached to each PID.
 	// Using a set ensures each attacher is Detach-called exactly once per PID
-	// regardless of how many matching mappings triggered Attach. Protected by mu.
+	// regardless of how many matching mappings triggered Attach. Protected by attachMu.
 	attachedProbes map[libpf.PID]map[ProbeAttacher]libpf.Void
 }
 

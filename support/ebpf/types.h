@@ -376,6 +376,9 @@ enum {
   // number of thread context attribute payloads truncated to fit the buffer
   metricID_UnwindThreadContextAttrsTruncated,
 
+  // number of bpf_ringbuf_output failures when sending the traces of probes
+  metricID_BPFProbeRingbufOutputErr,
+
   //
   // Metric IDs above are for counters (cumulative values)
   //

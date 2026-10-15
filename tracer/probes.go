@@ -220,16 +220,12 @@ func (c *ProbeContext) LoadProbeUnwinders(
 	if perfProgs == nil {
 		return fmt.Errorf("perf_progs map not available")
 	}
-	perCPURecords := c.maps["per_cpu_records"]
-	if perCPURecords == nil {
-		return fmt.Errorf("per_cpu_records map not available")
-	}
-	perCPURecordsKp := c.maps["per_cpu_records_kp"]
-	if perCPURecordsKp == nil {
-		return fmt.Errorf("per_cpu_records_kp map not available")
+	probeMaps, err := probeUnwinderMaps(c.maps)
+	if err != nil {
+		return err
 	}
 	return loadProbeUnwinders(coll, ebpfProgs, kprobeProgs, progs,
-		bpfVerifierLogLevel, perfProgs.FD(), perCPURecords.FD(), perCPURecordsKp)
+		bpfVerifierLogLevel, perfProgs.FD(), probeMaps)
 }
 
 // CollectTrampolineRef describes what an external probe's eBPF entry program needs

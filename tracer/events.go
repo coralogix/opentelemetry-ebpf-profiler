@@ -134,31 +134,41 @@ func startPerfEventMonitor(ctx context.Context, perfEventMap *ebpf.Map,
 }
 
 // startTraceEventMonitor spawns a goroutine that receives trace events from
-// the kernel by periodically polling the underlying ringbuffer.
-// Events written to the ringbuffer do not wake userspace immediately.
+// the kernel by periodically polling the underlying ringbuffers: trace_events
+// for sampled traces and probe_trace_events for the traces of probes. Each poll
+// reads sampled traces first, so probe traces cannot hold them up.
+// Events written to the ringbuffers do not wake userspace immediately.
 //
 // Returns a function that can be called to retrieve ringbuffer error counts.
 func (t *Tracer) startTraceEventMonitor(ctx context.Context,
 	traceOutChan chan<- *libpf.EbpfTrace,
 ) (func() []metrics.Metric, error) {
-	eventsMap := t.ebpfMaps["trace_events"]
-	eventReader, err := ringbuf.NewReader(eventsMap)
-	if err != nil {
-		return nil, fmt.Errorf("failed to setup ringbuf reporting via %s: %v", eventsMap, err)
+	var readers []*ringbuf.Reader
+	for _, name := range []string{"trace_events", "probe_trace_events"} {
+		eventReader, err := ringbuf.NewReader(t.ebpfMaps[name])
+		if err != nil {
+			for _, r := range readers {
+				_ = r.Close()
+			}
+			return nil, fmt.Errorf("failed to setup ringbuf reporting via %s: %v", name, err)
+		}
+		// A deadline of zero is treated as "no deadline". A deadline in the past
+		// means "always return immediately". We thus set a deadline 1 second after
+		// unix epoch to always ensure the latter behavior.
+		// TODO: adapt this to better reflect ringbuffer behavior
+		eventReader.SetDeadline(time.Unix(1, 0))
+		readers = append(readers, eventReader)
 	}
-
-	// A deadline of zero is treated as "no deadline". A deadline in the past
-	// means "always return immediately". We thus set a deadline 1 second after
-	// unix epoch to always ensure the latter behavior.
-	// TODO: adapt this to better reflect ringbuffer behavior
-	eventReader.SetDeadline(time.Unix(1, 0))
 
 	var readErrorCount, noDataCount atomic.Uint64
 	go func() {
-		defer eventReader.Close()
+		defer func() {
+			for _, r := range readers {
+				_ = r.Close()
+			}
+		}()
 		var data ringbuf.Record
 		var oldKTime, minKTime int64
-		var eventCount int
 
 		pollTicker := time.NewTicker(t.intervals.TracePollInterval())
 		defer pollTicker.Stop()
@@ -182,65 +192,15 @@ func (t *Tracer) startTraceEventMonitor(ctx context.Context,
 				// Continue execution below
 			}
 
-			eventCount = 0
 			minKTime = 0
-
-			// Eagerly read events until the buffer is exhausted or we reach maxEvents
-			for {
-				if err = eventReader.ReadInto(&data); err != nil {
-					if !errors.Is(err, os.ErrDeadlineExceeded) {
-						readErrorCount.Add(1)
-					}
-					break
-				}
-
-				// There's a theoretical possibility that this inner loop never exits if the
-				// following two error cases are continuously being hit. In practice this would
-				// mean that userspace doesn't manage to make ANY progress when reading events
-				// (eventCount never reaching maxEvents and underlying buffers never being empty),
-				// something that should not happen even with off-cpu at maximum sampling rates:
-				// probabilistically, there should always be some events read per X iterations.
-				// We could add a secondary fallback (ideally deterministic, e.g. maximum time
-				// elapsed) to guard against that possibility if we see it as a concern (currently
-				// not done).
-				//
-				// Regardless, the current data transmission architecture from kernel to user and
-				// the -serial- event processing pipeline in the rest of the agent is not designed
-				// for the data volumes that off-cpu profiling can generate and should be revisited.
-
-				if len(data.RawSample) == 0 {
-					noDataCount.Add(1)
-					continue
-				}
-
-				eventCount++
-
-				// Keep track of min KTime seen in this batch processing loop
-				trace, err := t.loadBpfTrace(data.RawSample)
-				switch {
-				case err == nil:
-					// Fast path for no error.
-				case errors.Is(err, errOriginUnexpected):
-					log.Warnf("skip trace handling: %v", err)
-					continue
-				case errors.Is(err, errRecordTooSmall), errors.Is(err, errRecordUnexpectedSize):
-					log.Errorf("Stop receiving traces: %v", err)
-					t.signalDone()
+			for _, eventReader := range readers {
+				readMinKTime, ok := t.readTraceEvents(eventReader, &data, traceOutChan,
+					&readErrorCount, &noDataCount)
+				if !ok {
 					return
-				default:
-					log.Warnf("unexpected error handling trace: %v", err)
-					continue
 				}
-
-				if minKTime == 0 || trace.KTime < minKTime {
-					minKTime = trace.KTime
-				}
-				// TODO: This per-event channel send couples event processing in the rest of
-				// the agent with event reading from the ringbuffer slowing down the latter.
-				traceOutChan <- trace
-				if eventCount == maxEvents {
-					// Break this inner loop to ensure ProcessedUntil logic executes
-					break
+				if readMinKTime != 0 && (minKTime == 0 || readMinKTime < minKTime) {
+					minKTime = readMinKTime
 				}
 			}
 			// After we've received and processed all trace events, call
@@ -286,6 +246,69 @@ func (t *Tracer) startTraceEventMonitor(ctx context.Context,
 			{ID: metrics.IDTraceEventReadError, Value: metrics.MetricValue(readError)},
 		}
 	}, nil
+}
+
+// readTraceEvents eagerly reads trace events from eventReader until its buffer
+// is exhausted or maxEvents are read, and sends them to traceOutChan. It returns
+// the minimum KTime of the events read, 0 if none, and false if trace handling
+// must stop.
+func (t *Tracer) readTraceEvents(eventReader *ringbuf.Reader, data *ringbuf.Record,
+	traceOutChan chan<- *libpf.EbpfTrace, readErrorCount, noDataCount *atomic.Uint64,
+) (minKTime int64, ok bool) {
+	for eventCount := 0; eventCount < maxEvents; {
+		if err := eventReader.ReadInto(data); err != nil {
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				readErrorCount.Add(1)
+			}
+			break
+		}
+
+		// There's a theoretical possibility that this loop never exits if the
+		// following two error cases are continuously being hit. In practice this would
+		// mean that userspace doesn't manage to make ANY progress when reading events
+		// (eventCount never reaching maxEvents and underlying buffers never being empty),
+		// something that should not happen even with off-cpu at maximum sampling rates:
+		// probabilistically, there should always be some events read per X iterations.
+		// We could add a secondary fallback (ideally deterministic, e.g. maximum time
+		// elapsed) to guard against that possibility if we see it as a concern (currently
+		// not done).
+		//
+		// Regardless, the current data transmission architecture from kernel to user and
+		// the -serial- event processing pipeline in the rest of the agent is not designed
+		// for the data volumes that off-cpu profiling can generate and should be revisited.
+
+		if len(data.RawSample) == 0 {
+			noDataCount.Add(1)
+			continue
+		}
+
+		eventCount++
+
+		// Keep track of min KTime seen in this batch processing loop
+		trace, err := t.loadBpfTrace(data.RawSample)
+		switch {
+		case err == nil:
+			// Fast path for no error.
+		case errors.Is(err, errOriginUnexpected):
+			log.Warnf("skip trace handling: %v", err)
+			continue
+		case errors.Is(err, errRecordTooSmall), errors.Is(err, errRecordUnexpectedSize):
+			log.Errorf("Stop receiving traces: %v", err)
+			t.signalDone()
+			return 0, false
+		default:
+			log.Warnf("unexpected error handling trace: %v", err)
+			continue
+		}
+
+		if minKTime == 0 || trace.KTime < minKTime {
+			minKTime = trace.KTime
+		}
+		// TODO: This per-event channel send couples event processing in the rest of
+		// the agent with event reading from the ringbuffer slowing down the latter.
+		traceOutChan <- trace
+	}
+	return minKTime, true
 }
 
 // startEventMonitor spawns a goroutine that receives events from the

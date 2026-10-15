@@ -716,6 +716,9 @@ const (
 	// Number of thread context attribute payloads truncated to fit the buffer
 	IDUnwindThreadContextAttrsTruncated = 309
 
+	// Number of bpf_ringbuf_output failures when sending the traces of probes
+	IDBPFProbeRingbufOutputErr = 310
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 310
+	IDMax = 311
 )
