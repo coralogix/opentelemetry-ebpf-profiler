@@ -8,8 +8,9 @@ import (
 	"io"
 	"math"
 
-	"go.opentelemetry.io/ebpf-profiler/asm/expression"
 	"golang.org/x/arch/x86/x86asm"
+
+	"go.opentelemetry.io/ebpf-profiler/asm/expression"
 )
 
 type CodeBlock struct {
@@ -20,30 +21,26 @@ type CodeBlock struct {
 type Interpreter struct {
 	Regs        Registers
 	code        []byte
-	CodeAddress expression.Expression
-	pc          int
-}
-
-func NewInterpreter() *Interpreter {
-	it := &Interpreter{}
-	it.initRegs()
-	return it
+	codeAddress expression.Expression
+	pc          uint64
 }
 
 func NewInterpreterWithCode(code []byte) *Interpreter {
-	it := &Interpreter{code: code, CodeAddress: expression.Named("code address")}
+	it := &Interpreter{code: code}
 	it.initRegs()
+	it.codeAddress = it.Regs.Get(RIP)
 	return it
 }
 
-func (i *Interpreter) PC() int {
-	return i.pc
+func NewInterpreterWithCodeAt(code []byte, address expression.Expression) *Interpreter {
+	it := &Interpreter{code: code, codeAddress: address}
+	it.initRegs()
+	it.Regs.setX86asm(x86asm.RIP, address)
+	return it
 }
 
-func (i *Interpreter) ResetCode(code []byte, address expression.Expression) {
-	i.code = code
-	i.CodeAddress = address
-	i.pc = 0
+func (i *Interpreter) PC() uint64 {
+	return i.pc
 }
 
 func (i *Interpreter) Loop() (x86asm.Inst, error) {
@@ -78,23 +75,29 @@ func (i *Interpreter) Step() (x86asm.Inst, error) {
 			return inst, fmt.Errorf("at 0x%x : %v", i.pc, err)
 		}
 	}
-	i.pc += inst.Len
+	i.pc += uint64(inst.Len)
 	i.code = i.code[inst.Len:]
-	i.Regs.setX86asm(x86asm.RIP, expression.Add(i.CodeAddress, expression.Imm(uint64(i.pc))))
+	i.Regs.setX86asm(x86asm.RIP, expression.Add(i.codeAddress, expression.Imm(uint64(i.pc))))
 	switch inst.Op {
-	case x86asm.ADD:
+	case x86asm.ADD, x86asm.SUB:
 		if dst, ok := inst.Args[0].(x86asm.Reg); ok {
 			left := i.Regs.GetX86(dst)
+			var right expression.Expression
 			switch src := inst.Args[1].(type) {
 			case x86asm.Imm:
-				right := expression.Imm(uint64(src))
-				i.Regs.setX86asm(dst, expression.Add(left, right))
+				right = expression.Imm(uint64(src))
 			case x86asm.Reg:
-				right := i.Regs.GetX86(src)
-				i.Regs.setX86asm(dst, expression.Add(left, right))
+				right = i.Regs.GetX86(src)
 			case x86asm.Mem:
-				right := i.MemArg(src)
-				right = expression.MemWithSegment(src.Segment, right, inst.MemBytes)
+				right = expression.MemWithSegment(src.Segment, i.MemArg(src), inst.MemBytes)
+			}
+			if right != nil {
+				// SUB is ADD with the right operand negated (-1 * x). Multiply/Add fold
+				// the immediate case, so `sub reg, imm` cancels a later `+imm`. Note that
+				// symbolic cancellation doesn't happen, so X + (-1 * X) doesn't become 0.
+				if inst.Op == x86asm.SUB {
+					right = expression.Multiply(expression.Imm(^uint64(0)), right)
+				}
 				i.Regs.setX86asm(dst, expression.Add(left, right))
 			}
 		}
@@ -120,7 +123,7 @@ func (i *Interpreter) Step() (x86asm.Inst, error) {
 				if src.Base == x86asm.RIP {
 					// For RIP-relative, the address is RIP + displacement.
 					// RIP points to the already updated next instruction.
-					v = expression.Add(i.Regs.GetX86(x86asm.RIP), expression.Imm(uint64(src.Disp)))
+					v = expression.Add(i.Regs.GetX86(x86asm.RIP), immFromDisp(src.Disp))
 				} else {
 					v = i.MemArg(src)
 				}
@@ -163,10 +166,21 @@ func (i *Interpreter) Step() (x86asm.Inst, error) {
 	return inst, nil
 }
 
+// immFromDisp builds an immediate from an x86asm displacement. x86asm doesn't
+// sign-extend 32-bit displacements: they arrive zero-extended in
+// [0, math.MaxUint32], so recover the sign. A full 64-bit displacement (the
+// moffs64 absolute MOV form) is already the intended value and passes through.
+func immFromDisp(disp int64) expression.Expression {
+	if uint64(disp) <= math.MaxUint32 {
+		return expression.Imm(uint64(int32(disp)))
+	}
+	return expression.Imm(uint64(disp))
+}
+
 func (i *Interpreter) MemArg(src x86asm.Mem) expression.Expression {
 	vs := make([]expression.Expression, 0, 3)
 	if src.Disp != 0 {
-		vs = append(vs, expression.Imm(uint64(src.Disp)))
+		vs = append(vs, immFromDisp(src.Disp))
 	}
 	if src.Base != 0 {
 		vs = append(vs, i.Regs.GetX86(src.Base))

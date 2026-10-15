@@ -6,10 +6,11 @@ package amd // import "go.opentelemetry.io/ebpf-profiler/asm/amd"
 import (
 	"fmt"
 
+	"golang.org/x/arch/x86/x86asm"
+
 	e "go.opentelemetry.io/ebpf-profiler/asm/expression"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	npsr "go.opentelemetry.io/ebpf-profiler/nopanicslicereader"
-	"golang.org/x/arch/x86/x86asm"
 )
 
 // ExtractTLSOffset scans through x86_64 assembly code looking for MOV instructions
@@ -24,8 +25,7 @@ import (
 // If file is nil, RIP-relative memory dereferencing will be skipped.
 func ExtractTLSOffset(code []byte, codeAddress uint64, file *pfelf.File) (int32, error) {
 	offset := e.NewImmediateCapture("offset")
-	it := NewInterpreterWithCode(code)
-	it.CodeAddress = e.Imm(codeAddress)
+	it := NewInterpreterWithCodeAt(code, e.Imm(codeAddress))
 
 	for {
 		op, err := it.Step()

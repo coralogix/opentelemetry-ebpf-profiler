@@ -3,6 +3,7 @@
 // perf event and will call the appropriate tracer for a given process
 
 #include "bpfdefs.h"
+#include "go_runtime.h"
 #include "kernel.h"
 #include "tracemgmt.h"
 #include "tsd.h"
@@ -17,6 +18,17 @@ struct per_cpu_records_t {
   __type(value, PerCPURecord);
   __uint(max_entries, 1);
 } per_cpu_records SEC(".maps");
+
+// per_cpu_records_kp is a second per-CPU record used by the probe unwinder.
+// At load time loadProbeUnwinders repoints its get_per_cpu_record() from
+// per_cpu_records to this map, so a perf sampler interrupting an in-flight uprobe
+// unwind (uprobes are not covered by bpf_prog_active) cannot clobber its record.
+struct per_cpu_records_kp_t {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, int);
+  __type(value, PerCPURecord);
+  __uint(max_entries, 1);
+} per_cpu_records_kp SEC(".maps");
 
 // metrics maps metric ID to a value
 struct metrics_t {
@@ -117,6 +129,15 @@ struct trace_events_t {
   __uint(max_entries, 0);
 } trace_events SEC(".maps");
 
+// Ring buffer for the traces of probes, such as GPU calls and off-CPU events.
+// The probe unwinders are loaded with their trace_events references pointed at
+// this map, so a burst of probe traces cannot crowd out sampled traces.
+// Sized at load time like trace_events.
+struct probe_trace_events_t {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 0);
+} probe_trace_events SEC(".maps");
+
 // End shared maps
 
 // Implements the specification to share span/trace IDs according to:
@@ -130,84 +151,43 @@ struct traces_ctx_v1_t {
 
 struct apm_int_procs_t {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __type(key, pid_t);
+  __type(key, u32);
   __type(value, ApmIntProcInfo);
   __uint(max_entries, 128);
 } apm_int_procs SEC(".maps");
 
+struct thread_context_procs_t {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, u32);
+  __type(value, ThreadContextProcInfo);
+  __uint(max_entries, 1024);
+} thread_context_procs SEC(".maps");
+
 // filter_error_frames is set during load time.
 BPF_RODATA_VAR(bool, filter_error_frames, false)
 
-static EBPF_INLINE u64 go_get_g_register(UNUSED UnwindState *state)
-{
-#if defined(__aarch64__)
-  // On aarch64 for !iscgo programs the g is only stored in r28 register.
-  // CGO_ENABLED can be true even when runtime.iscgo is false; then we want to retrieve g from r28.
-  // See https://github.com/open-telemetry/opentelemetry-ebpf-profiler/issues/1455.
-  return state->r28;
-#else
-  return 0;
-#endif
-}
-
-static EBPF_INLINE u64 go_get_g_ptr(struct GoLabelsOffsets *offs, UnwindState *state)
-{
-  u64 g_register = go_get_g_register(state);
-
-  if (offs->tls_offset == 0) {
-    DEBUG_PRINT("cl: TLS offset for g pointer missing; using register fallback if available");
-    return g_register;
-  }
-
-  u64 g_addr     = 0;
-  void *tls_base = NULL;
-  if (tsd_get_base(&tls_base) < 0) {
-    DEBUG_PRINT("cl: failed to get tsd base; using register fallback if available");
-    return g_register;
-  }
-  DEBUG_PRINT(
-    "cl: read tsd_base at 0x%lx, g offset: %d", (unsigned long)tls_base, offs->tls_offset);
-
-  if (bpf_probe_read_user(&g_addr, sizeof(void *), (void *)((s64)tls_base + offs->tls_offset))) {
-    DEBUG_PRINT(
-      "cl: failed to read g_addr, tls_base(%lx); using register fallback if available",
-      (unsigned long)tls_base);
-  }
-
-  return g_addr ? g_addr : g_register;
-}
-
-static EBPF_INLINE void *go_get_m_ptr(struct GoLabelsOffsets *offs, UnwindState *state)
-{
-  u64 g_addr = go_get_g_ptr(offs, state);
-  if (!g_addr) {
-    return NULL;
-  }
-
-  DEBUG_PRINT("cl: reading m_ptr_addr at 0x%lx + 0x%x", (unsigned long)g_addr, offs->m_offset);
-  void *m_ptr_addr;
-  if (bpf_probe_read_user(&m_ptr_addr, sizeof(void *), (void *)(g_addr + offs->m_offset))) {
-    DEBUG_PRINT("cl: failed m_ptr_addr");
-    return NULL;
-  }
-  DEBUG_PRINT("cl: m_ptr_addr 0x%lx", (unsigned long)m_ptr_addr);
-  return m_ptr_addr;
-}
+// go_labels_disabled gates Go custom-label extraction. It mirrors the Go labels
+// configuration (Config.IsLabelsDisabled). The Go runtime offsets are loaded
+// independently whenever Go support is enabled.
+BPF_RODATA_VAR(bool, go_labels_disabled, true)
 
 static EBPF_INLINE void maybe_add_go_custom_labels(struct pt_regs *ctx, PerCPURecord *record)
 {
-  u32 pid                  = record->trace.pid;
-  GoLabelsOffsets *offsets = bpf_map_lookup_elem(&go_labels_procs, &pid);
-  if (!offsets) {
-    DEBUG_PRINT("cl: no offsets, %d not recognized as a go binary", pid);
+  if (go_labels_disabled) {
     return;
   }
+
+  if (record->goOffsets.m_offset == 0) {
+    DEBUG_PRINT("cl: no offsets, %d not recognized as a go binary", record->trace.pid);
+    return;
+  }
+  GoRuntimeOffsets *offsets = &record->goOffsets;
 
   void *m_ptr_addr = go_get_m_ptr(offsets, &record->state);
   if (!m_ptr_addr) {
     return;
   }
-  record->customLabelsState.go_m_ptr = m_ptr_addr;
+  record->golangLabelsState.go_m_ptr = m_ptr_addr;
 
   DEBUG_PRINT("cl: trace is within a process with Go custom labels enabled");
   increment_metric(metricID_UnwindGoLabelsAttempts);
@@ -285,6 +265,18 @@ static EBPF_INLINE void maybe_add_apm_info(Trace *trace)
     corr_buf.trace_flags);
 }
 
+// Stub: only looks the process up, so thread_context_procs stays loaded
+// regardless of whether the tracer is enabled. Reading and decoding the
+// thread context lands in a later change.
+static EBPF_INLINE void maybe_add_thread_context_info(Trace *trace)
+{
+  u32 pid                     = trace->pid;
+  ThreadContextProcInfo *proc = bpf_map_lookup_elem(&thread_context_procs, &pid);
+  if (!proc) {
+    return;
+  }
+}
+
 // unwind_stop is the tail call destination for PROG_UNWIND_STOP.
 static EBPF_INLINE int unwind_stop(struct pt_regs *ctx)
 {
@@ -304,13 +296,15 @@ static EBPF_INLINE int unwind_stop(struct pt_regs *ctx)
 
   // If the stack is otherwise empty, push an error for that: we should
   // never encounter empty stacks for successful unwinding.
-  if (trace->frame_data_len == 0) {
+  if (trace->variable_data_end == 0) {
     DEBUG_PRINT("unwind_stop called but the stack is empty");
     increment_metric(metricID_ErrEmptyStack);
     if (!state->unwind_error) {
       state->unwind_error = ERR_EMPTY_STACK;
     }
   }
+
+  refine_missing_mapping_error(state, record->usesAnonymousMappings);
 
   // If unwinding was aborted due to a critical error, push an error frame.
   if (state->unwind_error) {
@@ -328,7 +322,7 @@ static EBPF_INLINE int unwind_stop(struct pt_regs *ctx)
       increment_metric(metricID_NumUnknownPC);
     }
     // fallthrough
-  default: increment_metric(state->error_metric);
+  default: increment_metric((u32)state->error_metric);
   }
 
   // TEMPORARY HACK
@@ -341,15 +335,20 @@ static EBPF_INLINE int unwind_stop(struct pt_regs *ctx)
   // through different data structures, we'd have to keep a list of known empty traces to
   // also prevent the corresponding trace counts to be sent out. OTOH, if we do it here,
   // this is trivial.
-  if (trace->frame_data_len == 1 && state->unwind_error) {
-    if (filter_error_frames) {
+  if (filter_error_frames) {
+    if (trace->num_frames == 1 && trace->kernel_frame_end == 0 && state->unwind_error) {
       return 0;
     }
   }
   // TEMPORARY HACK END
 
-  // Must be last since it may not return (it will call send_trace).
+  trace->frame_data_end = trace->variable_data_end;
+
+  // Does not return once it dispatches, so anything below runs only when the
+  // Go path did not fill custom labels.
   maybe_add_go_custom_labels(ctx, record);
+
+  maybe_add_thread_context_info(trace);
 
   send_trace(ctx, trace);
 

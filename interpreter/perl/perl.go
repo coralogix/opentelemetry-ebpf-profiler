@@ -51,6 +51,7 @@ import (
 	"slices"
 
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
+	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
 const (
@@ -78,7 +79,13 @@ func perlVersion(revision, version, subversion byte) uint32 {
 	return uint32(revision)*0x10000 + uint32(version)*0x100 + uint32(subversion)
 }
 
-func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
+func GetLoader(_ Config) interpreter.Loader {
+	return interpreter.NewLoader(loader, []interpreter.InterpreterResource{
+		{MapName: BPFMapName, ProgID: uint32(support.ProgUnwindPerl), ProgName: "unwind_perl"},
+	})
+}
+
+func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
 	mainDSO := false
 	if !libperlRegex.MatchString(info.FileName()) {
 		mainDSO = true

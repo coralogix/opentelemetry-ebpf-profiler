@@ -6,7 +6,7 @@
 #include "tracemgmt.h"
 #include "types.h"
 
-static EBPF_INLINE void send_sample_traces(void *ctx, u64 pid)
+static EBPF_INLINE void send_sample_traces(void *ctx, u32 pid, u32 tid)
 {
   // Use the per CPU record for trace storage: it's too big for stack.
   PerCPURecord *record = get_pristine_per_cpu_record();
@@ -18,32 +18,36 @@ static EBPF_INLINE void send_sample_traces(void *ctx, u64 pid)
   Trace *trace = &record->trace;
 
   // Use COMM as a marker for our test traces. COMM[3] serves as test case ID.
+  bpf_get_current_comm(trace->comm, sizeof(trace->comm));
   trace->comm[0] = 0xAA;
   trace->comm[1] = 0xBB;
   trace->comm[2] = 0xCC;
 
-  trace->origin = TRACE_SAMPLING;
+  trace->origin = origin_id_sampling;
 
   trace->comm[3] = 1;
   trace->pid     = pid;
-  trace->tid     = pid;
+  trace->tid     = tid;
 
   u64 *data = push_frame(&record->state, trace, FRAME_MARKER_NATIVE, 0, 21, 1);
   if (data) {
     data[0] = 1337;
   }
+  trace->frame_data_end = trace->variable_data_end;
   send_trace(ctx, trace);
 
   // Single native frame, with kernel trace.
-  trace->frame_data_len    = 0;
+  trace->kernel_frame_end  = 0;
+  trace->frame_data_end    = 0;
+  trace->variable_data_end = 0;
   trace->num_frames        = 0;
-  trace->num_kernel_frames = 0;
   trace->comm[3]           = 2;
   push_kernel_frames(ctx, trace);
   data = push_frame(&record->state, trace, FRAME_MARKER_NATIVE, 0, 21, 1);
   if (data) {
     data[0] = 1337;
   }
+  trace->frame_data_end = trace->variable_data_end;
   send_trace(ctx, trace);
 }
 
@@ -52,12 +56,15 @@ static EBPF_INLINE void send_sample_traces(void *ctx, u64 pid)
 SEC("tracepoint/integration/sched_switch")
 int tracepoint_integration__sched_switch(void *ctx)
 {
-  u64 id  = bpf_get_current_pid_tgid();
-  u64 pid = id >> 32;
+  u32 pid = 0;
+  u32 tid = 0;
+  if (!get_pid_tgid(&pid, &tid)) {
+    return 0;
+  }
 
-  printt("pid %lld in integration test", pid);
+  printt("pid %d in integration test", pid);
 
-  send_sample_traces(ctx, pid);
+  send_sample_traces(ctx, pid, tid);
 
   return 0;
 }

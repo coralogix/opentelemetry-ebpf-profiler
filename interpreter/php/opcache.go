@@ -116,7 +116,6 @@ package php // import "go.opentelemetry.io/ebpf-profiler/interpreter/php"
 
 import (
 	"debug/elf"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"regexp"
@@ -200,17 +199,8 @@ func (i *opcacheInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler,
 		return nil
 	}
 
-	dasmBufVal := make([]byte, 8)
-	dasmSizeVal := make([]byte, 8)
-	if err := i.rm.Read(i.d.dasmBufPtr+i.bias, dasmBufVal); err != nil {
-		return nil
-	}
-	if err := i.rm.Read(i.d.dasmSizePtr+i.bias, dasmSizeVal); err != nil {
-		return nil
-	}
-
-	dasmBuf := binary.LittleEndian.Uint64(dasmBufVal)
-	dasmSize := binary.LittleEndian.Uint64(dasmBufVal)
+	dasmBuf := i.rm.Uint64(i.d.dasmBufPtr + i.bias)
+	dasmSize := i.rm.Uint64(i.d.dasmSizePtr + i.bias)
 	if dasmBuf == 0 || dasmSize == 0 {
 		// This is the normal path if JIT is not enabled, or we try to
 		// attach before JIT engine is initialized.
@@ -250,6 +240,10 @@ func (d *opcacheData) Attach(_ interpreter.EbpfHandler, _ libpf.PID, bias libpf.
 }
 
 func (d *opcacheData) Unload(_ interpreter.EbpfHandler) {
+}
+
+func (i *opcacheInstance) UsesAnonymousMappings() bool {
+	return true
 }
 
 func determineOPCacheVersion(ef *pfelf.File) (uint32, error) {
@@ -344,7 +338,13 @@ func getOpcacheJITInfo(ef *pfelf.File) (dasmBuf, dasmSize libpf.Address, err err
 	return libpf.Address(dasmBufPtr), libpf.Address(dasmSizePtr), nil
 }
 
-func OpcacheLoader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (
+func GetOpcacheLoader(_ Config) interpreter.Loader {
+	return interpreter.NewLoader(opcacheLoader, []interpreter.InterpreterResource{
+		{MapName: BPFMapName},
+	})
+}
+
+func opcacheLoader(_ interpreter.EbpfHandler, info *interpreter.LoaderInfo) (
 	interpreter.Data, error,
 ) {
 	if !opcacheRegex.MatchString(info.FileName()) {

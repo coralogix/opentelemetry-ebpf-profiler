@@ -4,8 +4,40 @@
 package libpf // import "go.opentelemetry.io/ebpf-profiler/libpf"
 
 import (
+	"encoding/binary"
+	"hash/fnv"
+	"hash/maphash"
+	"strconv"
 	"unique"
+
+	"github.com/zeebo/xxh3"
+
+	"go.opentelemetry.io/ebpf-profiler/stringutil"
 )
+
+const commLen = 16
+
+// Comm is the fixed-size process command name buffer supplied by the kernel.
+type Comm struct {
+	buffer [commLen]uint8
+}
+
+// NewComm returns a Comm that preserves the full fixed-size kernel buffer.
+func NewComm(buffer [commLen]uint8) Comm {
+	return Comm{buffer: buffer}
+}
+
+// NewCommFromString returns a Comm initialized from str.
+func NewCommFromString(str string) Comm {
+	var buffer [commLen]uint8
+	copy(buffer[:], str)
+	return NewComm(buffer)
+}
+
+// String converts Comm's NUL-terminated fixed-size buffer into a Go string.
+func (c Comm) String() string {
+	return string(stringutil.CString(c.buffer[:]))
+}
 
 // FrameMappingFileData represents a backing file for a memory mapping.
 type FrameMappingFileData struct {
@@ -100,19 +132,85 @@ func (frames *Frames) Append(frame *Frame) {
 type Trace struct {
 	CustomLabels map[String]String
 	Frames       Frames
-	Hash         TraceHash
+
+	// cachedHash memoizes the result of Hash().
+	// invalidTraceHash means the hash has not been computed yet.
+	cachedHash TraceHash
 }
 
-// EbpfTrace represents a stack trace from Ebpf code.
+// APMHash returns the trace's hash required by the APM Agent for correlation.
+// The result is not memoized.
+func (t *Trace) APMHash() TraceHash {
+	var buf [24]byte
+	// Review and maybe update invalidTraceHash if hash function changes from FNV128A
+	h := fnv.New128a()
+	for _, uniqueFrame := range t.Frames {
+		frame := uniqueFrame.Value()
+		fileID := FileID{}
+		if frame.Mapping.Valid() {
+			fileID = frame.Mapping.Value().File.Value().FileID
+		}
+		_, _ = h.Write(fileID.Bytes())
+		// Using FormatUint() or putting AppendUint() into a function leads
+		// to escaping to heap (allocation).
+		_, _ = h.Write(strconv.AppendUint(buf[:0], uint64(frame.AddressOrLineno), 10))
+	}
+	// Avoid a heap allocation by reusing the stack-allocated buffer.
+	traceHash, _ := TraceHashFromBytes(h.Sum(buf[:0]))
+	return traceHash
+}
+
+var customLabelHashSeed = maphash.MakeSeed()
+
+// Hash returns a cached hash of the frames and custom labels for internal use.
+// Mutations after the first call are not reflected.
+func (t *Trace) Hash() TraceHash {
+	if t.cachedHash != InvalidTraceHash {
+		return t.cachedHash
+	}
+	var buf [24]byte
+	h := xxh3.New128()
+	for _, uniqueFrame := range t.Frames {
+		frame := uniqueFrame.Value()
+		fileID := FileID{}
+		if frame.Mapping.Valid() {
+			fileID = frame.Mapping.Value().File.Value().FileID
+		}
+		_, _ = h.Write(fileID.Bytes())
+		n := putUint64(buf[:], uint64(frame.AddressOrLineno))
+		_, _ = h.Write(buf[:n])
+	}
+	if len(t.CustomLabels) > 0 {
+		var labelsHash uint64
+		// XOR makes label order irrelevant; map keys are unique.
+		for key, value := range t.CustomLabels {
+			labelsHash ^= maphash.Comparable(customLabelHashSeed, [2]String{key, value})
+		}
+		binary.LittleEndian.PutUint64(buf[:8], labelsHash)
+		_, _ = h.Write(buf[:8])
+	}
+	// Avoid a heap allocation by reusing the stack-allocated buffer.
+	traceHash, _ := TraceHashFromBytes(h.Sum(buf[:0]))
+	t.cachedHash = traceHash
+	return traceHash
+}
+
+func putUint64(b []byte, v uint64) int {
+	for i := range 8 {
+		b[i] = byte(v)
+		v >>= 8
+		if v == 0 {
+			return i + 1
+		}
+	}
+	return 8
+}
+
+// EbpfTrace holds data sourced from eBPF.
 type EbpfTrace struct {
-	EnvVars          map[String]String
-	ProcessName      String
-	ExecutablePath   String
-	ContainerID      String
 	CustomLabels     map[String]String
-	Comm             String
+	Comm             Comm
 	FrameData        []uint64
-	KernelFrames     Frames
 	FrameDataBuf     [3072]uint64
 	Value            int64
 	KTime            int64
@@ -120,7 +218,8 @@ type EbpfTrace struct {
 	TID              PID
 	PID              PID
 	NumFrames        uint16
-	Origin           Origin
+	NumKernelFrames  uint16
+	Origin           uint16
 	APMTraceID       APMTraceID
 	APMTransactionID APMTransactionID
 }
@@ -129,14 +228,20 @@ type EbpfFrame []uint64
 
 // The below code must match ebpf tracemgmt.h frame_header() layout.
 
-// NewEbpfFrame creates a new EbpfFrame slice with given header information.
-// Typically used for testing only.
-func NewEbpfFrame(ty FrameType, ff FrameFlags, l uint8, data uint64) []uint64 {
+// NewEbpfFrameHeader creates the first word of an eBPF frame.
+// Typically used for testing and synthetic cache keys only.
+func NewEbpfFrameHeader(ty FrameType, ff FrameFlags, l uint8, data uint64) uint64 {
 	val := uint64(ty) << 60
 	val |= uint64(ff) << 56
 	val |= uint64(l) << 52
+	return val | data
+}
+
+// NewEbpfFrame creates a new EbpfFrame slice with given header information.
+// Typically used for testing only.
+func NewEbpfFrame(ty FrameType, ff FrameFlags, l uint8, data uint64) []uint64 {
 	ef := make([]uint64, l)
-	ef[0] = val | data
+	ef[0] = NewEbpfFrameHeader(ty, ff, l, data)
 	return ef
 }
 
@@ -158,4 +263,15 @@ func (f EbpfFrame) Data() uint64 {
 
 func (f EbpfFrame) Variable(ndx int) uint64 {
 	return f[ndx+1]
+}
+
+// ThreadLabels contains per-thread custom labels with interned keys and values.
+type ThreadLabels map[String]String
+
+// ThreadLabelDecoder decodes a per-thread custom-label payload into labels plus a
+// count of entries it could not decode. Implementations must be
+// concurrency-safe, and DecodeLabels must not retain or alias data, which
+// points into a reused ring buffer.
+type ThreadLabelDecoder interface {
+	DecodeLabels(data []byte) (labels ThreadLabels, dropped int)
 }

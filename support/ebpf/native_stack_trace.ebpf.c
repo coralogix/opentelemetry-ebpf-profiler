@@ -9,21 +9,70 @@ BPF_RODATA_VAR(u32, with_debug_output, 0)
 // filter_idle_frames is set during load time.
 BPF_RODATA_VAR(bool, filter_idle_frames, false)
 
+// filter_min_process_age_ns is set during load time.
+BPF_RODATA_VAR(u64, filter_min_process_age_ns, 0)
+
 // inverse_pac_mask is set during load time.
 BPF_RODATA_VAR(u64, inverse_pac_mask, 0)
+
+// vma_lookup_enabled is set during load time.
+// It is enabled only on kernels where the loaded BPF object can call bpf_find_vma().
+BPF_RODATA_VAR(bool, vma_lookup_enabled, false)
+
+// vma_vm_file_offset is set during load time.
+// The offset of vm_file within vm_area_struct.
+BPF_RODATA_VAR(u32, vma_vm_file_offset, 0)
+
+// vma_vm_flags_offset is set during load time.
+// The offset of vm_flags, or __vm_flags, within vm_area_struct.
+BPF_RODATA_VAR(u32, vma_vm_flags_offset, 0)
 
 // tpbase_offset is set during load time.
 // The offset of the Thread Pointer Base variable in `task_struct`. It is
 // populated by the host agent based on kernel code analysis.
 BPF_RODATA_VAR(u64, tpbase_offset, 0)
 
+// task_group_leader_offset is set during load time.
+// The offset of group_leader within `task_struct`.
+BPF_RODATA_VAR(u32, task_group_leader_offset, 0)
+
 // task_stack_offset is set during load time.
 // The offset of stack base within `task_struct`.
 BPF_RODATA_VAR(u32, task_stack_offset, 0)
 
+// task_start_time_offset is set during load time.
+// The offset of start_time within `task_struct`.
+BPF_RODATA_VAR(u32, task_start_time_offset, 0)
+
 // stack_ptregs_offset is set during load time.
 // The offset of struct pt_regs within the kernel entry stack.
 BPF_RODATA_VAR(u32, stack_ptregs_offset, 0)
+
+// Mode of PID namespace translation:
+// - PID_NS_TRANSLATION_MODE_NONE (0): disabled, reporting host PIDs
+// - PID_NS_TRANSLATION_MODE_EXACT (1): translate tasks in active namespace
+// - PID_NS_TRANSLATION_MODE_RECURSIVE (2): translate active + descendant namespaces recursively
+BPF_RODATA_VAR(u8, pid_ns_translation_mode, PID_NS_TRANSLATION_MODE_NONE)
+
+// The inode number of the target PID namespace.
+// Obtained by calling stat() on /proc/self/ns/pid.
+BPF_RODATA_VAR(u64, target_pid_ns_inode, 0)
+
+// The device ID (st_dev) of the target PID namespace inode.
+// Required by the bpf_get_ns_current_pid_tgid helper to uniquely
+// identify the namespace filesystem (nsfs) instance.
+BPF_RODATA_VAR(u64, target_pid_ns_dev, 0)
+
+// The nesting level of the target PID namespace in the namespace hierarchy
+// (0 for root, 1 for immediate child, etc.).
+BPF_RODATA_VAR(u32, target_pid_ns_level, 0)
+
+// Kernel BTF-derived layout used to translate tasks in descendant PID
+// namespaces into target_pid_ns_inode. bpf_get_ns_current_pid_tgid only
+// handles tasks whose active PID namespace exactly matches the target.
+BPF_RODATA_VAR(PIDNamespaceLayout, pid_namespace_layout, {})
+// origin_id_sampling is set during load time.
+BPF_RODATA_VAR(u16, origin_id_sampling, 0)
 
 // Macro to create a map named exe_id_to_X_stack_deltas that is a nested maps with a fileID for the
 // outer map and an array as inner map that holds up to 2^X stack delta entries for the given
@@ -101,7 +150,7 @@ static EBPF_INLINE int unwind_native(struct pt_regs *ctx)
   Trace *trace = &record->trace;
   int unwinder;
   ErrorCode error;
-  for (int i = 0; i < NATIVE_FRAMES_PER_PROGRAM; i++) {
+  for (u64 i = 0; i < NATIVE_FRAMES_PER_PROGRAM; i++) {
     unwinder = PROG_UNWIND_STOP;
 
     // Unwind native code
@@ -127,7 +176,8 @@ static EBPF_INLINE int unwind_native(struct pt_regs *ctx)
 
     // Unwind the native frame using stack deltas. Stop if no next frame.
     bool stop;
-    error = unwind_one_frame(record, &stop);
+    // This program implements every command, so no frame is delegated.
+    error = unwind_one_frame(record, &stop, NULL);
     if (error || stop) {
       break;
     }
@@ -151,16 +201,20 @@ static EBPF_INLINE int unwind_native(struct pt_regs *ctx)
 SEC("perf_event/native_tracer_entry")
 int native_tracer_entry(struct bpf_perf_event_data *ctx)
 {
-  // Get the PID and TGID register.
-  u64 id  = bpf_get_current_pid_tgid();
-  u32 pid = id >> 32;
-  u32 tid = id & 0xFFFFFFFF;
+  u32 pid          = 0;
+  u32 tid          = 0;
+  u64 group_leader = 0;
+  if (!get_pid_tgid_leader(&pid, &tid, &group_leader)) {
+    return 0;
+  }
 
   if (pid == 0 && filter_idle_frames) {
     return 0;
   }
 
   u64 ts = bpf_ktime_get_ns();
-  return collect_trace((struct pt_regs *)&ctx->regs, TRACE_SAMPLING, pid, tid, ts, 0);
+
+  return collect_trace(
+    (struct pt_regs *)&ctx->regs, origin_id_sampling, pid, tid, group_leader, ts, 0);
 }
 MULTI_USE_FUNC(unwind_native)

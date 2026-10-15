@@ -6,10 +6,11 @@ package php // import "go.opentelemetry.io/ebpf-profiler/interpreter/php"
 import (
 	"errors"
 
+	"golang.org/x/arch/x86/x86asm"
+
 	"go.opentelemetry.io/ebpf-profiler/asm/amd"
 	e "go.opentelemetry.io/ebpf-profiler/asm/expression"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"golang.org/x/arch/x86/x86asm"
 )
 
 // retrieveZendVMKindX86. This function reads the code blob and recovers
@@ -36,8 +37,7 @@ func retrieveZendVMKindX86(code []byte) (uint, error) {
 // for all JIT code.
 func retrieveExecuteExJumpLabelAddressX86(code []byte, addrBase libpf.SymbolValue) (
 	libpf.SymbolValue, error) {
-	it := amd.NewInterpreterWithCode(code)
-	it.CodeAddress = e.Imm(uint64(addrBase))
+	it := amd.NewInterpreterWithCodeAt(code, e.Imm(uint64(addrBase)))
 	_, err := it.LoopWithBreak(func(op x86asm.Inst) bool {
 		return op.Op == x86asm.JMP
 	})
@@ -56,8 +56,7 @@ func retrieveExecuteExJumpLabelAddressX86(code []byte, addrBase libpf.SymbolValu
 // to the JIT buffer used by PHP (called "dasm_buf" in the PHP source).
 func retrieveJITBufferPtrx86(code []byte, addrBase libpf.SymbolValue) (
 	dasmBuf libpf.SymbolValue, dasmSize libpf.SymbolValue, err error) {
-	it := amd.NewInterpreterWithCode(code)
-	it.CodeAddress = e.Imm(uint64(addrBase))
+	it := amd.NewInterpreterWithCodeAt(code, e.Imm(uint64(addrBase)))
 	_, err = it.LoopWithBreak(func(op x86asm.Inst) bool {
 		return op.Op == x86asm.CALL
 	})

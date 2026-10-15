@@ -6,14 +6,14 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/tools/coredump/modulestore"
-
-	"go.opentelemetry.io/ebpf-profiler/internal/log"
 )
 
 type StoreCoredump struct {
@@ -24,17 +24,11 @@ type StoreCoredump struct {
 	tempFiles map[string]string
 }
 
-var _ pfelf.ELFOpener = &StoreCoredump{}
+var _ process.Process = &StoreCoredump{}
 
-func (scd *StoreCoredump) openFile(path string) (process.ReadAtCloser, error) {
+func (scd *StoreCoredump) openFile(path string) (*modulestore.ModuleReader, error) {
 	info, ok := scd.modules[path]
 	if !ok {
-		// The test case creator should have bundled everything.
-		// However, old test cases have no bundle at all, so give a warning
-		// only if some modules exists.
-		if len(scd.modules) != 0 {
-			log.Warnf("Store does not bundle %s", path)
-		}
 		return nil, fmt.Errorf("failed to open file `%s`: %w", path, os.ErrNotExist)
 	}
 
@@ -46,26 +40,34 @@ func (scd *StoreCoredump) openFile(path string) (process.ReadAtCloser, error) {
 	return file, nil
 }
 
-func (scd *StoreCoredump) OpenMappingFile(m *process.RawMapping) (process.ReadAtCloser, error) {
-	rac, err := scd.openFile(m.Path)
+func (scd *StoreCoredump) OpenMappingFile(m *process.RawMapping) (fs.File, error) {
+	file, err := scd.openFile(m.Path)
 	if errors.Is(err, os.ErrNotExist) {
-		// Bundle miss: let OpenELFMapping fall back to OpenELF, which
-		// can serve content from PT_LOAD segments for legacy test cases.
-		return nil, fmt.Errorf("%w: %w", process.ErrMappingFileUnavailable, err)
+		// Bundle miss: fall back to the coredump, which serves VDSO from
+		// memory and content from PT_LOAD segments for legacy test cases.
+		return scd.CoredumpProcess.OpenMappingFile(m)
 	}
-	return rac, err
-}
-
-func (scd *StoreCoredump) OpenELF(path string) (*pfelf.File, error) {
-	file, err := scd.openFile(path)
-	if err == nil {
-		return pfelf.NewFileOwned(file)
-	}
-	if !errors.Is(err, os.ErrNotExist) {
+	if err != nil {
 		return nil, err
 	}
-	// Fallback to the native CoredumpProcess
-	return scd.CoredumpProcess.OpenELF(path)
+	return file, nil
+}
+
+// Open implements the fs.FS interface. It prefers content from the module
+// store, falling back to the coredump's own partial data for name.
+func (scd *StoreCoredump) Open(name string) (fs.File, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrInvalid}
+	}
+	// Modules are recorded by their absolute path.
+	file, err := scd.openFile("/" + name)
+	if errors.Is(err, os.ErrNotExist) {
+		return scd.CoredumpProcess.Open(name)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return file, nil
 }
 
 // remoteReaderWithModuleFallback satisfies io.ReaderAt by first trying the
@@ -80,7 +82,7 @@ type remoteReaderWithModuleFallback struct {
 }
 
 func (r *remoteReaderWithModuleFallback) ReadAt(p []byte, addr int64) (int, error) {
-	n, err := r.scd.CoredumpProcess.ReadAt(p, addr)
+	n, err := r.scd.ReadAt(p, addr)
 	if err == nil {
 		return n, nil
 	}
@@ -98,11 +100,15 @@ func (r *remoteReaderWithModuleFallback) ReadAt(p []byte, addr int64) (int, erro
 	if !found {
 		return n, err
 	}
-	file, openErr := r.scd.OpenMappingFile(&covering)
+	f, openErr := r.scd.OpenMappingFile(&covering)
 	if openErr != nil {
 		return n, err
 	}
-	defer file.Close()
+	defer f.Close()
+	file, ok := f.(io.ReaderAt)
+	if !ok {
+		return n, err
+	}
 	fileOff := covering.FileOffset + (uint64(addr) - covering.Vaddr)
 	return file.ReadAt(p, int64(fileOff))
 }

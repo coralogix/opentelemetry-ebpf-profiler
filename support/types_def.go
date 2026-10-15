@@ -13,6 +13,7 @@ import (
 #include "./ebpf/types.h"
 #include "./ebpf/frametypes.h"
 #include "./ebpf/v8_tracer.h"
+#include "./ebpf/luajit.h"
 */
 import "C"
 
@@ -97,49 +98,47 @@ const (
 	HSTSIDSegMapMask      = C.HS_TSID_SEG_MAP_MASK
 )
 
-const (
-	TraceOriginUnknown  = C.TRACE_UNKNOWN
-	TraceOriginSampling = C.TRACE_SAMPLING
-	TraceOriginOffCPU   = C.TRACE_OFF_CPU
-	TraceOriginProbe    = C.TRACE_PROBE
-)
-
 type ApmSpanID C.ApmSpanID
 type ApmTraceID C.ApmTraceID
-type CustomLabel C.CustomLabel
-type CustomLabelsArray C.CustomLabelsArray
 type Event C.Event
+type GolangLabel C.GolangLabel
 type OffsetRange C.OffsetRange
 type PIDPage C.PIDPage
 type PIDPageMappingInfo C.PIDPageMappingInfo
+type PIDNamespaceLayout C.PIDNamespaceLayout
 type StackDelta C.StackDelta
 type StackDeltaPageInfo C.StackDeltaPageInfo
 type StackDeltaPageKey C.StackDeltaPageKey
 type SystemAnalysis C.SystemAnalysis
 type TSDInfo C.TSDInfo
 type DTVInfo C.DTVInfo
+type TLSVarInfo C.TLSVarInfo
 type Trace C.Trace
 type UnwindInfo C.UnwindInfo
 
 type ApmIntProcInfo C.ApmIntProcInfo
 type BEAMProcInfo C.BEAMProcInfo
 type DotnetProcInfo C.DotnetProcInfo
-type GoLabelsOffsets C.GoLabelsOffsets
+type GoRuntimeOffsets C.GoRuntimeOffsets
 type HotspotProcInfo C.HotspotProcInfo
 type PHPProcInfo C.PHPProcInfo
 type PerlProcInfo C.PerlProcInfo
 type PyProcInfo C.PyProcInfo
 type RubyProcInfo C.RubyProcInfo
+type ThreadContextProcInfo C.ThreadContextProcInfo
 type V8ProcInfo C.V8ProcInfo
 
 const (
-	Sizeof_StackDelta = C.sizeof_StackDelta
-	Sizeof_Trace      = C.sizeof_Trace
+	Sizeof_StackDelta    = C.sizeof_StackDelta
+	Sizeof_TraceHeader   = C.sizeof_Trace
+	Sizeof_TraceWithData = C.sizeof_Trace + C.sizeof_TraceData
+	Sizeof_GolangLabel   = C.sizeof_GolangLabel
 
-	sizeof_ApmIntProcInfo = C.sizeof_ApmIntProcInfo
-	sizeof_DotnetProcInfo = C.sizeof_DotnetProcInfo
-	sizeof_PHPProcInfo    = C.sizeof_PHPProcInfo
-	sizeof_RubyProcInfo   = C.sizeof_RubyProcInfo
+	sizeof_ApmIntProcInfo        = C.sizeof_ApmIntProcInfo
+	sizeof_DotnetProcInfo        = C.sizeof_DotnetProcInfo
+	sizeof_PHPProcInfo           = C.sizeof_PHPProcInfo
+	sizeof_RubyProcInfo          = C.sizeof_RubyProcInfo
+	sizeof_ThreadContextProcInfo = C.sizeof_ThreadContextProcInfo
 )
 
 const (
@@ -159,11 +158,10 @@ const (
 	UnwindRegX86R8   uint8 = C.UNWIND_REG_X86_R8
 
 	// UnwindFlag values from the C header file
-	UnwindFlagCommand    uint8 = C.UNWIND_FLAG_COMMAND
-	UnwindFlagFrame      uint8 = C.UNWIND_FLAG_FRAME
-	UnwindFlagLeafOnly   uint8 = C.UNWIND_FLAG_LEAF_ONLY
-	UnwindFlagDerefCfa   uint8 = C.UNWIND_FLAG_DEREF_CFA
-	UnwindFlagRegisterRA uint8 = C.UNWIND_FLAG_REGISTER_RA
+	UnwindFlagCommand  uint8 = C.UNWIND_FLAG_COMMAND
+	UnwindFlagFrame    uint8 = C.UNWIND_FLAG_FRAME
+	UnwindFlagLeafOnly uint8 = C.UNWIND_FLAG_LEAF_ONLY
+	UnwindFlagDerefCfa uint8 = C.UNWIND_FLAG_DEREF_CFA
 
 	// UnwindCommands from the C header file
 	UnwindCommandInvalid      int32 = C.UNWIND_COMMAND_INVALID
@@ -171,6 +169,8 @@ const (
 	UnwindCommandPLT          int32 = C.UNWIND_COMMAND_PLT
 	UnwindCommandSignal       int32 = C.UNWIND_COMMAND_SIGNAL
 	UnwindCommandFramePointer int32 = C.UNWIND_COMMAND_FRAME_POINTER
+	UnwindCommandGoAsmcgocall int32 = C.UNWIND_COMMAND_GO_ASMCGOCALL
+	UnwindCommandGoMorestack  int32 = C.UNWIND_COMMAND_GO_MORESTACK
 
 	// UnwindDeref handling from the C header file
 	UnwindDerefMask       int32 = C.UNWIND_DEREF_MASK
@@ -210,6 +210,10 @@ const (
 	RubyFrameTypeCmeCfunc = C.RUBY_FRAME_TYPE_CME_CFUNC
 	RubyFrameTypeIseq     = C.RUBY_FRAME_TYPE_ISEQ
 	RubyFrameTypeGc       = C.RUBY_FRAME_TYPE_GC
+	RubyFrameTypeJit      = C.RUBY_FRAME_TYPE_JIT
+
+	LJCframeSpaceX86 = C.LUAJIT_CFRAME_SPACE_X86_64
+	LJCframeSpaceArm = C.LUAJIT_CFRAME_SPACE_AARCH64
 )
 
 var MetricsTranslation = []metrics.MetricID{
@@ -309,4 +313,20 @@ var MetricsTranslation = []metrics.MetricID{
 	C.metricID_UnwindRubyErrCmeMaxEp:                      metrics.IDUnwindRubyErrCmeMaxEp,
 	C.metricID_UnwindErrBadDTVRead:                        metrics.IDUnwindErrBadDTVRead,
 	C.metricID_BPFRingbufOutputErr:                        metrics.IDBPFRingbufOutputErr,
+	C.metricID_UnwindNativeErrNoVMA:                       metrics.IDUnwindNativeErrNoVMA,
+	C.metricID_UnwindNativeErrUnsupportedAnonymousMapping: metrics.IDUnwindNativeErrUnsupportedAnonymousMapping,
+	C.metricID_UnwindNativeErrNonExecutableVMA:            metrics.IDUnwindNativeErrNonExecutableVMA,
+	C.metricID_UnwindLuaJITAttempts:                       metrics.IDUnwindLuaJITAttempts,
+	C.metricID_UnwindLuaJITErrNoProcInfo:                  metrics.IDUnwindLuaJITErrNoProcInfo,
+	C.metricID_SamplesSkippedProcessTooNew:                metrics.IDSamplesSkippedProcessTooNew,
+	C.metricID_NumSyncsFromPrctl:                          metrics.IDNumSyncsFromPrctl,
+	C.metricID_NumPriorityEventDeferred:                   metrics.IDNumPriorityEventDeferred,
+	C.metricID_UnwindGoAsmcgocallAttempts:                 metrics.IDUnwindGoAsmcgocallAttempts,
+	C.metricID_UnwindGoAsmcgocallSuccess:                  metrics.IDUnwindGoAsmcgocallSuccess,
+	C.metricID_UnwindGoAsmcgocallUnwindFailure:            metrics.IDUnwindGoAsmcgocallUnwindFailure,
+	C.metricID_UnwindThreadContextErrReadTlsPtr:           metrics.IDUnwindThreadContextErrReadTlsPtr,
+	C.metricID_UnwindThreadContextErrReadThreadCtxBuf:     metrics.IDUnwindThreadContextErrReadThreadCtxBuf,
+	C.metricID_UnwindThreadContextReadSuccesses:           metrics.IDUnwindThreadContextReadSuccesses,
+	C.metricID_UnwindThreadContextAttrsTruncated:          metrics.IDUnwindThreadContextAttrsTruncated,
+	C.metricID_BPFProbeRingbufOutputErr:                   metrics.IDBPFProbeRingbufOutputErr,
 }

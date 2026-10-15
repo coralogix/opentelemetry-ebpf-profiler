@@ -9,12 +9,32 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pprofile"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/pdata"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
+)
+
+var (
+	profileTypeSampling = &samples.TypeMetadata{
+		PeriodType: "cpu",
+		PeriodUnit: "nanoseconds",
+		SampleType: "samples",
+		SampleUnit: "count",
+	}
+	profileTypeOffCPU = &samples.TypeMetadata{
+		SampleType:   "off_cpu",
+		SampleUnit:   "nanoseconds",
+		ReportValues: true,
+	}
+	profileTypeProbe = &samples.TypeMetadata{
+		SampleType: "events",
+		SampleUnit: "count",
+	}
 )
 
 // createTestBaseReporter creates a minimal baseReporter for testing purposes
@@ -47,7 +67,6 @@ func TestBaseReporterGenerate(t *testing.T) {
 	reporter := createTestBaseReporter(t, nil)
 
 	trace1 := &libpf.Trace{
-		Hash: libpf.NewTraceHash(0x0102030400000000, 0x0000000000000000),
 		Frames: func() libpf.Frames {
 			frames := make(libpf.Frames, 0, 3)
 			frames.Append(&libpf.Frame{
@@ -70,7 +89,6 @@ func TestBaseReporterGenerate(t *testing.T) {
 	}
 
 	trace2 := &libpf.Trace{
-		Hash: libpf.NewTraceHash(0x0506070800000000, 0x0000000000000000),
 		Frames: func() libpf.Frames {
 			frames := make(libpf.Frames, 0, 2)
 			frames.Append(&libpf.Frame{
@@ -90,28 +108,26 @@ func TestBaseReporterGenerate(t *testing.T) {
 	now := time.Now()
 	meta1 := &samples.TraceEventMeta{
 		Timestamp:      libpf.UnixTime64(now.UnixNano()),
-		Comm:           libpf.Intern("app1"),
-		ProcessName:    libpf.Intern("app1"),
+		Comm:           libpf.NewCommFromString("app1"),
 		ExecutablePath: libpf.Intern("/usr/bin/app1"),
 		APMServiceName: "service1",
 		ContainerID:    libpf.Intern("container-1"),
 		PID:            1000,
 		TID:            1001,
 		CPU:            0,
-		Origin:         support.TraceOriginSampling,
+		ProfileType:    profileTypeSampling,
 	}
 
 	meta2 := &samples.TraceEventMeta{
 		Timestamp:      libpf.UnixTime64(now.Add(time.Second).UnixNano()),
-		Comm:           libpf.Intern("app2"),
-		ProcessName:    libpf.Intern("app2"),
+		Comm:           libpf.NewCommFromString("app2"),
 		ExecutablePath: libpf.Intern("/usr/bin/app2"),
 		APMServiceName: "service2",
 		ContainerID:    libpf.Intern("container-2"),
 		PID:            2000,
 		TID:            2001,
 		CPU:            1,
-		Origin:         support.TraceOriginOffCPU,
+		ProfileType:    profileTypeOffCPU,
 		Value:          5000000, // 5ms
 	}
 
@@ -142,14 +158,14 @@ func TestBaseReporterGenerate(t *testing.T) {
 	require.NotNil(t, profiles)
 
 	// Validate profile structure
-	assert.Greater(t, profiles.SampleCount(), 0,
+	assert.Positive(t, profiles.SampleCount(),
 		"Should have at least one sample")
 	assert.Equal(t, 2, profiles.ResourceProfiles().Len(),
 		"Should have exactly two resource profile")
 
 	// Check that we have scope profiles
 	resourceProfile := profiles.ResourceProfiles().At(0)
-	assert.Equal(t, 1, resourceProfile.ScopeProfiles().Len(), 0,
+	assert.Equal(t, 1, resourceProfile.ScopeProfiles().Len(),
 		"Should have exactly one scope profile")
 
 	// Verify scope profile metadata
@@ -158,6 +174,353 @@ func TestBaseReporterGenerate(t *testing.T) {
 	assert.Equal(t, reporter.version, scopeProfile.Scope().Version())
 
 	// Verify profiles exist
-	assert.Greater(t, scopeProfile.Profiles().Len(), 0,
+	assert.Positive(t, scopeProfile.Profiles().Len(),
 		"Should have at least one profile")
+}
+
+func serviceAttrs(name string) attribute.Set {
+	return attribute.NewSet(semconv.ServiceName(name))
+}
+
+func singleNativeFrameTrace() *libpf.Trace {
+	frames := make(libpf.Frames, 0, 1)
+	frames.Append(&libpf.Frame{
+		Type:            libpf.NativeFrame,
+		AddressOrLineno: 0x100,
+		FunctionName:    libpf.Intern("f"),
+	})
+	return &libpf.Trace{Frames: frames}
+}
+
+// baseMetaWithResourceAttrs builds meta for one synthetic PID, varying only the
+// resource attributes so every event lands in the same bucket.
+func baseMetaWithResourceAttrs(resourceAttrs attribute.Set) *samples.TraceEventMeta {
+	return &samples.TraceEventMeta{
+		Timestamp:      libpf.UnixTime64(time.Now().UnixNano()),
+		Comm:           libpf.NewCommFromString("svc"),
+		ExecutablePath: libpf.Intern("/usr/bin/svc"),
+		ContainerID:    libpf.Intern("c1"),
+		PID:            1234,
+		TID:            1235,
+		ProfileType:    profileTypeSampling,
+		ResourceAttrs:  resourceAttrs,
+	}
+}
+
+func serviceNameIn(t *testing.T, reporter *baseReporter) string {
+	t.Helper()
+	treePtr := reporter.traceEvents.RLock()
+	defer reporter.traceEvents.RUnlock(&treePtr)
+	require.Len(t, *treePtr, 1, "all samples for one PID belong to a single bucket")
+	for _, rtp := range *treePtr {
+		v, _ := rtp.ResourceAttrs.Value(semconv.ServiceNameKey)
+		return v.AsString()
+	}
+	return ""
+}
+
+// The bucket's resource attributes track the most recent sample's, so a context
+// detected or cleared mid-interval applies to the whole reporting period.
+func TestReportTraceEventResourceAttrsTrackLatest(t *testing.T) {
+	tests := map[string]struct {
+		reported []attribute.Set
+		want     string
+	}{
+		"late publish applies to earlier samples": {
+			reported: []attribute.Set{{}, {}, serviceAttrs("svc")},
+			want:     "svc",
+		},
+		"republish replaces previous": {
+			reported: []attribute.Set{serviceAttrs("svc-v1"), serviceAttrs("svc-v2")},
+			want:     "svc-v2",
+		},
+		// A mapping gone on teardown must drop attribution rather than leave
+		// the last-seen resource attached.
+		"cleared context clears attribution": {
+			reported: []attribute.Set{serviceAttrs("svc"), {}},
+			want:     "",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			reporter := createTestBaseReporter(t, nil)
+			trace := singleNativeFrameTrace()
+			for _, attrs := range tt.reported {
+				require.NoError(t, reporter.ReportTraceEvent(trace,
+					baseMetaWithResourceAttrs(attrs)))
+			}
+			assert.Equal(t, tt.want, serviceNameIn(t, reporter))
+		})
+	}
+}
+
+// processNameAttrProducer is a test SampleAttrProducer that reads "process.name" from
+// TraceEventMeta.ExtraMeta (populated by a ProcessMetaEnricher) and emits it as a
+// sample attribute, exercising the full enricher → TraceEventMeta → attribute pipeline.
+type processNameAttrProducer struct{}
+
+func (p *processNameAttrProducer) CollectExtraSampleMeta(_ *libpf.Trace, meta *samples.TraceEventMeta) any {
+	if meta.ExtraMeta == nil {
+		return ""
+	}
+	return meta.ExtraMeta[libpf.Intern("process.name")]
+}
+
+func (p *processNameAttrProducer) ExtraSampleAttrs(attrMgr *samples.AttrTableManager, extraMeta any) []int32 {
+	name, _ := extraMeta.(string)
+	if name == "" {
+		return nil
+	}
+	// Use a scratch sample to collect the attribute index from AttrTableManager.
+	tmp := pprofile.NewSample()
+	attrMgr.AppendOptionalString(tmp.AttributeIndices(), attribute.Key("process.name"), name)
+	indices := make([]int32, tmp.AttributeIndices().Len())
+	for i := range indices {
+		indices[i] = tmp.AttributeIndices().At(i)
+	}
+	return indices
+}
+
+// TestProcessMetaEnricherPipeline verifies that values set by a ProcessMetaEnricher
+// (stored in TraceEventMeta.ExtraMeta) flow through CollectExtraSampleMeta and
+// ExtraSampleAttrs and end up as attributes in the generated profiles.
+func TestProcessMetaEnricherPipeline(t *testing.T) {
+	cfg := &Config{
+		Name:                "test-agent",
+		Version:             "v1.0.0",
+		SamplesPerSecond:    100,
+		ExtraSampleAttrProd: &processNameAttrProducer{},
+	}
+	reporter := createTestBaseReporter(t, cfg)
+
+	trace := singleNativeFrameTrace()
+
+	now := time.Now()
+	// Simulate what a ProcessMetaEnricher would have stored in ExtraMeta at
+	// process discovery time, which then flows into TraceEventMeta.ExtraMeta.
+	meta := &samples.TraceEventMeta{
+		Timestamp:      libpf.UnixTime64(now.UnixNano()),
+		Comm:           libpf.NewCommFromString("myapp"),
+		ExecutablePath: libpf.Intern("/usr/bin/myapp"),
+		ContainerID:    libpf.Intern("container-x"),
+		PID:            3000,
+		TID:            3001,
+		CPU:            0,
+		ExtraMeta:      map[libpf.String]string{libpf.Intern("process.name"): "myapp"},
+		ProfileType:    profileTypeSampling,
+	}
+
+	err := reporter.ReportTraceEvent(trace, meta)
+	require.NoError(t, err)
+
+	eventsTreePtr := reporter.traceEvents.RLock()
+	eventsTree := *eventsTreePtr
+	reporter.traceEvents.RUnlock(&eventsTreePtr)
+
+	profiles, err := reporter.pdata.Generate(
+		eventsTree,
+		reporter.name,
+		reporter.version,
+		reporter.collectionStartTime,
+		time.Now(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, profiles)
+
+	// Verify "process.name" = "myapp" appears in the attribute table.
+	dic := profiles.Dictionary()
+	strTable := dic.StringTable()
+	attrTable := dic.AttributeTable()
+
+	found := false
+	for i := 0; i < attrTable.Len(); i++ {
+		attr := attrTable.At(i)
+		keyIdx := int(attr.KeyStrindex())
+		if keyIdx < strTable.Len() && strTable.At(keyIdx) == "process.name" {
+			if attr.Value().Str() == "myapp" {
+				found = true
+				break
+			}
+		}
+	}
+	assert.True(t, found, "expected process.name=myapp in the attribute table")
+}
+
+func TestCustomLabelsArePartOfSampleIdentity(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	frames := make(libpf.Frames, 0, 1)
+	frames.Append(&libpf.Frame{
+		Type:            libpf.GoFrame,
+		AddressOrLineno: 42,
+		FunctionName:    libpf.Intern("work"),
+	})
+
+	meta := &samples.TraceEventMeta{
+		Timestamp:      libpf.UnixTime64(time.Now().UnixNano()),
+		Comm:           libpf.NewCommFromString("app"),
+		ExecutablePath: libpf.Intern("/usr/bin/app"),
+		PID:            1000,
+		TID:            1001,
+		CPU:            0,
+		ProfileType:    profileTypeSampling,
+	}
+
+	for _, value := range []string{"tenant-a", "tenant-b", "tenant-a"} {
+		trace := &libpf.Trace{
+			Frames: frames,
+			CustomLabels: map[libpf.String]libpf.String{
+				libpf.Intern("tenant"): libpf.Intern(value),
+			},
+		}
+		require.NoError(t, reporter.ReportTraceEvent(trace, meta))
+		meta.Timestamp++
+	}
+
+	eventsTreePtr := reporter.traceEvents.RLock()
+	eventsTree := *eventsTreePtr
+	reporter.traceEvents.RUnlock(&eventsTreePtr)
+	profiles, err := reporter.pdata.Generate(eventsTree, reporter.name, reporter.version,
+		reporter.collectionStartTime, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, 2, profiles.SampleCount())
+
+	dictionary := profiles.Dictionary()
+	profileSamples := profiles.ResourceProfiles().At(0).ScopeProfiles().At(0).Profiles().At(0).Samples()
+	labelValues := make(map[string]struct{}, profileSamples.Len())
+	timestampsByLabel := make(map[string]int, profileSamples.Len())
+	for i := 0; i < profileSamples.Len(); i++ {
+		profileSample := profileSamples.At(i)
+		attributeIndices := profileSample.AttributeIndices()
+		for j := 0; j < attributeIndices.Len(); j++ {
+			attr := dictionary.AttributeTable().At(int(attributeIndices.At(j)))
+			if dictionary.StringTable().At(int(attr.KeyStrindex())) == "process.context.label.tenant" {
+				value := attr.Value().Str()
+				labelValues[value] = struct{}{}
+				timestampsByLabel[value] = profileSample.TimestampsUnixNano().Len()
+			}
+		}
+	}
+	require.Equal(t, map[string]struct{}{
+		"tenant-a": {},
+		"tenant-b": {},
+	}, labelValues)
+	require.Equal(t, map[string]int{
+		"tenant-a": 2,
+		"tenant-b": 1,
+	}, timestampsByLabel)
+}
+
+func TestMergeSnapshots(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	snapshotType := &samples.TypeMetadata{
+		SampleType:        "gpu_kernel_time",
+		SampleUnit:        "nanoseconds",
+		ReportValues:      true,
+		OmitThreadContext: true,
+	}
+
+	// A CPU sample of PID 1000 creates the resource the snapshot must join.
+	cpuMeta := baseMetaWithResourceAttrs(attribute.Set{})
+	cpuMeta.PID = 1000
+	require.NoError(t, reporter.ReportTraceEvent(singleNativeFrameTrace(), cpuMeta))
+
+	processMeta := map[libpf.PID]samples.ProcessMeta{
+		1000: {ExecutablePath: cpuMeta.ExecutablePath, ContainerID: cpuMeta.ContainerID},
+		2000: {
+			ExecutablePath: libpf.Intern("/usr/bin/gpu"),
+			ResourceAttrs:  serviceAttrs("gpu-svc"),
+		},
+	}
+	kernelA := libpf.NewTraceHash(1, 1)
+	kernelB := libpf.NewTraceHash(2, 2)
+	reporter.SetSnapshotSources(func() []samples.SnapshotProfile {
+		return []samples.SnapshotProfile{{
+			ProfileType: snapshotType,
+			Samples: []samples.SnapshotSample{
+				{PID: 1000, TraceHash: kernelA, Frames: singleNativeFrameTrace().Frames, Value: 10},
+				{PID: 1000, TraceHash: kernelA, Frames: singleNativeFrameTrace().Frames, Value: 5},
+				{PID: 2000, TraceHash: kernelB, Frames: singleNativeFrameTrace().Frames, Value: 7},
+			},
+		}}
+	}, func(pid libpf.PID) samples.ProcessMeta { return processMeta[pid] })
+
+	treePtr := reporter.traceEvents.RLock()
+	tree := *treePtr
+	reporter.traceEvents.RUnlock(&treePtr)
+	end := time.Now()
+	reporter.mergeSnapshots(tree, end)
+	require.Len(t, tree, 2)
+
+	existing := tree[samples.ResourceKey{
+		ContainerID:    cpuMeta.ContainerID,
+		ExecutablePath: cpuMeta.ExecutablePath,
+		PID:            1000,
+	}]
+	require.Len(t, existing.Events, 2, "snapshot joins the CPU sample's resource")
+	merged := existing.Events[snapshotType][samples.SampleKey{Hash: kernelA}]
+	require.NotNil(t, merged)
+	assert.Equal(t, []int64{10, 5}, merged.Values)
+	assert.Equal(t, []uint64{uint64(end.UnixNano()), uint64(end.UnixNano())}, merged.Timestamps)
+
+	created := tree[samples.ResourceKey{ExecutablePath: libpf.Intern("/usr/bin/gpu"), PID: 2000}]
+	v, _ := created.ResourceAttrs.Value(semconv.ServiceNameKey)
+	assert.Equal(t, "gpu-svc", v.AsString())
+	assert.Equal(t, []int64{7}, created.Events[snapshotType][samples.SampleKey{Hash: kernelB}].Values)
+
+	profiles, err := reporter.pdata.Generate(tree, reporter.name, reporter.version,
+		reporter.collectionStartTime, end)
+	require.NoError(t, err)
+	dictionary := profiles.Dictionary()
+	for i := 0; i < profiles.ResourceProfiles().Len(); i++ {
+		profs := profiles.ResourceProfiles().At(i).ScopeProfiles().At(0).Profiles()
+		for j := 0; j < profs.Len(); j++ {
+			prof := profs.At(j)
+			if dictionary.StringTable().At(int(prof.SampleType().TypeStrindex())) != "gpu_kernel_time" {
+				continue
+			}
+			for k := 0; k < prof.Samples().Len(); k++ {
+				indices := prof.Samples().At(k).AttributeIndices()
+				for l := 0; l < indices.Len(); l++ {
+					attr := dictionary.AttributeTable().At(int(indices.At(l)))
+					key := dictionary.StringTable().At(int(attr.KeyStrindex()))
+					assert.NotEqual(t, string(semconv.ThreadIDKey), key)
+					assert.NotEqual(t, string(semconv.CPULogicalNumberKey), key)
+				}
+			}
+		}
+	}
+}
+
+func TestMergeSnapshotsWithoutSources(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	tree := make(samples.TraceEventsTree)
+	reporter.mergeSnapshots(tree, time.Now())
+	assert.Empty(t, tree)
+}
+
+func TestMergeSnapshotsPrefersSampleProcessMeta(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+	reporter.SetSnapshotSources(func() []samples.SnapshotProfile {
+		return []samples.SnapshotProfile{{
+			ProfileType: profileTypeOffCPU,
+			Samples: []samples.SnapshotSample{{
+				PID:       3000,
+				TraceHash: libpf.NewTraceHash(3, 3),
+				Value:     1,
+				// Captured while the process was alive.
+				ProcessMeta: &samples.ProcessMeta{
+					ExecutablePath: libpf.Intern("/usr/bin/exited"),
+				},
+			}},
+		}}
+	}, func(libpf.PID) samples.ProcessMeta {
+		// The process has exited, so the report-time lookup knows nothing.
+		return samples.ProcessMeta{}
+	})
+
+	tree := make(samples.TraceEventsTree)
+	reporter.mergeSnapshots(tree, time.Now())
+	require.Len(t, tree, 1)
+	_, ok := tree[samples.ResourceKey{ExecutablePath: libpf.Intern("/usr/bin/exited"), PID: 3000}]
+	assert.True(t, ok)
 }

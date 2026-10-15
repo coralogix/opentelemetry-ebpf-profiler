@@ -10,21 +10,12 @@ import (
 	"time"
 
 	lru "github.com/elastic/go-freelru"
+
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 
 	"go.opentelemetry.io/ebpf-profiler/host"
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
-	"go.opentelemetry.io/ebpf-profiler/interpreter/apmint"
-	"go.opentelemetry.io/ebpf-profiler/interpreter/beam"
-	"go.opentelemetry.io/ebpf-profiler/interpreter/dotnet"
-	golang "go.opentelemetry.io/ebpf-profiler/interpreter/go"
-	"go.opentelemetry.io/ebpf-profiler/interpreter/golabels"
-	"go.opentelemetry.io/ebpf-profiler/interpreter/hotspot"
-	"go.opentelemetry.io/ebpf-profiler/interpreter/nodev8"
-	"go.opentelemetry.io/ebpf-profiler/interpreter/perl"
-	"go.opentelemetry.io/ebpf-profiler/interpreter/php"
-	"go.opentelemetry.io/ebpf-profiler/interpreter/python"
-	"go.opentelemetry.io/ebpf-profiler/interpreter/ruby"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/libc"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
@@ -34,7 +25,6 @@ import (
 	sdtypes "go.opentelemetry.io/ebpf-profiler/nativeunwind/stackdeltatypes"
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	"go.opentelemetry.io/ebpf-profiler/support"
-	"go.opentelemetry.io/ebpf-profiler/tracer/types"
 )
 
 const (
@@ -93,42 +83,9 @@ type ExecutableInfoManager struct {
 func NewExecutableInfoManager(
 	sdp nativeunwind.StackDeltaProvider,
 	ebpf pmebpf.EbpfHandler,
-	includeTracers types.IncludedTracers,
+	interpretersConfig interpreterconfig.Config,
 ) (*ExecutableInfoManager, error) {
-	// Initialize interpreter loaders.
-	interpreterLoaders := make([]interpreter.Loader, 0)
-	if includeTracers.Has(types.PerlTracer) {
-		interpreterLoaders = append(interpreterLoaders, perl.Loader)
-	}
-	if includeTracers.Has(types.PythonTracer) {
-		interpreterLoaders = append(interpreterLoaders, python.Loader)
-	}
-	if includeTracers.Has(types.PHPTracer) {
-		interpreterLoaders = append(interpreterLoaders, php.Loader, php.OpcacheLoader)
-	}
-	if includeTracers.Has(types.HotspotTracer) {
-		interpreterLoaders = append(interpreterLoaders, hotspot.Loader)
-	}
-	if includeTracers.Has(types.RubyTracer) {
-		interpreterLoaders = append(interpreterLoaders, ruby.Loader)
-	}
-	if includeTracers.Has(types.V8Tracer) {
-		interpreterLoaders = append(interpreterLoaders, nodev8.Loader)
-	}
-	if includeTracers.Has(types.DotnetTracer) {
-		interpreterLoaders = append(interpreterLoaders, dotnet.Loader)
-	}
-	if includeTracers.Has(types.GoTracer) {
-		interpreterLoaders = append(interpreterLoaders, golang.Loader)
-	}
-	if includeTracers.Has(types.BEAMTracer) {
-		interpreterLoaders = append(interpreterLoaders, beam.Loader)
-	}
-
-	interpreterLoaders = append(interpreterLoaders, apmint.Loader)
-	if includeTracers.Has(types.Labels) {
-		interpreterLoaders = append(interpreterLoaders, golabels.Loader)
-	}
+	loaders := interpretersConfig.Loaders()
 
 	deferredFileIDs, err := lru.NewSynced[host.FileID, libpf.Void](deferredFileIDSize,
 		func(id host.FileID) uint32 { return uint32(id) })
@@ -140,7 +97,7 @@ func NewExecutableInfoManager(
 	return &ExecutableInfoManager{
 		sdp: sdp,
 		state: xsync.NewRWMutex(executableInfoManagerState{
-			interpreterLoaders: interpreterLoaders,
+			interpreterLoaders: loaders,
 			executables:        map[host.FileID]*entry{},
 			unusedExecutables:  map[host.FileID]time.Time{},
 			unwindInfoIndex:    map[sdtypes.UnwindInfo]uint16{},
@@ -162,10 +119,8 @@ func (mgr *ExecutableInfoManager) AddOrIncRef(fileID host.FileID,
 		return ExecutableInfo{}, ErrDeferredFileID
 	}
 	var (
-		intervalData sdtypes.IntervalData
-		libcInfo     *libc.LibcInfo
-		ref          mapRef
-		err          error
+		libcInfo *libc.LibcInfo
+		ref      mapRef
 	)
 
 	// Fast path for executable info that is already present.
@@ -184,13 +139,14 @@ func (mgr *ExecutableInfoManager) AddOrIncRef(fileID host.FileID,
 	// so we release the lock before doing this.
 	mgr.state.WUnlock(&state)
 
-	if err = mgr.sdp.GetIntervalStructuresForFile(elfRef, &intervalData); err != nil {
+	intervalData, err := mgr.sdp.GetIntervalDataForFile(elfRef)
+	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			mgr.deferredFileIDs.Add(fileID, libpf.Void{})
 		}
 		return ExecutableInfo{}, fmt.Errorf("failed to extract interval data: %w", err)
 	}
-	if len(intervalData.Deltas) == 0 {
+	if len(intervalData.Blocks) == 0 {
 		ef, errx := elfRef.GetELF()
 		if errx != nil {
 			return ExecutableInfo{}, errx
@@ -218,19 +174,22 @@ func (mgr *ExecutableInfoManager) AddOrIncRef(fileID host.FileID,
 	}
 
 	// Load the data into BPF maps.
-	ref, err = state.loadDeltas(fileID, intervalData.Deltas)
+	ref, err = state.loadDeltas(fileID, intervalData)
 	if err != nil {
 		mgr.deferredFileIDs.Add(fileID, libpf.Void{})
 		return ExecutableInfo{}, fmt.Errorf("failed to load deltas: %w", err)
 	}
 
 	// Create the LoaderInfo for interpreter detection
-	loaderInfo := interpreter.NewLoaderInfo(fileID, elfRef)
+	loaderInfo := interpreter.NewLoaderInfo(fileID, elfRef, intervalData)
+
+	// Detect and load interpreter data
+	interpData := state.detectAndLoadInterpData(loaderInfo)
 
 	// Insert a corresponding record into our map.
 	info = &entry{
 		ExecutableInfo: ExecutableInfo{
-			Data:     state.detectAndLoadInterpData(loaderInfo),
+			Data:     interpData,
 			LibcInfo: libcInfo,
 		},
 		mapRef: ref,
@@ -324,7 +283,7 @@ func (mgr *ExecutableInfoManager) UpdateMetricSummary(summary metrics.Summary) {
 }
 
 type executableInfoManagerState struct {
-	// interpreterLoaders is a list of instances of an interface that provide functionality
+	// interpreterLoaders is a list of loaders, each providing functionality
 	// for loading the host agent support for a specific interpreter type.
 	interpreterLoaders []interpreter.Loader
 
@@ -353,22 +312,22 @@ type executableInfoManagerState struct {
 
 // detectAndLoadInterpData attempts to detect the given executable as an interpreter. If detection
 // succeeds, it then loads additional per-interpreter data into the BPF maps and returns the
-// interpreter data. If multiple loaders recognize the executable, it returns a MultiData instance.
+// interpreter data. If multiple loaders recognize the executable, it returns a MultiInterpreter.
 func (state *executableInfoManagerState) detectAndLoadInterpData(
 	loaderInfo *interpreter.LoaderInfo,
 ) interpreter.Data {
-	var interpreterDatas []interpreter.Data //nolint:prealloc
+	var matches []interpreter.Data //nolint:prealloc
 
 	// Ask all interpreter loaders whether they want to handle this executable.
 	for _, loader := range state.interpreterLoaders {
-		data, err := loader(state.ebpf, loaderInfo)
+		data, err := loader.Load(state.ebpf, loaderInfo)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				// Very common if the process exited when we tried to analyze it.
 				log.Debugf("Failed to load %v (%#016x): file not found",
 					loaderInfo.FileName(), loaderInfo.FileID())
 			} else {
-				log.Errorf("Failed to load %v (%#016x): %v",
+				log.Warnf("Failed to load %v (%#016x): %v",
 					loaderInfo.FileName(), loaderInfo.FileID(), err)
 			}
 			// Continue checking other loaders even if one fails
@@ -380,20 +339,19 @@ func (state *executableInfoManagerState) detectAndLoadInterpData(
 
 		log.Debugf("Interpreter data %v for %v (%#016x)",
 			data, loaderInfo.FileName(), loaderInfo.FileID())
-		interpreterDatas = append(interpreterDatas, data)
+		matches = append(matches, data)
 	}
 
 	// Return based on how many interpreters matched
-	switch len(interpreterDatas) {
+	switch len(matches) {
 	case 0:
 		return nil
 	case 1:
-		return interpreterDatas[0]
+		return matches[0]
 	default:
-		// Multiple interpreters matched, create a MultiData
 		log.Debugf("Multiple interpreters (%d) matched for %v (%#016x)",
-			len(interpreterDatas), loaderInfo.FileName(), loaderInfo.FileID())
-		return interpreter.NewMultiData(interpreterDatas)
+			len(matches), loaderInfo.FileName(), loaderInfo.FileID())
+		return interpreter.NewMultiData(matches)
 	}
 }
 
@@ -402,46 +360,78 @@ func (state *executableInfoManagerState) detectAndLoadInterpData(
 // also creates a list of all large gaps in the executable.
 func (state *executableInfoManagerState) loadDeltas(
 	fileID host.FileID,
-	deltas []sdtypes.StackDelta,
+	intervals *sdtypes.IntervalData,
 ) (mapRef, error) {
-	numDeltas := len(deltas)
+	numDeltas := intervals.NumDeltas
 	if numDeltas == 0 {
 		// If no deltas are extracted, cache the result but don't reserve memory in BPF maps.
 		return mapRef{MapID: 0}, nil
 	}
 
-	firstPage := deltas[0].Address >> support.StackDeltaPageBits
-	firstPageAddr := deltas[0].Address &^ support.StackDeltaPageMask
-	lastPage := deltas[numDeltas-1].Address >> support.StackDeltaPageBits
+	firstBlock := intervals.Blocks[0]
+	lastBlock := intervals.Blocks[len(intervals.Blocks)-1]
+
+	firstPage := firstBlock.Start >> support.StackDeltaPageBits
+	firstPageAddr := firstBlock.Start &^ support.StackDeltaPageMask
+	lastPage := lastBlock.End >> support.StackDeltaPageBits
 	numPages := lastPage - firstPage + 1
 	numDeltasPerPage := make([]uint16, numPages)
 
 	// Index the unwind-info.
 	var unwindInfo sdtypes.UnwindInfo
 	ebpfDeltas := make([]pmebpf.StackDeltaEBPF, 0, numDeltas)
-	for index, delta := range deltas {
-		if unwindInfo.MergeOpcode != 0 {
-			// This delta was merged in the previous iteration.
-			unwindInfo.MergeOpcode = 0
-			continue
-		}
-		unwindInfo = delta.Info
-		if index+1 < len(deltas) {
-			unwindInfo.MergeOpcode = calculateMergeOpcode(delta, deltas[index+1])
-		}
-		// Uses the new 'unwindInfo' with potentially updated MergeOpcode
-		// here. In the end, it's only the unwindInfoIndex being different for
-		// merged deltas.
-		var unwindInfoIndex uint16
-		unwindInfoIndex, err := state.getUnwindInfoIndex(unwindInfo)
+	addDelta := func(addr uint64, info support.UnwindInfo) error {
+		unwindInfoIndex, err := state.getUnwindInfoIndex(info)
 		if err != nil {
-			return mapRef{}, err
+			return err
 		}
-		ebpfDeltas = append(ebpfDeltas, pmebpf.StackDeltaEBPF{
-			AddressLow: uint16(delta.Address),
-			UnwindInfo: unwindInfoIndex,
-		})
-		numDeltasPerPage[(delta.Address>>support.StackDeltaPageBits)-firstPage]++
+		numDeltas := len(ebpfDeltas)
+		if numDeltas == 0 || ebpfDeltas[numDeltas-1].UnwindInfo != unwindInfoIndex {
+			ebpfDeltas = append(ebpfDeltas, pmebpf.StackDeltaEBPF{
+				AddressLow: uint16(addr),
+				UnwindInfo: unwindInfoIndex,
+			})
+			numDeltasPerPage[(addr>>support.StackDeltaPageBits)-firstPage]++
+		}
+		return nil
+	}
+
+	for blockIndex, block := range intervals.Blocks {
+		for deltaIndex, delta := range block.Deltas {
+			if unwindInfo.MergeOpcode != 0 {
+				// This delta was merged in the previous iteration.
+				unwindInfo.MergeOpcode = 0
+				continue
+			}
+			unwindInfo = delta.Info
+			if deltaIndex+1 < len(block.Deltas) {
+				unwindInfo.MergeOpcode = calculateMergeOpcode(delta, block.Deltas[deltaIndex+1])
+			}
+
+			addr := block.Start + uint64(delta.Offset)
+			if unwindInfo.Flags&support.UnwindFlagCommand != 0 && unwindInfo.Param == support.UnwindCommandSignal {
+				// EBPF code does a -1 fixup for return addresses.
+				// To match the signal handler function injected into
+				// stack, the signal handler stack delta must start one
+				// byte earlier to accommodate for the ebpf fixup.
+				// C-libraries will have a 'nop' inserted to make sure
+				// nothing conflicts.
+				addr--
+			}
+
+			// Uses the new 'unwindInfo' with potentially updated MergeOpcode
+			// here. In the end, it's only the unwindInfoIndex being different for
+			// merged deltas.
+			if err := addDelta(addr, unwindInfo); err != nil {
+				return mapRef{}, err
+			}
+		}
+		// Check if blocks are far apart or last block
+		if blockIndex+1 == len(intervals.Blocks) || block.End+sdtypes.MinimumGap < intervals.Blocks[blockIndex+1].Start {
+			if err := addDelta(block.End, sdtypes.UnwindInfoInvalid); err != nil {
+				return mapRef{}, err
+			}
+		}
 	}
 
 	// Update data to eBPF
@@ -474,7 +464,7 @@ func calculateMergeOpcode(delta, nextDelta sdtypes.StackDelta) uint8 {
 	if delta.Info.Flags&support.UnwindFlagCommand != 0 {
 		return 0
 	}
-	addrDiff := nextDelta.Address - delta.Address
+	addrDiff := nextDelta.Offset - delta.Offset
 	if addrDiff < 1 || addrDiff > 2 {
 		return 0
 	}

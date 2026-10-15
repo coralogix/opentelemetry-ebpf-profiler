@@ -6,10 +6,11 @@ package python // import "go.opentelemetry.io/ebpf-profiler/interpreter/python"
 import (
 	"fmt"
 
+	"golang.org/x/arch/x86/x86asm"
+
 	"go.opentelemetry.io/ebpf-profiler/asm/amd"
 	e "go.opentelemetry.io/ebpf-profiler/asm/expression"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"golang.org/x/arch/x86/x86asm"
 )
 
 func decodeStubArgumentAMD64(
@@ -18,8 +19,7 @@ func decodeStubArgumentAMD64(
 ) (
 	libpf.SymbolValue, error,
 ) {
-	it := amd.NewInterpreterWithCode(code)
-	it.CodeAddress = e.Imm(codeAddress)
+	it := amd.NewInterpreterWithCodeAt(code, e.Imm(codeAddress))
 	_, err := it.LoopWithBreak(func(op x86asm.Inst) bool {
 		return op.Op == x86asm.JMP || op.Op == x86asm.CALL
 	})

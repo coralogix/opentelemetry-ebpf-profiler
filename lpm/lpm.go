@@ -95,7 +95,13 @@ func CalculatePrefixList(start, end uint64) ([]Prefix, error) {
 
 func calculateRmb(currentVal, end uint64) uint64 {
 	rmb := getRightmostSetBit(currentVal)
-	for currentVal+rmb > end {
+	if rmb == 0 {
+		// currentVal == 0 has no rightmost set bit. Start from the largest
+		// possible block; the loop below shrinks it to fit [currentVal, end).
+		rmb = 1 << 63
+	}
+	// Compare against the remaining range to avoid overflowing currentVal+rmb.
+	for rmb > end-currentVal {
 		rmb >>= 1
 	}
 	return rmb

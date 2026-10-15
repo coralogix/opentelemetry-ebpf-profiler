@@ -11,21 +11,33 @@ dist:
   name: otelcol-ebpf-profiler
   description: Local OpenTelemetry Collector binary, testing only.
   version: dev
+  output_path: ./cmd/otelcol-ebpf-profiler
+
+extensions:
+  - gomod: go.opentelemetry.io/ebpf-profiler v0.0.202640
+    import: go.opentelemetry.io/ebpf-profiler/probes/gpu
+  - gomod: go.opentelemetry.io/ebpf-profiler v0.0.202640
+    import: go.opentelemetry.io/ebpf-profiler/probes/kprobe
+  - gomod: go.opentelemetry.io/ebpf-profiler v0.0.202640
+    import: go.opentelemetry.io/ebpf-profiler/probes/offcpu
+  - gomod: go.opentelemetry.io/ebpf-profiler v0.0.202640
+    import: go.opentelemetry.io/ebpf-profiler/probes/uprobe
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/pprofextension v0.162.0
 
 receivers:
-  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.154.0
-  - gomod: go.opentelemetry.io/ebpf-profiler v0.0.202623
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.162.0
+  - gomod: go.opentelemetry.io/ebpf-profiler v0.0.202640
     import: go.opentelemetry.io/ebpf-profiler/collector
 
 exporters:
-  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.154.0
-  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.154.0
-  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.154.0
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.162.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.162.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.162.0
 
 providers:
-  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.60.0
-  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.60.0
-  - gomod: go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.60.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.68.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.68.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.68.0
 
 replaces:
   - go.opentelemetry.io/ebpf-profiler => ../../

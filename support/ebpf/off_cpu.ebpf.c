@@ -21,13 +21,19 @@ struct sched_times_t {
 // off_cpu_threshold is set during load time.
 BPF_RODATA_VAR(u32, off_cpu_threshold, 0)
 
+// origin_id_off_cpu is set during load time.
+BPF_RODATA_VAR(u16, origin_id_off_cpu, 0)
+
 // tracepoint__sched_switch serves as entry point for off cpu profiling.
 SEC("tracepoint/sched/sched_switch")
 int tracepoint__sched_switch(UNUSED void *ctx)
 {
-  u64 pid_tgid = bpf_get_current_pid_tgid();
-  u32 pid      = pid_tgid >> 32;
-  u32 tid      = pid_tgid & 0xFFFFFFFF;
+  u32 pid          = 0;
+  u32 tid          = 0;
+  u64 group_leader = 0;
+  if (!get_pid_tgid_leader(&pid, &tid, &group_leader)) {
+    return 0;
+  }
 
   if (pid == 0 || tid == 0) {
     return 0;
@@ -38,6 +44,11 @@ int tracepoint__sched_switch(UNUSED void *ctx)
   }
 
   u64 ts = bpf_ktime_get_ns();
+  if (process_is_too_new(ts, group_leader)) {
+    return 0;
+  }
+
+  u64 pid_tgid = ((u64)pid << 32) | tid;
 
   if (bpf_map_update_elem(&sched_times, &pid_tgid, &ts, BPF_ANY) < 0) {
     DEBUG_PRINT("Failed to record sched_switch event entry");
@@ -47,12 +58,16 @@ int tracepoint__sched_switch(UNUSED void *ctx)
   return 0;
 }
 
-// kprobe__dummy is never loaded or called. It just makes sure kprobe_progs is
-// referenced and make the compiler and linker happy.
+// kprobe__dummy is never loaded or called. It just makes sure kprobe_progs,
+// per_cpu_records_kp and probe_trace_events are referenced (all are only used via
+// load-time map rewriting), keeping rewriteMaps and the linker happy.
 SEC("kprobe/dummy")
 int kprobe__dummy(struct pt_regs *ctx)
 {
-  bpf_tail_call(ctx, &kprobe_progs, 0);
+  int key = 0;
+  if (bpf_map_lookup_elem(&per_cpu_records_kp, &key))
+    bpf_tail_call(ctx, &kprobe_progs, 0);
+  bpf_ringbuf_output(&probe_trace_events, &key, sizeof(key), 0);
   return 0;
 }
 
@@ -61,16 +76,19 @@ int kprobe__dummy(struct pt_regs *ctx)
 SEC("kprobe/finish_task_switch")
 int finish_task_switch(struct pt_regs *ctx)
 {
-  // Get the PID and TGID register.
-  u64 pid_tgid = bpf_get_current_pid_tgid();
-  u32 pid      = pid_tgid >> 32;
-  u32 tid      = pid_tgid & 0xFFFFFFFF;
+  u32 pid          = 0;
+  u32 tid          = 0;
+  u64 group_leader = 0;
+  if (!get_pid_tgid_leader(&pid, &tid, &group_leader)) {
+    return 0;
+  }
 
   if (pid == 0 || tid == 0) {
     return 0;
   }
 
-  u64 ts = bpf_ktime_get_ns();
+  u64 ts       = bpf_ktime_get_ns();
+  u64 pid_tgid = ((u64)pid << 32) | tid;
 
   u64 *start_ts = bpf_map_lookup_elem(&sched_times, &pid_tgid);
   if (!start_ts || *start_ts == 0) {
@@ -86,5 +104,5 @@ int finish_task_switch(struct pt_regs *ctx)
   u64 diff = ts - *start_ts;
   DEBUG_PRINT("==== finish_task_switch ====");
 
-  return collect_trace(ctx, TRACE_OFF_CPU, pid, tid, ts, diff);
+  return collect_trace(ctx, origin_id_off_cpu, pid, tid, group_leader, ts, diff);
 }

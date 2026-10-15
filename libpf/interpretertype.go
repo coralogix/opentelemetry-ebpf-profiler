@@ -39,6 +39,15 @@ const (
 	BEAM InterpreterType = support.FrameMarkerBEAM
 )
 
+// Interpreters whose frames are synthesized in Go by probes instead of being
+// unwound in eBPF. eBPF frame headers hold the frame type in 4 bits, so these
+// start above that range.
+const (
+	// GPU identifies work run on GPUs and other accelerators, such as kernels
+	// and memory operations, reported by GPU probes.
+	GPU InterpreterType = 0x10
+)
+
 // Pseudo-interpreters without a corresponding frame type.
 const (
 	// pseudoInterpreterStart marks the start of the pseudo interpreter ID space.
@@ -47,8 +56,8 @@ const (
 	// APMInt identifies the pseudo-interpreter for the APM integration.
 	APMInt InterpreterType = 0x100
 
-	// Go identifies the pseudo-interpreter for Go custom labels support.
-	GoLabels InterpreterType = 0x101
+	// ThreadContext identifies the pseudo-interpreter for thread context support.
+	ThreadContext InterpreterType = 0x101
 )
 
 // Frame converts the interpreter type into the corresponding frame type.
@@ -64,20 +73,21 @@ var interpreterTypeToString = map[InterpreterType]string{
 	UnknownInterp: "unknown",
 	PHP:           "php",
 	// OTel SemConv does not differentiate between jitted code and interpreted code.
-	PHPJIT:   "php",
-	Python:   "cpython",
-	Native:   "native",
-	Kernel:   "kernel",
-	HotSpot:  "jvm",
-	Ruby:     "ruby",
-	Perl:     "perl",
-	V8:       "v8js",
-	Dotnet:   "dotnet",
-	BEAM:     "beam",
-	APMInt:   "apm-integration",
-	LuaJIT:   "luajit",
-	Go:       "go",
-	GoLabels: "go-labels",
+	PHPJIT:        "php",
+	Python:        "cpython",
+	Native:        "native",
+	Kernel:        "kernel",
+	HotSpot:       "jvm",
+	Ruby:          "ruby",
+	Perl:          "perl",
+	V8:            "v8js",
+	Dotnet:        "dotnet",
+	BEAM:          "beam",
+	APMInt:        "apm-integration",
+	ThreadContext: "thread-context",
+	LuaJIT:        "luajit",
+	Go:            "go",
+	GPU:           "gpu",
 }
 
 var stringToInterpreterType = make(map[string]InterpreterType, len(interpreterTypeToString))

@@ -40,6 +40,20 @@ unsigned long long bpf_ktime_get_ns(void);
 int bpf_get_current_comm(void *, int);
 int bpf_perf_event_output(void *, void *, unsigned long long, void *, int);
 long bpf_ringbuf_output(void *, void *, u64, u64);
+static inline struct task_struct *bpf_get_current_task_btf(void)
+{
+  return NULL;
+}
+
+static inline long bpf_find_vma(
+  UNUSED struct task_struct *task,
+  UNUSED u64 addr,
+  UNUSED void *callback_fn,
+  UNUSED void *callback_ctx,
+  UNUSED u64 flags)
+{
+  return 0;
+}
 
 static inline long bpf_probe_read_user(void *buf, u32 sz, const void *ptr)
 {
@@ -61,6 +75,16 @@ static inline long bpf_probe_read_kernel(UNUSED void *buf, UNUSED u32 sz, UNUSED
 static inline u64 bpf_get_current_pid_tgid(void)
 {
   return __cgo_ctx->id;
+}
+
+static inline long bpf_get_ns_current_pid_tgid(u64 dev, u64 ino, void *info, u32 size)
+{
+  return -1;
+}
+
+static inline unsigned long long bpf_get_current_task(void)
+{
+  return 0;
 }
 
 static inline void *bpf_map_lookup_elem(void *map, const void *key)
@@ -111,14 +135,19 @@ bpf_get_stack(UNUSED void *ctx, UNUSED void *buf, UNUSED u32 size, UNUSED u64 fl
 static void *(*bpf_map_lookup_elem)(void *map, void *key) = (void *)BPF_FUNC_map_lookup_elem;
 static int (*bpf_map_update_elem)(void *map, void *key, void *value, u64 flags) = (void *)
   BPF_FUNC_map_update_elem;
-static int (*bpf_map_delete_elem)(void *map, void *key) = (void *)BPF_FUNC_map_delete_elem;
-static int (*bpf_probe_read)(void *dst, int size, const void *unsafe_ptr) = (void *)
-  BPF_FUNC_probe_read;
+static int (*bpf_map_delete_elem)(void *map, void *key)     = (void *)BPF_FUNC_map_delete_elem;
 static unsigned long long (*bpf_ktime_get_ns)(void)         = (void *)BPF_FUNC_ktime_get_ns;
 static unsigned long long (*bpf_get_current_pid_tgid)(void) = (void *)BPF_FUNC_get_current_pid_tgid;
-static int (*bpf_get_current_comm)(void *buf, int buf_size) = (void *)BPF_FUNC_get_current_comm;
+static long (*bpf_get_ns_current_pid_tgid)(u64 dev, u64 ino, void *info, u32 size) = (void *)
+  BPF_FUNC_get_ns_current_pid_tgid;
+static int (*bpf_get_current_comm)(void *buf, int buf_size)   = (void *)BPF_FUNC_get_current_comm;
 static void (*bpf_tail_call)(void *ctx, void *map, int index) = (void *)BPF_FUNC_tail_call;
 static unsigned long long (*bpf_get_current_task)(void)       = (void *)BPF_FUNC_get_current_task;
+static struct task_struct *(*bpf_get_current_task_btf)(void)  = (void *)
+  BPF_FUNC_get_current_task_btf;
+static long (*bpf_find_vma)(
+  struct task_struct *task, u64 addr, void *callback_fn, void *callback_ctx, u64 flags) = (void *)
+  BPF_FUNC_find_vma;
 static int (*bpf_perf_event_output)(
   void *ctx, void *map, unsigned long long flags, void *data, int size) = (void *)
   BPF_FUNC_perf_event_output;
@@ -132,10 +161,11 @@ static unsigned long long (*bpf_get_prandom_u32)(void) = (void *)BPF_FUNC_get_pr
 __attribute__((format(printf, 1, 3))) static int (*bpf_trace_printk)(
   const char *fmt, int fmt_size, ...) = (void *)BPF_FUNC_trace_printk;
 
-static long (*bpf_probe_read_user)(void *dst, int size, const void *unsafe_ptr) = (void *)
+static long (*bpf_probe_read_user)(void *dst, u32 size, const void *unsafe_ptr) = (void *)
   BPF_FUNC_probe_read_user;
-static long (*bpf_probe_read_kernel)(void *dst, int size, const void *unsafe_ptr) = (void *)
+static long (*bpf_probe_read_kernel)(void *dst, u32 size, const void *unsafe_ptr) = (void *)
   BPF_FUNC_probe_read_kernel;
+static long (*bpf_send_signal_thread)(u32 sig) = (void *)BPF_FUNC_send_signal_thread;
 
   #define bpf_probe_read_user_with_test_fault bpf_probe_read_user
 
@@ -158,14 +188,9 @@ static long (*bpf_probe_read_kernel)(void *dst, int size, const void *unsafe_ptr
   // intend to debug. Placing it into frequently taken code paths might otherwise take down
   // important system processes like sshd or your window manager. For frequently taken cases,
   // prefer using the `DEBUG_CAPTURE_COREDUMP_IF_TGID` macro.
-  //
-  // This macro requires linking against kernel headers >= 5.6.
   #define DEBUG_CAPTURE_COREDUMP()                                                                 \
     ({                                                                                             \
       if (__builtin_expect(with_debug_output, 0)) {                                                \
-        /* We don't define `bpf_send_signal_thread` globally because it requires a      */         \
-        /* rather recent kernel (>= 5.6) and otherwise breaks builds of older versions. */         \
-        long (*bpf_send_signal_thread)(u32 sig) = (void *)BPF_FUNC_send_signal_thread;             \
         bpf_send_signal_thread(SIGTRAP);                                                           \
       }                                                                                            \
     })
@@ -176,7 +201,6 @@ static long (*bpf_probe_read_kernel)(void *dst, int size, const void *unsafe_ptr
     ({                                                                                             \
       if (__builtin_expect(with_debug_output, 0) && bpf_get_current_pid_tgid() >> 32 == (tgid)) {  \
         printt("coredumping process %d", (tgid));                                                  \
-        long (*bpf_send_signal_thread)(u32 sig) = (void *)BPF_FUNC_send_signal_thread;             \
         bpf_send_signal_thread(SIGTRAP);                                                           \
       }                                                                                            \
     })

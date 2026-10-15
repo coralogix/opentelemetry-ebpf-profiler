@@ -8,11 +8,10 @@ package process // import "go.opentelemetry.io/ebpf-profiler/process"
 import (
 	"debug/elf"
 	"io"
+	"io/fs"
 	"strings"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
-	"go.opentelemetry.io/ebpf-profiler/processcontext"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
@@ -59,7 +58,14 @@ func (m *RawMapping) IsAnonymous() bool {
 }
 
 func (m *RawMapping) IsFileBacked() bool {
-	return m.Path != "" && !m.IsVDSO() && !m.IsMemFD()
+	return m.Path != "" && !m.IsVDSO() && !m.IsMemFD() && !m.IsPrctlNamed()
+}
+
+// IsPrctlNamed returns true if the mapping was named via prctl(PR_SET_VMA),
+// which gives anonymous mappings a path like "[anon:name]". These are still
+// anonymous memory, not file-backed.
+func (m *RawMapping) IsPrctlNamed() bool {
+	return strings.HasPrefix(m.Path, "[anon:")
 }
 
 func (m *RawMapping) IsMemFD() bool {
@@ -97,32 +103,28 @@ type MachineData struct {
 	DataPACMask uint64
 }
 
-// ReadAtCloser combines the io.ReaderAt and io.Closer interfaces.
-type ReadAtCloser = pfelf.ReadAtCloser
-
-// MetaConfig provides options that influences gathering ProcessMeta.
-type MetaConfig struct {
-	// IncludeEnvVars holds a list of env vars that should be captured from the process.
-	IncludeEnvVars libpf.Set[string]
-}
-
 // ProcessMeta contains metadata about a tracked process.
-type ProcessMeta struct {
-	// process name retrieved from /proc/PID/comm
-	Name libpf.String
+type Meta struct {
 	// executable path retrieved from /proc/PID/exe
 	Executable libpf.String
-	// process env vars from /proc/PID/environ
+	// process env vars from /proc/PID/environ that may be reported
 	EnvVariables map[libpf.String]libpf.String
+	// process env vars captured for the profiler's own use. Overlaps
+	// EnvVariables when the user also asked to report one of them.
+	InternalEnvVariables map[libpf.String]libpf.String
 	// container ID retrieved from /proc/PID/cgroup
 	ContainerID libpf.String
-	// process context
-	ProcessContextInfo processcontext.Info
+
+	// ExtraMeta holds arbitrary key-value pairs populated by a MetaEnricher.
+	// It is nil unless an enricher is configured and explicitly sets values.
+	// Must be treated as read-only after enricher logic has executed: access is
+	// not synchronized, so concurrent writes will trigger data races.
+	ExtraMeta map[libpf.String]string
 }
 
 // Process is the interface to inspect ELF coredump/process.
 // The current implementations do not allow concurrent access to this interface
-// from different goroutines. As an exception the ELFOpener and the returned
+// from different goroutines. As an exception the fs.FS and the returned
 // GetRemoteMemory object are safe for concurrent use.
 type Process interface {
 	// PID returns the process identifier.
@@ -132,7 +134,7 @@ type Process interface {
 	GetMachineData() MachineData
 
 	// GetProcessMeta returns process specific metadata.
-	GetProcessMeta(MetaConfig) ProcessMeta
+	GetProcessMeta([]MetaEnricher) Meta
 
 	// GetExe returns the executable path of the process.
 	GetExe() (libpf.String, error)
@@ -151,8 +153,11 @@ type Process interface {
 	// GetRemoteMemory returns a remote memory reader accessing the target process.
 	GetRemoteMemory() remotememory.RemoteMemory
 
-	// OpenMappingFile returns ReadAtCloser accessing the backing file of the mapping.
-	OpenMappingFile(*RawMapping) (ReadAtCloser, error)
+	// OpenMappingFile returns the backing file of the mapping. The returned
+	// fs.File is of the same kind as those returned by Open (in particular it
+	// implements io.ReaderAt), but it may also be able to access the file
+	// even if it was deleted or replaced on disk after being mapped.
+	OpenMappingFile(*RawMapping) (fs.File, error)
 
 	// GetMappingFileLastModifed returns the timestamp when the backing file was last modified
 	// or zero if an error occurs or mapping file is not accessible via filesystem.
@@ -163,5 +168,28 @@ type Process interface {
 
 	io.Closer
 
-	pfelf.ELFOpener
+	// FS opens files in the process's file system namespace. As required by
+	// fs.FS, names are unrooted (e.g. "usr/lib/libc.so.6" for the absolute
+	// path "/usr/lib/libc.so.6"). Callers that have a RawMapping should use
+	// OpenMappingFile instead, which can open the backing file even if it was
+	// deleted or replaced on disk.
+	fs.FS
+}
+
+// MetaEnricher is called once per process when it is first observed.
+// Implementations may read from /proc or any other source and store arbitrary
+// key-value pairs in meta.ExtraMeta. The call happens while the process is still
+// alive, so short-lived process data is reliably captured.
+type MetaEnricher interface {
+	// EnrichMeta is called with the process's /proc/<pid>/ base path (including
+	// trailing slash) and a pointer to the Meta to populate.
+	EnrichMeta(string, *Meta)
+}
+
+// MetaEnricherFunc is an adapter to allow use of plain functions as a
+// MetaEnricher.
+type MetaEnricherFunc func(string, *Meta)
+
+func (f MetaEnricherFunc) EnrichMeta(procBase string, meta *Meta) {
+	f(procBase, meta)
 }

@@ -16,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/elastic/go-freelru"
+
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/libpf/hash"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfunsafe"
@@ -129,7 +130,13 @@ type beamInstance struct {
 	mappingGeneration uint32
 }
 
-func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
+func GetLoader(_ Config) interpreter.Loader {
+	return interpreter.NewLoader(loader, []interpreter.InterpreterResource{
+		{MapName: BPFMapName, ProgID: uint32(support.ProgUnwindBEAM), ProgName: "unwind_beam"},
+	})
+}
+
+func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {
 	matches := beamRegex.FindStringSubmatch(info.FileName())
 	if matches == nil {
 		return nil, nil
@@ -147,7 +154,7 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	// Slice off the null-terminator before parsing
 	otpRelease, err := strconv.ParseUint(string(otpReleaseString[:len(otpReleaseString)-1]), 10, 32)
 	if err != nil || otpRelease > 255 {
-		return nil, fmt.Errorf("Invalid OTP Release: %v", otpReleaseString)
+		return nil, fmt.Errorf("invalid OTP Release: %v", otpReleaseString)
 	}
 
 	_, ertsVersion, err := ef.SymbolData("etp_erts_version", 64)
@@ -282,13 +289,14 @@ func hashMFA(key beamMfa) uint32 {
 	return uint32(hash.Uint64(uint64(mfhash)<<32 | uint64(key.arity)))
 }
 
-func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libpf.Address, rm remotememory.RemoteMemory) (interpreter.Instance, error) {
+func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libpf.Address,
+	rm remotememory.RemoteMemory) (interpreter.Instance, error) {
 	log.Debugf("BEAM attaching, OTP %d, ERTS %s, bias: 0x%x", d.otpRelease, d.ertsVersion, bias)
 
 	data := support.BEAMProcInfo{
 		R:                     uint64(bias + d.r),
 		The_active_code_index: uint64(bias + d.theActiveCodeIndex),
-		Beam_normal_exit:      uint64(bias + d.beamNormalExit),
+		Beam_normal_exit:      rm.Uint64(bias + d.beamNormalExit),
 		Ranges_sizeof:         uint8(d.vmStructs.ranges.sizeOf),
 	}
 
@@ -335,6 +343,10 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 }
 
 func (d *beamData) Unload(_ interpreter.EbpfHandler) {
+}
+
+func (i *beamInstance) UsesAnonymousMappings() bool {
+	return true
 }
 
 func (i *beamInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler, _ reporter.ExecutableReporter, pr process.Process, mappings []process.RawMapping) error {

@@ -22,6 +22,8 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/collector/internal/metadata"
 	"go.opentelemetry.io/ebpf-profiler/internal/controller"
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
 )
 
 var errInvalidConfig = errors.New("invalid config")
@@ -40,9 +42,10 @@ func defaultConfig() component.Config {
 		ReporterJitter:         0.2,
 		MonitorInterval:        5 * time.Second,
 		SamplesPerSecond:       20,
+		FrameCacheSize:         uint(pm.DefaultFrameCacheSize),
 		ProbabilisticInterval:  1 * time.Minute,
 		ProbabilisticThreshold: 100,
-		Tracers:                "all",
+		Interpreters:           interpreterconfig.AllInterpreters(),
 		ClockSyncInterval:      3 * time.Minute,
 		MaxGRPCRetries:         5,
 		MaxRPCMsgSize:          32 << 20, // 32 MiB
@@ -70,10 +73,11 @@ func BuildProfilesReceiver(options ...Option) xreceiver.CreateProfilesFunc {
 		}
 
 		controlerCfg := &controller.Config{
-			Config:             *cfg,
-			ExecutableReporter: controllerOption.executableReporter,
-			ReporterFactory:    controllerOption.reporterFactory,
-			OnShutdown:         controllerOption.onShutdown,
+			Config:               *cfg,
+			ExecutableReporter:   controllerOption.executableReporter,
+			ProcessMetaEnrichers: controllerOption.processMetaEnrichers,
+			ReporterFactory:      controllerOption.reporterFactory,
+			OnShutdown:           controllerOption.onShutdown,
 		}
 
 		return internal.NewController(controlerCfg, rs, nextConsumer)
