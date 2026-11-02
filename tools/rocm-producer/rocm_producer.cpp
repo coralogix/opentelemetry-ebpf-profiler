@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // libotelrocm.so — rocprofiler-sdk tool library (ROCP_TOOL_LIBRARIES), a
-// reference producer of the otel_gpu USDT probes for AMD GPUs, the ROCm
+// reference producer of the otel_gpu_v1 USDT probe for AMD GPUs, the ROCm
 // counterpart of tools/cupti-producer. The contract is
-// probes/gpu/otel_gpu_usdt.h.
+// probes/gpu/otel_gpu_v1_usdt.h.
 //
 // C++ only because the rocprofiler-sdk headers are: the code avoids the C++
 // standard library, so the library does not depend on libstdc++ (it loads
@@ -12,6 +12,7 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -20,39 +21,23 @@
 #include <rocprofiler-sdk/registration.h>
 #include <rocprofiler-sdk/rocprofiler.h>
 
-#define OTEL_GPU_SEMAPHORES
-#include "otel_gpu_usdt.h"
+#define OTEL_GPU_SEMAPHORE
+#include "otel_gpu_v1_usdt.h"
 #include "sampler.h"
 
 #define BUFFER_SIZE      (8u << 20)
 #define BUFFER_WATERMARK (BUFFER_SIZE / 2)
 
+/* g_context follows HIP calls, ranges and code objects all along;
+ * g_trace_context records GPU work only while the profiler is attached. */
 static rocprofiler_context_id_t g_context;
+static rocprofiler_context_id_t g_trace_context;
 static rocprofiler_buffer_id_t g_buffer;
 static int g_enabled;
 
-/* ─── Errors ─────────────────────────────────────────────────────────────────
- * An error fired at startup races the profiler attaching, so the last one is
- * re-emitted periodically and at exit. msg is static. */
-static pthread_mutex_t g_err_mu = PTHREAD_MUTEX_INITIALIZER;
-static struct otel_gpu_error_rec g_last_err;
-static int g_err_started;
-
-static void *error_reemit_thread(void *)
+static void log_error(int code, const char *msg)
 {
-  unsigned interval = 60;
-  const char *s     = getenv("OTEL_GPU_ERROR_REEMIT_S");
-  if (s && atoi(s) > 0) {
-    interval = (unsigned)atoi(s);
-  }
-  for (;;) {
-    sleep(interval);
-    pthread_mutex_lock(&g_err_mu);
-    struct otel_gpu_error_rec rec = g_last_err;
-    pthread_mutex_unlock(&g_err_mu);
-    OTEL_GPU_PROBE(error, &rec);
-  }
-  return NULL;
+  fprintf(stderr, "otelrocm: %s (%d)\n", msg, code);
 }
 
 static void start_thread(void *(*fn)(void *))
@@ -65,26 +50,14 @@ static void start_thread(void *(*fn)(void *))
   pthread_attr_destroy(&a);
 }
 
-static void emit_error(int code, const char *msg)
-{
-  struct otel_gpu_error_rec rec = {};
-  rec.code                      = code;
-  rec.msg_ptr                   = (uint64_t)(uintptr_t)msg;
-  OTEL_GPU_PROBE(error, &rec);
-  pthread_mutex_lock(&g_err_mu);
-  g_last_err = rec;
-  if (!g_err_started) {
-    g_err_started = 1;
-    start_thread(error_reemit_thread);
-  }
-  pthread_mutex_unlock(&g_err_mu);
-}
-
 /* ─── Interned strings ──────────────────────────────────────────────────────
- * The profiler reads names from the process memory later, so every string
- * passed in a record is copied here once and never freed. Insert-only
- * open-addressed table: lock-free reads, inserts take the mutex. */
-#define STRING_POOL_SLOTS 8192
+ * Kernel names and range stacks are looked up when the work of a call is
+ * reported, from another thread, so each is copied here once and never freed.
+ * Insert-only open-addressed table: lock-free reads, inserts take the mutex. */
+#define STRING_POOL_SLOTS  (1 << 16)
+/* Slots looked at for a string: a string not found within them is not kept, so
+ * a full pool costs a few comparisons rather than a scan of all of it. */
+#define STRING_POOL_PROBES 64
 
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static const char *g_pool[STRING_POOL_SLOTS];
@@ -104,14 +77,14 @@ static const char *intern(const char *s)
     return NULL;
   }
   const uint32_t h = fnv1a(s);
-  for (uint32_t i = 0; i < STRING_POOL_SLOTS; i++) {
+  for (uint32_t i = 0; i < STRING_POOL_PROBES; i++) {
     uint32_t slot = (h + i) & (STRING_POOL_SLOTS - 1);
     const char *p = __atomic_load_n(&g_pool[slot], __ATOMIC_ACQUIRE);
     if (p == NULL) {
       pthread_mutex_lock(&g_pool_mu);
       /* Re-probe under the lock: another thread may have inserted. */
       const char *found = NULL;
-      for (; i < STRING_POOL_SLOTS; i++) {
+      for (; i < STRING_POOL_PROBES; i++) {
         slot = (h + i) & (STRING_POOL_SLOTS - 1);
         p    = g_pool[slot];
         if (p == NULL) {
@@ -172,13 +145,24 @@ static const char *kernel_name(uint64_t id)
   return NULL;
 }
 
-/* ─── GPU indexes ───────────────────────────────────────────────────────────
- * Records name agents by opaque handle; the contract wants a device index. */
+/* ─── GPUs ──────────────────────────────────────────────────────────────────
+ * Records name agents by opaque handle; the contract wants the GPU's UUID. */
 #define MAX_AGENTS 64
 
 static uint64_t g_agent_handle[MAX_AGENTS];
-static int32_t g_agent_gpu[MAX_AGENTS]; /* GPU index, -1 for other agents */
+/* UUID of each GPU agent, 8-4-4-4-12 hex digits; empty for other agents */
+static char g_agent_uuid[MAX_AGENTS][sizeof("00000000-0000-0000-0000-000000000000")];
 static size_t g_num_agents;
+
+static void format_uuid(char *out, const rocprofiler_uuid_t *uuid)
+{
+  for (size_t i = 0; i < sizeof(uuid->bytes); i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) {
+      *out++ = '-';
+    }
+    out += sprintf(out, "%02x", uuid->bytes[i]);
+  }
+}
 
 static rocprofiler_status_t
 collect_agents(rocprofiler_agent_version_t, const void **agents, size_t num_agents, void *)
@@ -186,20 +170,23 @@ collect_agents(rocprofiler_agent_version_t, const void **agents, size_t num_agen
   for (size_t i = 0; i < num_agents && g_num_agents < MAX_AGENTS; i++) {
     const rocprofiler_agent_v0_t *a = (const rocprofiler_agent_v0_t *)agents[i];
     g_agent_handle[g_num_agents]    = a->id.handle;
-    g_agent_gpu[g_num_agents] = a->type == ROCPROFILER_AGENT_TYPE_GPU ? a->logical_node_type_id : -1;
+    if (a->type == ROCPROFILER_AGENT_TYPE_GPU) {
+      format_uuid(g_agent_uuid[g_num_agents], &a->uuid);
+    }
     g_num_agents++;
   }
   return ROCPROFILER_STATUS_SUCCESS;
 }
 
-static int32_t gpu_index(rocprofiler_agent_id_t agent)
+/* Returns the UUID of a GPU agent, or NULL for other agents. */
+static const char *gpu_uuid(rocprofiler_agent_id_t agent)
 {
   for (size_t i = 0; i < g_num_agents; i++) {
     if (g_agent_handle[i] == agent.handle) {
-      return g_agent_gpu[i];
+      return g_agent_uuid[i][0] ? g_agent_uuid[i] : NULL;
     }
   }
-  return -1;
+  return NULL;
 }
 
 /* ─── Range stacks ──────────────────────────────────────────────────────────
@@ -215,7 +202,7 @@ static __thread const char *t_ranges;
 
 static void ranges_recompute(void)
 {
-  t_ranges = NULL;
+  t_ranges    = NULL;
   const int n = t_range_depth < RANGE_MAX_DEPTH ? t_range_depth : RANGE_MAX_DEPTH;
   static __thread char buf[1024];
   size_t off = 0;
@@ -257,72 +244,77 @@ static void range_pop(void)
   ranges_recompute();
 }
 
-/* ─── Call sites by correlation id ──────────────────────────────────────────
- * Every tracked call site leaves its sample weight (0 if not sampled), its
- * ranges and whether it launches a graph here, for the buffer callback to
- * filter and label its GPU records. Direct-mapped on sequential correlation
- * ids, so it holds the last CALL_SITE_SLOTS calls. Correlation ids are 64-bit
- * in rocprofiler-sdk; the contract carries the low 32 bits. */
-#define CALL_SITE_SLOTS (1 << 19)
+/* ─── Calls by correlation id ───────────────────────────────────────────────
+ * Every tracked call leaves its sample weight and its ranges here, for the
+ * buffer callback to filter, weigh and label its GPU records. Direct-mapped on
+ * the low 32 bits of the sequential correlation ids, so it holds the last
+ * CALL_SLOTS calls. */
+#define CALL_SLOTS (1 << 20)
 
-static uint64_t g_site_key[CALL_SITE_SLOTS]; /* correlation id << 32 | weight */
-static const char *g_site_ranges[CALL_SITE_SLOTS];
-static uint8_t g_site_graph[CALL_SITE_SLOTS];
+/* low 32 bits of the correlation id << 32 | sample weight, 0 if not sampled */
+static uint64_t g_call_key[CALL_SLOTS];
+static const char *g_call_ranges[CALL_SLOTS];
 
-static void remember_call_site(uint32_t corr, uint32_t weight, const char *ranges, int graph)
+/* Timestamp at which tracing started, UINT64_MAX while it is off: the GPU work
+ * of an untracked call that started earlier may come from before the profiler
+ * attached. */
+static uint64_t g_tracing_since = UINT64_MAX;
+/* Whether GPU work is recorded: LAUNCH events are sent only then. */
+static int g_tracing;
+
+static void remember_call(uint64_t corr, uint32_t weight, const char *ranges)
 {
-  if (corr == 0) {
+  const uint32_t id = (uint32_t)corr;
+  if (id == 0) {
     return;
   }
-  const uint32_t h = corr & (CALL_SITE_SLOTS - 1);
-  __atomic_store_n(&g_site_ranges[h], ranges, __ATOMIC_RELEASE);
-  __atomic_store_n(&g_site_graph[h], (uint8_t)graph, __ATOMIC_RELEASE);
-  __atomic_store_n(&g_site_key[h], (uint64_t)corr << 32 | weight, __ATOMIC_RELEASE);
+  const uint32_t h = id & (CALL_SLOTS - 1);
+  __atomic_store_n(&g_call_ranges[h], ranges, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_call_key[h], (uint64_t)id << 32 | weight, __ATOMIC_RELEASE);
 }
 
-/* Returns the sample weight of the GPU records of call corr, 0 to drop them,
- * with its ranges and graph flag. Records of untracked calls count once. */
-static uint32_t call_site_weight(uint32_t corr, const char **ranges, int *graph)
+/* Returns the sample weight of the call corr, 0 if its GPU records are not
+ * reported, with its ranges. The records of an untracked call, which sent no
+ * LAUNCH event, count once if they started after tracing did. */
+static uint32_t call_weight(uint64_t corr, uint64_t start, const char **ranges)
 {
-  *ranges = NULL;
-  *graph  = 0;
-  if (corr == 0) {
-    return 1;
-  }
-  const uint32_t h    = corr & (CALL_SITE_SLOTS - 1);
-  const uint64_t key  = __atomic_load_n(&g_site_key[h], __ATOMIC_ACQUIRE);
-  const uint32_t site = (uint32_t)(key >> 32);
-  if (key != 0 && site == corr) {
-    *ranges = __atomic_load_n(&g_site_ranges[h], __ATOMIC_ACQUIRE);
-    *graph  = __atomic_load_n(&g_site_graph[h], __ATOMIC_ACQUIRE);
-    return (uint32_t)key;
-  }
-  if (key != 0 && (int32_t)(site - corr) > 0) {
-    /* A later call took the slot: whether this one was sampled is lost. */
-    static int reported;
-    if (!__atomic_exchange_n(&reported, 1, __ATOMIC_RELAXED)) {
-      emit_error(-1, "call site table too small: GPU records were dropped");
+  *ranges           = NULL;
+  const uint32_t id = (uint32_t)corr;
+  if (id != 0) {
+    const uint32_t h    = id & (CALL_SLOTS - 1);
+    const uint64_t key  = __atomic_load_n(&g_call_key[h], __ATOMIC_ACQUIRE);
+    const uint32_t call = (uint32_t)(key >> 32);
+    if (key != 0 && call == id) {
+      *ranges = __atomic_load_n(&g_call_ranges[h], __ATOMIC_ACQUIRE);
+      return (uint32_t)key;
     }
-    return 0;
+    if (key != 0 && (int32_t)(call - id) > 0) {
+      /* A later call took the slot: whether this one was sampled is lost. */
+      static int reported;
+      if (!__atomic_exchange_n(&reported, 1, __ATOMIC_RELAXED)) {
+        log_error(-1, "call table too small: GPU records were dropped");
+      }
+      return 0;
+    }
   }
-  return 1;
+  return start >= __atomic_load_n(&g_tracing_since, __ATOMIC_ACQUIRE) ? 1 : 0;
 }
 
-/* ─── Call site sampling ────────────────────────────────────────────────────
+/* ─── Call sampling ──────────────────────────────────────────────────────────
  * Same classes and defaults as the CUDA producer. */
-enum call_site_class {
-  SITE_KERNEL,
-  SITE_GRAPH,
-  SITE_MEMORY,
-  SITE_ALLOC,
-  SITE_CLASSES,
+enum call_class {
+  CALL_UNTRACKED,
+  CALL_KERNEL,
+  CALL_GRAPH,
+  CALL_MEMORY,
+  CALL_CLASSES,
 };
 
 #define DEFAULT_SAMPLE_RATE       200
 #define DEFAULT_GRAPH_SAMPLE_RATE 20
 
-static uint32_t g_sample_rate[SITE_CLASSES];
-static __thread struct otel_sampler t_samplers[SITE_CLASSES];
+static uint32_t g_sample_rate[CALL_CLASSES];
+static __thread struct otel_sampler t_samplers[CALL_CLASSES];
 static __thread uint64_t t_rng;
 
 static uint64_t now_ns(void)
@@ -332,7 +324,7 @@ static uint64_t now_ns(void)
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static uint32_t sample_call_site(enum call_site_class cls)
+static uint32_t sample_call(enum call_class cls)
 {
   const uint64_t now = now_ns();
   if (t_rng == 0) {
@@ -352,80 +344,189 @@ static uint32_t env_rate(const char *name, uint32_t fallback)
   return (*end == '\0' && v <= UINT32_MAX) ? (uint32_t)v : fallback;
 }
 
-/* Tracked HIP calls: they fire on_launch. */
+/* Tracked HIP calls send LAUNCH events: those that launch kernels or graphs,
+ * or copy or fill memory. ROCm versions number HIP calls differently and add
+ * new ones, so they are found by name at start. The first matching prefix
+ * decides. */
 static const struct {
-  rocprofiler_tracing_operation_t operation;
-  enum call_site_class cls;
-} g_call_sites[] = {
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipLaunchKernel, SITE_KERNEL},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipLaunchKernelExC, SITE_KERNEL},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipExtLaunchKernel, SITE_KERNEL},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipLaunchCooperativeKernel, SITE_KERNEL},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipModuleLaunchKernel, SITE_KERNEL},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipExtModuleLaunchKernel, SITE_KERNEL},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphLaunch, SITE_GRAPH},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpy, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyAsync, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyWithStream, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyHtoD, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyHtoDAsync, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyDtoH, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyDtoHAsync, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyDtoD, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyDtoDAsync, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpy2DAsync, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemset, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemsetAsync, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemsetD8Async, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMemsetD32Async, SITE_MEMORY},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMalloc, SITE_ALLOC},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipMallocAsync, SITE_ALLOC},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipFree, SITE_ALLOC},
-  {ROCPROFILER_HIP_RUNTIME_API_ID_hipFreeAsync, SITE_ALLOC},
+  const char *prefix;
+  enum call_class cls;
+} g_call_prefixes[] = {
+  /* Host functions run on the CPU. */
+  {"hipLaunchHostFunc", CALL_UNTRACKED},
+  {"hipGraphLaunch", CALL_GRAPH},
+  {"hipLaunch", CALL_KERNEL},
+  {"hipExtLaunch", CALL_KERNEL},
+  {"hipModuleLaunch", CALL_KERNEL},
+  {"hipExtModuleLaunch", CALL_KERNEL},
+  {"hipMemcpy", CALL_MEMORY},
+  {"hipMemset", CALL_MEMORY},
 };
-#define NUM_CALL_SITES (sizeof(g_call_sites) / sizeof(g_call_sites[0]))
 
-static int call_site_class(rocprofiler_tracing_operation_t operation)
+/* The class of each HIP operation; filled at start. */
+#define MAX_HIP_OPERATIONS 4096
+static uint8_t g_operation_class[MAX_HIP_OPERATIONS];
+
+/* The tracked operations this ROCm version has, found at start. */
+struct tracked_operations {
+  rocprofiler_tracing_operation_t ids[MAX_HIP_OPERATIONS];
+  size_t count;
+};
+
+static enum call_class classify_call(const char *name)
 {
-  for (size_t i = 0; i < NUM_CALL_SITES; i++) {
-    if (g_call_sites[i].operation == operation) {
-      return g_call_sites[i].cls;
+  for (size_t i = 0; i < sizeof(g_call_prefixes) / sizeof(g_call_prefixes[0]); i++) {
+    const char *prefix = g_call_prefixes[i].prefix;
+    if (strncmp(name, prefix, strlen(prefix)) == 0) {
+      return g_call_prefixes[i].cls;
     }
   }
-  return -1;
+  return CALL_UNTRACKED;
+}
+
+static int track_call(
+  rocprofiler_callback_tracing_kind_t kind, rocprofiler_tracing_operation_t operation, void *data)
+{
+  struct tracked_operations *tracked = (struct tracked_operations *)data;
+  const char *name                   = NULL;
+  uint64_t len                       = 0;
+  if (
+    operation < 0 || operation >= MAX_HIP_OPERATIONS ||
+    rocprofiler_query_callback_tracing_kind_operation_name(kind, operation, &name, &len) !=
+      ROCPROFILER_STATUS_SUCCESS ||
+    !name) {
+    return 0;
+  }
+  const enum call_class cls = classify_call(name);
+  if (cls != CALL_UNTRACKED) {
+    g_operation_class[operation]   = (uint8_t)cls;
+    tracked->ids[tracked->count++] = operation;
+  }
+  return 0;
+}
+
+static enum call_class call_class(rocprofiler_tracing_operation_t operation)
+{
+  if (operation < 0 || operation >= MAX_HIP_OPERATIONS) {
+    return CALL_UNTRACKED;
+  }
+  return (enum call_class)g_operation_class[operation];
+}
+
+/* ─── Tracing while the profiler is attached ────────────────────────────────
+ * GPU work is recorded only while the probe's semaphore is raised, so the
+ * producer costs little without a profiler: a check of the semaphore at each
+ * tracked call. */
+static pthread_mutex_t g_tracing_mu = PTHREAD_MUTEX_INITIALIZER;
+/* Set once tracing could not start: the producer then reports nothing. */
+static int g_tracing_failed;
+
+/* Follows the probe's semaphore: on when the profiler attached, off when it
+ * left. */
+static void update_tracing(void)
+{
+  const int want = OTEL_GPU_ENABLED() != 0;
+  if (!g_enabled || want == __atomic_load_n(&g_tracing, __ATOMIC_ACQUIRE)) {
+    return;
+  }
+  pthread_mutex_lock(&g_tracing_mu);
+  if (want != g_tracing && !g_tracing_failed) {
+    if (want) {
+      rocprofiler_timestamp_t now = 0;
+      rocprofiler_get_timestamp(&now);
+      __atomic_store_n(&g_tracing_since, now, __ATOMIC_RELEASE);
+      const rocprofiler_status_t status = rocprofiler_start_context(g_trace_context);
+      if (status == ROCPROFILER_STATUS_SUCCESS) {
+        __atomic_store_n(&g_tracing, 1, __ATOMIC_RELEASE);
+      } else {
+        log_error((int)status, "starting tracing failed; GPU profiling disabled");
+        __atomic_store_n(&g_tracing_since, UINT64_MAX, __ATOMIC_RELEASE);
+        g_tracing_failed = 1;
+      }
+    } else {
+      __atomic_store_n(&g_tracing, 0, __ATOMIC_RELEASE);
+      __atomic_store_n(&g_tracing_since, UINT64_MAX, __ATOMIC_RELEASE);
+      const rocprofiler_status_t status = rocprofiler_stop_context(g_trace_context);
+      if (status != ROCPROFILER_STATUS_SUCCESS) {
+        log_error((int)status, "stopping tracing failed");
+      }
+    }
+  }
+  pthread_mutex_unlock(&g_tracing_mu);
+}
+
+/* ─── Events ──────────────────────────────────────────────────────────────── */
+
+/* emit_event is the only place firing the probe, so the profiler attaches one
+ * uprobe to the library. */
+__attribute__((noinline)) static void emit_event(const struct otel_gpu_event *ev)
+{
+  OTEL_GPU_EVENT(ev);
+}
+
+static void
+begin_event(struct otel_gpu_event *ev, enum otel_gpu_kind kind, uint64_t corr, uint32_t weight)
+{
+  ev->correlation_id = corr;
+  ev->sample_weight  = weight;
+  ev->kind           = (uint16_t)kind;
+  ev->payload_size   = 0;
+}
+
+/* put_work adds the fields of an event of GPU work: the GPU, how long it took,
+ * how many bytes it moved, its name, and the ranges at its call, innermost
+ * first. Names come last: one too long for the payload is cut short, and must
+ * not crowd out the others. */
+static void put_work(
+  struct otel_gpu_event *ev,
+  const char *gpu,
+  uint64_t start,
+  uint64_t end,
+  uint64_t bytes,
+  const char *name,
+  const char *ranges)
+{
+  otel_gpu_put_string(ev, OTEL_GPU_FIELD_GPU, gpu);
+  otel_gpu_put_uint(ev, OTEL_GPU_FIELD_DURATION_NS, end > start ? end - start : 0);
+  otel_gpu_put_uint(ev, OTEL_GPU_FIELD_BYTES, bytes);
+  otel_gpu_put_string(ev, OTEL_GPU_FIELD_NAME, name);
+  for (const char *range = ranges; range && *range;) {
+    const char *sep  = strchr(range, RANGE_SEP);
+    const size_t len = sep ? (size_t)(sep - range) : strlen(range);
+    otel_gpu_put_bytes(ev, OTEL_GPU_FIELD_RANGES, range, len);
+    range = sep ? sep + 1 : NULL;
+  }
 }
 
 /* ─── Callbacks on the application's threads ─────────────────────────────── */
 
-static void hip_api_callback(rocprofiler_callback_tracing_record_t record,
-                             rocprofiler_user_data_t *,
-                             void *)
+static void
+hip_api_callback(rocprofiler_callback_tracing_record_t record, rocprofiler_user_data_t *, void *)
 {
   if (record.phase != ROCPROFILER_CALLBACK_PHASE_ENTER) {
     return;
   }
-  const int cls = call_site_class(record.operation);
-  if (cls < 0) {
+  const enum call_class cls = call_class(record.operation);
+  if (cls == CALL_UNTRACKED) {
     return;
   }
-  const uint32_t corr = (uint32_t)record.correlation_id.internal;
+  const uint64_t corr = record.correlation_id.internal;
 
-  // Sampled call sites fire on_launch, the host stack keyed by correlation id.
-  // Without a profiler attached none is: its GPU records would lack the stack.
-  const uint32_t weight =
-    OTEL_GPU_ENABLED(ready) ? sample_call_site((enum call_site_class)cls) : 0;
+  // Sampled calls send a LAUNCH event, for the profiler to record the host
+  // stack under the correlation id. None is sent while GPU work is not
+  // recorded: the call's GPU records would never come.
+  const int reporting   = OTEL_GPU_ENABLED() && __atomic_load_n(&g_tracing, __ATOMIC_ACQUIRE);
+  const uint32_t weight = reporting ? sample_call(cls) : 0;
   if (weight != 0) {
-    struct otel_gpu_launch_rec rec = {};
-    rec.correlation_id             = corr;
-    rec.sample_weight              = weight;
-    OTEL_GPU_PROBE(on_launch, &rec);
+    struct otel_gpu_event ev;
+    begin_event(&ev, OTEL_GPU_LAUNCH, corr, weight);
+    emit_event(&ev);
   }
-  remember_call_site(corr, weight, weight != 0 ? t_ranges : NULL, cls == SITE_GRAPH);
+  remember_call(corr, weight, weight != 0 ? t_ranges : NULL);
 }
 
-static void marker_callback(rocprofiler_callback_tracing_record_t record,
-                            rocprofiler_user_data_t *,
-                            void *)
+static void
+marker_callback(rocprofiler_callback_tracing_record_t record, rocprofiler_user_data_t *, void *)
 {
   if (record.phase != ROCPROFILER_CALLBACK_PHASE_ENTER) {
     return;
@@ -441,12 +542,12 @@ static void marker_callback(rocprofiler_callback_tracing_record_t record,
   }
 }
 
-static void code_object_callback(rocprofiler_callback_tracing_record_t record,
-                                 rocprofiler_user_data_t *,
-                                 void *)
+static void code_object_callback(
+  rocprofiler_callback_tracing_record_t record, rocprofiler_user_data_t *, void *)
 {
-  if (record.operation != ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER ||
-      record.phase != ROCPROFILER_CALLBACK_PHASE_LOAD) {
+  if (
+    record.operation != ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER ||
+    record.phase != ROCPROFILER_CALLBACK_PHASE_LOAD) {
     return;
   }
   const rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t *data =
@@ -456,101 +557,72 @@ static void code_object_callback(rocprofiler_callback_tracing_record_t record,
 
 /* ─── GPU records ───────────────────────────────────────────────────────────── */
 
-static uint32_t copy_kind(rocprofiler_memory_copy_operation_t operation)
+/* Names where the data of a copy went. */
+static const char *copy_name(rocprofiler_memory_copy_operation_t operation)
 {
   switch (operation) {
-  case ROCPROFILER_MEMORY_COPY_HOST_TO_DEVICE: return OTEL_GPU_COPY_HTOD;
-  case ROCPROFILER_MEMORY_COPY_DEVICE_TO_HOST: return OTEL_GPU_COPY_DTOH;
-  case ROCPROFILER_MEMORY_COPY_DEVICE_TO_DEVICE: return OTEL_GPU_COPY_DTOD;
-  case ROCPROFILER_MEMORY_COPY_HOST_TO_HOST: return OTEL_GPU_COPY_HTOH;
-  default: return 0;
+  case ROCPROFILER_MEMORY_COPY_HOST_TO_DEVICE: return "HtoD";
+  case ROCPROFILER_MEMORY_COPY_DEVICE_TO_HOST: return "DtoH";
+  case ROCPROFILER_MEMORY_COPY_DEVICE_TO_DEVICE: return "DtoD";
+  case ROCPROFILER_MEMORY_COPY_HOST_TO_HOST: return "HtoH";
+  default: return NULL;
   }
 }
 
 static void kernel_dispatch(const rocprofiler_buffer_tracing_kernel_dispatch_record_t *k)
 {
-  const uint32_t corr = (uint32_t)k->correlation_id.internal;
+  const uint64_t corr = k->correlation_id.internal;
   const char *ranges;
-  int graph;
-  const uint32_t weight = call_site_weight(corr, &ranges, &graph);
+  const uint32_t weight = call_weight(corr, k->start_timestamp, &ranges);
   if (weight == 0) {
     return;
   }
-  const char *name               = kernel_name(k->dispatch_info.kernel_id);
-  struct otel_gpu_kernel_rec rec = {};
-  rec.start                      = k->start_timestamp;
-  rec.end                        = k->end_timestamp;
-  rec.correlation_id             = corr;
-  rec.device_id                  = (uint32_t)gpu_index(k->dispatch_info.agent_id);
-  rec.stream_id                  = (uint32_t)k->dispatch_info.queue_id.handle;
-  // HIP does not report graph ids: any nonzero id keeps the launch for the
-  // other kernels of the graph.
-  rec.graph_id                   = graph ? 1 : 0;
-  rec.name_ptr                   = (uint64_t)(uintptr_t)(name ? name : "");
-  rec.ranges_ptr                 = (uint64_t)(uintptr_t)ranges;
-  rec.sample_weight              = weight;
-  OTEL_GPU_PROBE(kernel_executed, &rec);
+  struct otel_gpu_event ev;
+  begin_event(&ev, OTEL_GPU_KERNEL, corr, weight);
+  put_work(
+    &ev,
+    gpu_uuid(k->dispatch_info.agent_id),
+    k->start_timestamp,
+    k->end_timestamp,
+    0,
+    kernel_name(k->dispatch_info.kernel_id),
+    ranges);
+  emit_event(&ev);
 }
 
 static void memory_copy(const rocprofiler_buffer_tracing_memory_copy_record_t *m)
 {
-  const uint32_t corr = (uint32_t)m->correlation_id.internal;
+  const uint64_t corr = m->correlation_id.internal;
   const char *ranges;
-  int graph;
-  const uint32_t weight = call_site_weight(corr, &ranges, &graph);
+  const uint32_t weight = call_weight(corr, m->start_timestamp, &ranges);
   if (weight == 0) {
     return;
   }
-  const int32_t dst           = gpu_index(m->dst_agent_id);
-  struct otel_gpu_mem_rec rec = {};
-  rec.start                   = m->start_timestamp;
-  rec.end                     = m->end_timestamp;
-  rec.correlation_id          = corr;
-  rec.device_id               = (uint32_t)(dst >= 0 ? dst : gpu_index(m->src_agent_id));
-  rec.copy_kind               = copy_kind(m->operation);
-  rec.bytes                   = m->bytes;
-  rec.ranges_ptr              = (uint64_t)(uintptr_t)ranges;
-  rec.sample_weight           = weight;
-  OTEL_GPU_PROBE(gpu_mem, &rec);
+  const char *gpu = gpu_uuid(m->dst_agent_id);
+  struct otel_gpu_event ev;
+  begin_event(&ev, OTEL_GPU_COPY, corr, weight);
+  put_work(
+    &ev,
+    gpu ? gpu : gpu_uuid(m->src_agent_id),
+    m->start_timestamp,
+    m->end_timestamp,
+    m->bytes,
+    copy_name(m->operation),
+    ranges);
+  emit_event(&ev);
 }
 
-static void memory_allocation(const rocprofiler_buffer_tracing_memory_allocation_record_t *a)
+static void buffer_callback(
+  rocprofiler_context_id_t,
+  rocprofiler_buffer_id_t,
+  rocprofiler_record_header_t **headers,
+  size_t num_headers,
+  void *,
+  uint64_t drop_count)
 {
-  uint32_t kind;
-  switch (a->operation) {
-  case ROCPROFILER_MEMORY_ALLOCATION_ALLOCATE:
-  case ROCPROFILER_MEMORY_ALLOCATION_VMEM_ALLOCATE: kind = OTEL_GPU_EVENT_ALLOC; break;
-  case ROCPROFILER_MEMORY_ALLOCATION_FREE:
-  case ROCPROFILER_MEMORY_ALLOCATION_VMEM_FREE: kind = OTEL_GPU_EVENT_FREE; break;
-  default: return;
-  }
-  const uint32_t corr = (uint32_t)a->correlation_id.internal;
-  const char *ranges;
-  int graph;
-  const uint32_t weight = call_site_weight(corr, &ranges, &graph);
-  if (weight == 0) {
-    return;
-  }
-  struct otel_gpu_event_rec ev = {};
-  ev.start                     = a->start_timestamp;
-  ev.end                       = a->end_timestamp;
-  ev.kind                      = kind;
-  ev.correlation_id            = corr;
-  ev.v1                        = a->allocation_size;
-  ev.v2 = gpu_index(a->agent_id) >= 0 ? OTEL_GPU_MEMORY_DEVICE : OTEL_GPU_MEMORY_PINNED;
-  ev.sample_weight = weight;
-  OTEL_GPU_PROBE(gpu_event, &ev);
-}
-
-static void buffer_callback(rocprofiler_context_id_t,
-                            rocprofiler_buffer_id_t,
-                            rocprofiler_record_header_t **headers,
-                            size_t num_headers,
-                            void *,
-                            uint64_t drop_count)
-{
-  if (drop_count > 0) {
-    emit_error(-1, "rocprofiler buffer full: GPU records were dropped");
+  static int reported;
+  if (drop_count > 0 && !__atomic_exchange_n(&reported, 1, __ATOMIC_RELAXED)) {
+    log_error(-1, "rocprofiler buffer full: GPU records were dropped");
   }
   for (size_t i = 0; i < num_headers; i++) {
     const rocprofiler_record_header_t *h = headers[i];
@@ -564,22 +636,22 @@ static void buffer_callback(rocprofiler_context_id_t,
     case ROCPROFILER_BUFFER_TRACING_MEMORY_COPY:
       memory_copy((const rocprofiler_buffer_tracing_memory_copy_record_t *)h->payload);
       break;
-    case ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION:
-      memory_allocation(
-        (const rocprofiler_buffer_tracing_memory_allocation_record_t *)h->payload);
-      break;
     default: break;
     }
   }
 }
 
-/* Otherwise records sit until the buffer reaches its watermark, delaying
- * export and aging out the call site table. */
-static void *flush_thread(void *)
+/* Follows the profiler from here, not from the application's calls, which
+ * would wait while tracing starts or stops, and hands over the records of
+ * finished work: otherwise they sit until the buffer reaches its watermark. */
+static void *tracing_thread(void *)
 {
   for (;;) {
-    sleep(1);
-    rocprofiler_flush_buffer(g_buffer);
+    update_tracing();
+    if (__atomic_load_n(&g_tracing, __ATOMIC_ACQUIRE)) {
+      rocprofiler_flush_buffer(g_buffer);
+    }
+    usleep(500 * 1000);
   }
   return NULL;
 }
@@ -590,68 +662,88 @@ static void *flush_thread(void *)
   do {                                                                                             \
     const rocprofiler_status_t status_ = (call);                                                   \
     if (status_ != ROCPROFILER_STATUS_SUCCESS) {                                                   \
-      emit_error((int)status_, msg);                                                               \
+      log_error((int)status_, msg);                                                                \
       return -1;                                                                                   \
     }                                                                                              \
   } while (0)
 
 static int tool_init(rocprofiler_client_finalize_t, void *)
 {
-  g_sample_rate[SITE_KERNEL] = env_rate("OTEL_GPU_SAMPLE_RATE", DEFAULT_SAMPLE_RATE);
-  g_sample_rate[SITE_MEMORY] = g_sample_rate[SITE_KERNEL];
-  g_sample_rate[SITE_ALLOC]  = g_sample_rate[SITE_KERNEL];
+  g_sample_rate[CALL_KERNEL] = env_rate("OTEL_GPU_SAMPLE_RATE", DEFAULT_SAMPLE_RATE);
+  g_sample_rate[CALL_MEMORY] = g_sample_rate[CALL_KERNEL];
   /* Sampling switched off covers graph launches too, unless they are set apart. */
-  g_sample_rate[SITE_GRAPH]  = env_rate(
-    "OTEL_GPU_GRAPH_SAMPLE_RATE", g_sample_rate[SITE_KERNEL] == 0 ? 0 : DEFAULT_GRAPH_SAMPLE_RATE);
+  g_sample_rate[CALL_GRAPH]  = env_rate(
+    "OTEL_GPU_GRAPH_SAMPLE_RATE", g_sample_rate[CALL_KERNEL] == 0 ? 0 : DEFAULT_GRAPH_SAMPLE_RATE);
 
-  CHECK(rocprofiler_query_available_agents(ROCPROFILER_AGENT_INFO_VERSION_0, collect_agents,
-                                           sizeof(rocprofiler_agent_v0_t), NULL),
-        "rocprofiler_query_available_agents failed");
+  CHECK(
+    rocprofiler_query_available_agents(
+      ROCPROFILER_AGENT_INFO_VERSION_0, collect_agents, sizeof(rocprofiler_agent_v0_t), NULL),
+    "rocprofiler_query_available_agents failed");
   CHECK(rocprofiler_create_context(&g_context), "rocprofiler_create_context failed");
 
-  rocprofiler_tracing_operation_t operations[NUM_CALL_SITES];
-  for (size_t i = 0; i < NUM_CALL_SITES; i++) {
-    operations[i] = g_call_sites[i].operation;
-  }
-  CHECK(rocprofiler_configure_callback_tracing_service(g_context,
-                                                       ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API,
-                                                       operations, NUM_CALL_SITES,
-                                                       hip_api_callback, NULL),
-        "tracing HIP calls failed");
-  CHECK(rocprofiler_configure_callback_tracing_service(
-          g_context, ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT, NULL, 0, code_object_callback, NULL),
-        "tracing code objects failed");
+  static struct tracked_operations tracked;
+  CHECK(
+    rocprofiler_iterate_callback_tracing_kind_operations(
+      ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API, track_call, &tracked),
+    "listing HIP calls failed");
+  CHECK(
+    rocprofiler_configure_callback_tracing_service(
+      g_context,
+      ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API,
+      tracked.ids,
+      tracked.count,
+      hip_api_callback,
+      NULL),
+    "tracing HIP calls failed");
+  CHECK(
+    rocprofiler_configure_callback_tracing_service(
+      g_context, ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT, NULL, 0, code_object_callback, NULL),
+    "tracing code objects failed");
   rocprofiler_tracing_operation_t marker_operations[] = {
     ROCPROFILER_MARKER_CORE_API_ID_roctxRangePushA,
     ROCPROFILER_MARKER_CORE_API_ID_roctxRangePop,
   };
-  CHECK(rocprofiler_configure_callback_tracing_service(
-          g_context, ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_API, marker_operations,
-          sizeof(marker_operations) / sizeof(marker_operations[0]), marker_callback, NULL),
-        "tracing ROCTx ranges failed");
+  CHECK(
+    rocprofiler_configure_callback_tracing_service(
+      g_context,
+      ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_API,
+      marker_operations,
+      sizeof(marker_operations) / sizeof(marker_operations[0]),
+      marker_callback,
+      NULL),
+    "tracing ROCTx ranges failed");
 
-  CHECK(rocprofiler_create_buffer(g_context, BUFFER_SIZE, BUFFER_WATERMARK,
-                                  ROCPROFILER_BUFFER_POLICY_LOSSLESS, buffer_callback, NULL,
-                                  &g_buffer),
-        "rocprofiler_create_buffer failed");
-  CHECK(rocprofiler_configure_buffer_tracing_service(
-          g_context, ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH, NULL, 0, g_buffer),
-        "tracing kernel dispatches failed");
-  CHECK(rocprofiler_configure_buffer_tracing_service(
-          g_context, ROCPROFILER_BUFFER_TRACING_MEMORY_COPY, NULL, 0, g_buffer),
-        "tracing memory copies failed");
-  CHECK(rocprofiler_configure_buffer_tracing_service(
-          g_context, ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION, NULL, 0, g_buffer),
-        "tracing memory allocations failed");
+  /* A full buffer drops records rather than blocking the application. */
+  CHECK(rocprofiler_create_context(&g_trace_context), "rocprofiler_create_context failed");
+  CHECK(
+    rocprofiler_create_buffer(
+      g_trace_context,
+      BUFFER_SIZE,
+      BUFFER_WATERMARK,
+      ROCPROFILER_BUFFER_POLICY_DISCARD,
+      buffer_callback,
+      NULL,
+      &g_buffer),
+    "rocprofiler_create_buffer failed");
+  CHECK(
+    rocprofiler_configure_buffer_tracing_service(
+      g_trace_context, ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH, NULL, 0, g_buffer),
+    "tracing kernel dispatches failed");
+  CHECK(
+    rocprofiler_configure_buffer_tracing_service(
+      g_trace_context, ROCPROFILER_BUFFER_TRACING_MEMORY_COPY, NULL, 0, g_buffer),
+    "tracing memory copies failed");
 
   rocprofiler_callback_thread_t thread;
   CHECK(rocprofiler_create_callback_thread(&thread), "rocprofiler_create_callback_thread failed");
-  CHECK(rocprofiler_assign_callback_thread(g_buffer, thread),
-        "rocprofiler_assign_callback_thread failed");
+  CHECK(
+    rocprofiler_assign_callback_thread(g_buffer, thread),
+    "rocprofiler_assign_callback_thread failed");
   CHECK(rocprofiler_start_context(g_context), "rocprofiler_start_context failed");
 
-  start_thread(flush_thread);
   g_enabled = 1;
+  update_tracing();
+  start_thread(tracing_thread);
   return 0;
 }
 
@@ -660,23 +752,25 @@ static void tool_fini(void *)
   if (g_enabled) {
     rocprofiler_flush_buffer(g_buffer);
   }
-  pthread_mutex_lock(&g_err_mu);
-  if (g_err_started) {
-    OTEL_GPU_PROBE(error, &g_last_err); /* last chance for the agent to see it */
-  }
-  pthread_mutex_unlock(&g_err_mu);
 }
 
 static void fork_prepare(void)
 {
-  pthread_mutex_lock(&g_err_mu);
+  pthread_mutex_lock(&g_tracing_mu);
   pthread_mutex_lock(&g_pool_mu);
 }
 
 static void fork_parent(void)
 {
   pthread_mutex_unlock(&g_pool_mu);
-  pthread_mutex_unlock(&g_err_mu);
+  pthread_mutex_unlock(&g_tracing_mu);
+}
+
+/* A child of a HIP process cannot use the GPU, nor flush the buffer at exit. */
+static void fork_child(void)
+{
+  fork_parent();
+  g_enabled = 0;
 }
 
 /* rocprofiler-sdk calls this entry point when it loads the library named in
@@ -687,8 +781,7 @@ rocprofiler_configure(uint32_t, const char *, uint32_t, rocprofiler_client_id_t 
   client_id->name = "otel_gpu";
   /* Hold our mutexes across fork: a child must never start with one locked by
    * a dead thread. */
-  pthread_atfork(fork_prepare, fork_parent, fork_parent);
-  OTEL_GPU_PROBE(ready, NULL);
+  pthread_atfork(fork_prepare, fork_parent, fork_child);
 
   static rocprofiler_tool_configure_result_t result = {
     sizeof(rocprofiler_tool_configure_result_t), tool_init, tool_fini, NULL};

@@ -6,6 +6,7 @@
 package gpu_test
 
 import (
+	"context"
 	"maps"
 	"os"
 	"os/exec"
@@ -17,7 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
@@ -28,10 +32,43 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/tracer"
 )
 
+// counted holds the values of the profiler's counters.
+var counted = &recordingMeter{values: make(map[string]int64)}
+
 func TestMain(m *testing.M) {
 	// Lingering periodic callers of the tracer add metrics concurrently.
-	metrics.Start(noop.Meter{})
+	metrics.Start(counted)
 	os.Exit(m.Run())
+}
+
+// recordingMeter adds up the values of the counters it creates, by name.
+type recordingMeter struct {
+	noop.Meter
+	mu     sync.Mutex
+	values map[string]int64
+}
+
+func (m *recordingMeter) Int64Counter(name string, _ ...metric.Int64CounterOption,
+) (metric.Int64Counter, error) {
+	return &recordingCounter{meter: m, name: name}, nil
+}
+
+func (m *recordingMeter) value(name string) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.values[name]
+}
+
+type recordingCounter struct {
+	noop.Int64Counter
+	meter *recordingMeter
+	name  string
+}
+
+func (c *recordingCounter) Add(_ context.Context, value int64, _ ...metric.AddOption) {
+	c.meter.mu.Lock()
+	defer c.meter.mu.Unlock()
+	c.meter.values[c.name] += value
 }
 
 type testIntervals struct{}
@@ -44,6 +81,8 @@ func (testIntervals) ExecutableUnloadDelay() time.Duration { return time.Second 
 type reportedEvent struct {
 	trace *libpf.Trace
 	meta  samples.TraceEventMeta
+	// values are the values the event reports.
+	values []int64
 }
 
 // recordingReporter keeps every reported trace event.
@@ -56,7 +95,11 @@ func (r *recordingReporter) ReportTraceEvent(trace *libpf.Trace,
 	meta *samples.TraceEventMeta) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.events = append(r.events, reportedEvent{trace: trace, meta: *meta})
+	// The context values alias a pooled trace: keep what they report instead.
+	values := meta.ProfileType.AppendValues(nil, meta)
+	kept := *meta
+	kept.ContextValues = nil
+	r.events = append(r.events, reportedEvent{trace: trace, meta: kept, values: values})
 	return nil
 }
 
@@ -65,7 +108,7 @@ func (r *recordingReporter) eventsOf(pid libpf.PID, sampleType string) []reporte
 	defer r.mu.Unlock()
 	var events []reportedEvent
 	for _, e := range r.events {
-		if e.meta.PID == pid && e.meta.ProfileType.SampleType == sampleType {
+		if e.meta.PID == pid && e.meta.ProfileType.SampleTypes[0].Type == sampleType {
 			events = append(events, e)
 		}
 	}
@@ -88,6 +131,7 @@ func startTracer(t *testing.T, rep *recordingReporter, config gpu.Config,
 		KernelVersionCheck:     true,
 		ProbabilisticInterval:  100,
 		ProbabilisticThreshold: 100,
+		ProbesEnabled:          true,
 	})
 	require.NoError(t, err)
 	t.Cleanup(trc.Close)
@@ -116,31 +160,39 @@ func startTracer(t *testing.T, rep *recordingReporter, config gpu.Config,
 	return trc, probe
 }
 
-// produced is what the fake producer fired, values multiplied by their sample
-// weights.
+// produced is what the fake producer fired, values multiplied by the sample
+// weight of their launch.
 type produced struct {
-	pid             libpf.PID
-	launches        uint64
-	launchWeights   int64
-	kernels         uint64
-	kernelNs        int64
-	memNs           int64
-	memBytes        int64
-	allocBytes      int64
-	uvmBytes        int64
-	stalls          int64
-	collectiveNs    int64
-	collectiveBytes int64
+	pid           libpf.PID
+	launches      uint64
+	launchWeights int64
+	kernels       uint64
+	kernelNs      int64
+	memNs         int64
+	memBytes      int64
+	// broken is the number of calls whose broken events the profiler drops.
+	broken int64
+}
+
+// profiles returns the totals the profiler must report for what was produced.
+func (p produced) profiles() map[string]int64 {
+	return map[string]int64{
+		"gpu_kernel_time": p.kernelNs,
+		"gpu_mem_time":    p.memNs,
+		"gpu_mem_bytes":   p.memBytes,
+	}
 }
 
 // runProducer builds the fake producer and runs it: it waits for the probe to
-// raise the ready semaphore, then fires probes for the given time.
+// raise the semaphore of its USDT probe, then fires events for the given time.
 func runProducer(t *testing.T, seconds int) produced {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "producer")
-	out, err := exec.Command("cc", "-O2", "-g", "-o", bin, "testdata/producer.c").CombinedOutput()
-	require.NoError(t, err, string(out))
+	return runBuiltProducer(t, buildProducer(t), seconds)
+}
 
+// runBuiltProducer runs the fake producer built by buildProducer.
+func runBuiltProducer(t *testing.T, bin string, seconds int) produced {
+	t.Helper()
 	cmd := exec.Command(bin, "10", strconv.Itoa(seconds))
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
@@ -149,26 +201,23 @@ func runProducer(t *testing.T, seconds int) produced {
 	require.NoError(t, cmd.Wait(), stderr.String())
 
 	fields := strings.Fields(stdout.String())
-	require.Len(t, fields, 11, stdout.String())
+	require.Len(t, fields, 7, stdout.String())
 	values := make([]int64, len(fields))
 	for i, field := range fields {
+		var err error
 		values[i], err = strconv.ParseInt(field, 10, 64)
 		require.NoError(t, err)
 	}
 	require.NotZero(t, values[0])
 	return produced{
-		pid:             libpf.PID(cmd.Process.Pid),
-		launches:        uint64(values[0]),
-		launchWeights:   values[1],
-		kernels:         uint64(values[2]),
-		kernelNs:        values[3],
-		memNs:           values[4],
-		memBytes:        values[5],
-		allocBytes:      values[6],
-		uvmBytes:        values[7],
-		stalls:          values[8],
-		collectiveNs:    values[9],
-		collectiveBytes: values[10],
+		pid:           libpf.PID(cmd.Process.Pid),
+		launches:      uint64(values[0]),
+		launchWeights: values[1],
+		kernels:       uint64(values[2]),
+		kernelNs:      values[3],
+		memNs:         values[4],
+		memBytes:      values[5],
+		broken:        values[6],
 	}
 }
 
@@ -187,7 +236,7 @@ func TestLaunchStacks(t *testing.T) {
 	var weights int64
 	for _, e := range events {
 		// The reported value is the sample weight the producer passed.
-		weights += e.meta.Value
+		weights += e.values[0]
 
 		require.True(t, inProducer(t, e.trace.Frames), "launch stack misses the producer")
 		for _, handle := range e.trace.Frames {
@@ -197,14 +246,8 @@ func TestLaunchStacks(t *testing.T) {
 	require.Equal(t, fired.launchWeights, weights)
 }
 
-// processLevel are the profile types whose samples have no launch stack.
-var processLevel = map[string]bool{
-	"gpu_uvm_bytes":        true,
-	"gpu_uvm_faults":       true,
-	"gpu_stall_samples":    true,
-	"gpu_collective_time":  true,
-	"gpu_collective_bytes": true,
-}
+// testGPU is the GPU UUID the fake producer sends with every event.
+const testGPU = "GPU-00000000-0000-0000-0000-000000000001"
 
 // collectGPUProfiles collects the snapshot samples of pid until the totals by
 // profile type reach want. It returns the totals by profile type, then by leaf
@@ -220,22 +263,20 @@ func collectGPUProfiles(t *testing.T, trc *tracer.Tracer, pid libpf.PID,
 	for time.Now().Before(deadline) {
 		time.Sleep(500 * time.Millisecond)
 		for _, profile := range trc.CollectSnapshots() {
-			sampleType := profile.ProfileType.SampleType
+			sampleType := profile.ProfileType.SampleTypes[0].Type
 			for _, sample := range profile.Samples {
 				if sample.PID != pid {
 					continue
 				}
 				leaf := sample.Frames[0].Value()
 				require.Equal(t, libpf.GPUFrame, leaf.Type)
-				if processLevel[sampleType] {
-					require.False(t, inProducer(t, sample.Frames))
-				} else {
-					require.True(t, inProducer(t, sample.Frames[1:]),
-						"%s %s has no launch stack", sampleType, leaf.FunctionName)
-				}
+				require.True(t, inProducer(t, sample.Frames[1:]),
+					"%s %s has no launch stack", sampleType, leaf.FunctionName)
 				require.NotNil(t, sample.ProcessMeta)
 				require.Equal(t, "producer",
 					filepath.Base(sample.ProcessMeta.ExecutablePath.String()))
+				require.Equal(t, []attribute.KeyValue{attribute.String("gpu.uuid", testGPU)},
+					sample.Attributes)
 				if byLeaf[sampleType] == nil {
 					byLeaf[sampleType] = make(map[string]int64)
 					byStack[sampleType] = make(map[string]int64)
@@ -269,35 +310,34 @@ func gpuFrames(frames libpf.Frames) string {
 func TestGPUProfiles(t *testing.T) {
 	rep := &recordingReporter{}
 	trc, _ := startTracer(t, rep, gpu.Config{})
+	// The metrics of a second are reported in the next one, so those of an
+	// earlier test may still be pending.
+	time.Sleep(2 * testIntervals{}.MonitorInterval())
+	tooLarge := counted.value("bpf.errors.gpu_event_too_large")
+	unreadable := counted.value("bpf.errors.gpu_event_read")
 	fired := runProducer(t, 3)
 
-	byLeaf, byStack := collectGPUProfiles(t, trc, fired.pid, map[string]int64{
-		"gpu_kernel_time":      fired.kernelNs,
-		"gpu_mem_time":         fired.memNs,
-		"gpu_mem_bytes":        fired.memBytes,
-		"gpu_alloc_bytes":      fired.allocBytes,
-		"gpu_uvm_bytes":        fired.uvmBytes,
-		"gpu_stall_samples":    fired.stalls,
-		"gpu_collective_time":  fired.collectiveNs,
-		"gpu_collective_bytes": fired.collectiveBytes,
-	})
+	// The totals leave out the events the producer breaks on purpose.
+	byLeaf, byStack := collectGPUProfiles(t, trc, fired.pid, fired.profiles())
 	require.Equal(t, []string{"graph_step", "vector_add"},
 		slices.Sorted(maps.Keys(byLeaf["gpu_kernel_time"])))
 	require.Equal(t, []string{"memcpy:HtoD", "memset"},
 		slices.Sorted(maps.Keys(byLeaf["gpu_mem_time"])))
-	require.Equal(t, []string{"alloc:device"},
-		slices.Sorted(maps.Keys(byLeaf["gpu_alloc_bytes"])))
 	require.Equal(t, []string{
 		"graph_step",
 		"vector_add",
 		"vector_add > range:aten::mm > range:aten::matmul > range:train_step",
 	}, slices.Sorted(maps.Keys(byStack["gpu_kernel_time"])))
-	require.Equal(t, []string{"memcpy:HtoD > range:train_step", "memset"},
+	require.Equal(t, []string{"memcpy:HtoD > range:train_step", "memset > range:train_step"},
 		slices.Sorted(maps.Keys(byStack["gpu_mem_time"])))
-	require.Equal(t, []string{"stall:memory_dependency > vector_add"},
-		slices.Sorted(maps.Keys(byStack["gpu_stall_samples"])))
-	require.Equal(t, []string{"collective:AllReduce"},
-		slices.Sorted(maps.Keys(byStack["gpu_collective_time"])))
+
+	// Each call with broken events sent one too large and one unreadable.
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.Equal(c, fired.broken,
+			counted.value("bpf.errors.gpu_event_too_large")-tooLarge, "too large")
+		assert.Equal(c, fired.broken,
+			counted.value("bpf.errors.gpu_event_read")-unreadable, "unreadable")
+	}, 5*time.Second, 100*time.Millisecond)
 }
 
 // inProducer reports whether frames run code of the producer executable.
@@ -313,45 +353,69 @@ func inProducer(t *testing.T, frames libpf.Frames) bool {
 	return false
 }
 
-func TestAPISpans(t *testing.T) {
-	trc, _ := startTracer(t, &recordingReporter{}, gpu.Config{APISpans: true})
+// TestProcessesShareUprobes runs the same producer file in several processes,
+// one after the other and two at once: the uprobes attached for the first are
+// reused for the others. Processes that start while the uprobes are attached
+// fire before the profiler knows them, so only the first one has the stacks of
+// all its launches.
+func TestProcessesShareUprobes(t *testing.T) {
+	rep := &recordingReporter{}
+	trc, _ := startTracer(t, rep, gpu.Config{})
+	bin := buildProducer(t)
 
-	dir := t.TempDir()
-	library := filepath.Join(dir, "libcudnn.so.9")
-	out, err := exec.Command("cc", "-O2", "-shared", "-fPIC", "-o", library,
-		"testdata/fake_cudnn.c").CombinedOutput()
-	require.NoError(t, err, string(out))
-	user := filepath.Join(dir, "cudnn_user")
-	out, err = exec.Command("cc", "-O2", "-o", user, "testdata/cudnn_user.c",
-		"-L"+dir, "-l:libcudnn.so.9", "-Wl,-rpath,"+dir).CombinedOutput()
-	require.NoError(t, err, string(out))
+	first := runBuiltProducer(t, bin, 1)
+	var both [2]produced
+	var wg sync.WaitGroup
+	for i := range both {
+		wg.Go(func() { both[i] = runBuiltProducer(t, bin, 1) })
+	}
+	wg.Wait()
 
-	cmd := exec.Command(user)
-	var stdout strings.Builder
-	cmd.Stdout = &stdout
-	require.NoError(t, cmd.Run())
-	calls, err := strconv.ParseInt(strings.TrimSpace(stdout.String()), 10, 64)
-	require.NoError(t, err)
-	pid := libpf.PID(cmd.Process.Pid)
-
-	// Each call sleeps at least callDuration, so missing spans lower the total.
-	const callDuration = 500 * time.Microsecond
-	var total int64
-	deadline := time.Now().Add(10 * time.Second)
-	for total < calls*int64(callDuration) && time.Now().Before(deadline) {
-		time.Sleep(500 * time.Millisecond)
+	want := make(map[libpf.PID]map[string]int64)
+	for _, fired := range []produced{first, both[0], both[1]} {
+		want[fired.pid] = fired.profiles()
+	}
+	got := make(map[libpf.PID]map[string]int64)
+	// stacked and stackless add up the values of the samples of each process
+	// below their launch stack, and without one.
+	stacked := make(map[libpf.PID]int64)
+	stackless := make(map[libpf.PID]int64)
+	require.Eventually(t, func() bool {
 		for _, profile := range trc.CollectSnapshots() {
 			for _, sample := range profile.Samples {
-				if sample.PID != pid {
+				if _, ok := want[sample.PID]; !ok {
 					continue
 				}
-				require.Equal(t, "gpu_api_time", profile.ProfileType.SampleType)
-				require.Equal(t, "cudnn:ConvolutionForward",
-					sample.Frames[0].Value().FunctionName.String())
-				total += sample.Value
+				if got[sample.PID] == nil {
+					got[sample.PID] = make(map[string]int64)
+				}
+				got[sample.PID][profile.ProfileType.SampleTypes[0].Type] += sample.Value
+				if inProducer(t, sample.Frames[1:]) {
+					stacked[sample.PID] += sample.Value
+				} else {
+					stackless[sample.PID] += sample.Value
+				}
 			}
 		}
+		return maps.EqualFunc(want, got, maps.Equal)
+	}, 10*time.Second, 500*time.Millisecond, "want %v, got %v", want, got)
+	require.Zero(t, stackless[first.pid], "GPU work of the first process without its launch stack")
+
+	for i, fired := range []produced{first, both[0], both[1]} {
+		require.NotZero(t, stacked[fired.pid], "no GPU work of %d below its launch", fired.pid)
+		var weights int64
+		require.Eventually(t, func() bool {
+			weights = 0
+			for _, e := range rep.eventsOf(fired.pid, "gpu_launches") {
+				require.True(t, inProducer(t, e.trace.Frames), "launch stack misses the producer")
+				weights += e.values[0]
+			}
+			if i == 0 {
+				return weights == fired.launchWeights
+			}
+			return weights > 0
+		}, 5*time.Second, 100*time.Millisecond,
+			"launch weights of %d: %d of %d", fired.pid, weights, fired.launchWeights)
+		require.LessOrEqual(t, weights, fired.launchWeights)
 	}
-	require.GreaterOrEqual(t, total, calls*int64(callDuration))
-	require.Less(t, total, calls*int64(100*callDuration))
 }

@@ -1,13 +1,12 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Call site sampling. Each thread samples each class of call sites on its own,
-// aiming at `rate` sampled call sites per second. A call site is sampled with
-// probability 1/N and then stands for N call sites, where N grows with the call
-// sites seen in the last second. N depends only on earlier call sites, so the
-// weighted samples estimate the totals without bias, also while the call rate
-// changes, and unlike a token bucket the choice does not favor call sites that
-// follow a pause.
+// Call sampling. Each thread samples each class of calls on its own, aiming at
+// `rate` sampled calls per second. A call is sampled with probability 1/N and
+// then stands for N calls, where N grows with the calls seen in the last
+// second. N depends only on earlier calls, so the weighted samples estimate the
+// totals without bias, also while the call rate changes, and unlike a token
+// bucket the choice does not favor calls that follow a pause.
 #pragma once
 
 #include <stdint.h>
@@ -16,8 +15,8 @@
 
 struct otel_sampler {
   uint64_t window_start; // ns
-  uint64_t current;      // call sites in the current window
-  uint64_t previous;     // call sites in the previous window
+  uint64_t current;      // calls in the current window
+  uint64_t previous;     // calls in the previous window
 };
 
 // otel_rng_next steps a xorshift64* generator, whose state must not be 0.
@@ -31,8 +30,8 @@ static inline uint64_t otel_rng_next(uint64_t *state)
   return x * 0x2545f4914f6cdd1dull;
 }
 
-// otel_sampler_weight returns the sample weight of the call site at now_ns, or
-// 0 if it is not sampled. A rate of 0 samples every call site.
+// otel_sampler_weight returns the sample weight of the call at now_ns, or
+// 0 if it is not sampled. A rate of 0 samples every call.
 static inline uint32_t
 otel_sampler_weight(struct otel_sampler *s, uint32_t rate, uint64_t now_ns, uint64_t *rng)
 {
@@ -47,7 +46,7 @@ otel_sampler_weight(struct otel_sampler *s, uint32_t rate, uint64_t now_ns, uint
     s->window_start    = adjacent ? s->window_start + OTEL_SAMPLER_WINDOW_NS : now_ns;
     elapsed            = now_ns - s->window_start;
   }
-  // Call sites of the last second: the previous window counts for the part
+  // Calls of the last second: the previous window counts for the part
   // of it the last second still covers.
   const uint64_t recent =
     s->current + s->previous * (OTEL_SAMPLER_WINDOW_NS - elapsed) / OTEL_SAMPLER_WINDOW_NS;

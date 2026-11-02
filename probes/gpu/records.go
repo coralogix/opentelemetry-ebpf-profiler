@@ -4,181 +4,125 @@
 package gpu // import "go.opentelemetry.io/ebpf-profiler/probes/gpu"
 
 import (
-	"bytes"
 	"encoding/binary"
+	"errors"
+	"strings"
+
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 )
 
-// Record types and layouts sent by support/ebpf/gpu.ebpf.c. Both supported
-// architectures are little-endian.
+// Kinds of events, from enum otel_gpu_kind in otel_gpu_v1_usdt.h. LAUNCH events
+// never get here: support/ebpf/gpu.ebpf.c turns them into traces.
 const (
-	recordKernel uint32 = 1
-	recordMemcpy uint32 = 2
-	recordEvent  uint32 = 3
-	recordError  uint32 = 4
-	// recordAPISpan is a call of a host GPU library function such as cuDNN's.
-	recordAPISpan uint32 = 5
+	kindKernel uint16 = 2
+	kindCopy   uint16 = 3
+	kindFill   uint16 = 4
 )
 
+// Fields of the payload, from enum otel_gpu_field in otel_gpu_v1_usdt.h.
 const (
-	// recordHeaderSize is the size of the {type, pid} header of every record.
-	recordHeaderSize = 8
-	// Kernel, memory copy and event records carry a 56-byte producer record.
-	producerRecordSize = recordHeaderSize + 56
-	errorMessageSize   = 120
-	errorRecordSize    = recordHeaderSize + 8 + errorMessageSize
+	fieldGPU        protowire.Number = 1
+	fieldName       protowire.Number = 2
+	fieldRanges     protowire.Number = 3
+	fieldDurationNS protowire.Number = 4
+	fieldBytes      protowire.Number = 5
 )
 
-// Kinds of otel_gpu event records.
-const (
-	eventUVMHtoD     uint32 = 1
-	eventUVMDtoH     uint32 = 2
-	eventUVMCPUFault uint32 = 3
-	eventUVMGPUFault uint32 = 4
-	eventAlloc       uint32 = 5
-	eventFree        uint32 = 6
-	eventMemset      uint32 = 7
-	eventStall       uint32 = 8
-	eventCollective  uint32 = 10
-)
+// eventHeaderSize is what support/ebpf/gpu.ebpf.c sends before the payload: the
+// PID, 4 bytes of padding, and the producer's 16-byte event header.
+const eventHeaderSize = 24
 
-// kernelRecord is one kernel execution measured on the GPU.
-type kernelRecord struct {
+// event is an event of a producer, as the gpu probe receives it.
+type event struct {
 	pid           libpf.PID
-	start, end    uint64
-	correlationID uint32
-	graphID       uint32
-	namePtr       uint64
-	rangesPtr     uint64
+	correlationID uint64
 	sampleWeight  uint32
+	kind          uint16
+	gpu           string
+	name          string
+	// ranges holds the names of the work in progress, innermost first, joined
+	// by rangeSeparator.
+	ranges     string
+	durationNS uint64
+	bytes      uint64
 }
 
-// memcpyRecord is one memory copy measured on the GPU.
-type memcpyRecord struct {
-	pid           libpf.PID
-	start, end    uint64
-	correlationID uint32
-	copyKind      uint32
-	bytes         uint64
-	rangesPtr     uint64
-	sampleWeight  uint32
-}
+var errShortEvent = errors.New("event shorter than its header and payload")
 
-// eventRecord is a lower-rate GPU event; kind selects the meaning of v1 and v2.
-type eventRecord struct {
-	pid           libpf.PID
-	start, end    uint64
-	kind          uint32
-	correlationID uint32
-	v1, v2        uint64
-	namePtr       uint64
-	sampleWeight  uint32
-}
-
-// apiSpanRecord is one call of an instrumented host library function.
-type apiSpanRecord struct {
-	pid        libpf.PID
-	start, end uint64
-	// cookie indexes apiFunctions.
-	cookie uint64
-}
-
-// errorRecord is a producer-side failure.
-type errorRecord struct {
-	pid     libpf.PID
-	code    int32
-	message string
-}
-
-// recordHeader returns the type and PID of a record.
-func recordHeader(b []byte) (recordType uint32, pid libpf.PID, ok bool) {
-	if len(b) < recordHeaderSize {
-		return 0, 0, false
-	}
-	return binary.LittleEndian.Uint32(b[0:]), libpf.PID(binary.LittleEndian.Uint32(b[4:])), true
-}
-
-func decodeKernelRecord(pid libpf.PID, b []byte) (kernelRecord, bool) {
-	if len(b) < producerRecordSize {
-		return kernelRecord{}, false
+// decodeEvent decodes an event sent by eBPF. Both supported architectures are
+// little endian.
+func decodeEvent(b []byte) (event, error) {
+	if len(b) < eventHeaderSize {
+		return event{}, errShortEvent
 	}
 	le := binary.LittleEndian
-	rec := b[recordHeaderSize:]
-	return kernelRecord{
-		pid:           pid,
-		start:         le.Uint64(rec[0:]),
-		end:           le.Uint64(rec[8:]),
-		correlationID: le.Uint32(rec[16:]),
-		graphID:       le.Uint32(rec[28:]),
-		namePtr:       le.Uint64(rec[32:]),
-		rangesPtr:     le.Uint64(rec[40:]),
-		sampleWeight:  le.Uint32(rec[48:]),
-	}, true
+	ev := event{
+		pid:           libpf.PID(le.Uint32(b[0:])),
+		correlationID: le.Uint64(b[8:]),
+		sampleWeight:  le.Uint32(b[16:]),
+		kind:          le.Uint16(b[20:]),
+	}
+	end := eventHeaderSize + int(le.Uint16(b[22:]))
+	if len(b) < end {
+		return event{}, errShortEvent
+	}
+	if err := ev.decodePayload(b[eventHeaderSize:end]); err != nil {
+		return event{}, err
+	}
+	return ev, nil
 }
 
-func decodeMemcpyRecord(pid libpf.PID, b []byte) (memcpyRecord, bool) {
-	if len(b) < producerRecordSize {
-		return memcpyRecord{}, false
+// decodePayload reads the fields of a Payload message, skipping the ones it
+// does not know.
+func (ev *event) decodePayload(b []byte) error {
+	var ranges []string
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return protowire.ParseError(n)
+		}
+		b = b[n:]
+
+		switch {
+		case typ == protowire.BytesType && isStringField(num):
+			value, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return protowire.ParseError(n)
+			}
+			b = b[n:]
+			switch num {
+			case fieldGPU:
+				ev.gpu = string(value)
+			case fieldName:
+				ev.name = string(value)
+			default:
+				ranges = append(ranges, string(value))
+			}
+		case typ == protowire.VarintType && (num == fieldDurationNS || num == fieldBytes):
+			value, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return protowire.ParseError(n)
+			}
+			b = b[n:]
+			if num == fieldDurationNS {
+				ev.durationNS = value
+			} else {
+				ev.bytes = value
+			}
+		default:
+			n := protowire.ConsumeFieldValue(num, typ, b)
+			if n < 0 {
+				return protowire.ParseError(n)
+			}
+			b = b[n:]
+		}
 	}
-	le := binary.LittleEndian
-	rec := b[recordHeaderSize:]
-	return memcpyRecord{
-		pid:           pid,
-		start:         le.Uint64(rec[0:]),
-		end:           le.Uint64(rec[8:]),
-		correlationID: le.Uint32(rec[16:]),
-		copyKind:      le.Uint32(rec[28:]),
-		bytes:         le.Uint64(rec[32:]),
-		rangesPtr:     le.Uint64(rec[40:]),
-		sampleWeight:  le.Uint32(rec[48:]),
-	}, true
+	ev.ranges = strings.Join(ranges, rangeSeparator)
+	return nil
 }
 
-func decodeEventRecord(pid libpf.PID, b []byte) (eventRecord, bool) {
-	if len(b) < producerRecordSize {
-		return eventRecord{}, false
-	}
-	le := binary.LittleEndian
-	rec := b[recordHeaderSize:]
-	return eventRecord{
-		pid:           pid,
-		start:         le.Uint64(rec[0:]),
-		end:           le.Uint64(rec[8:]),
-		kind:          le.Uint32(rec[16:]),
-		correlationID: le.Uint32(rec[20:]),
-		v1:            le.Uint64(rec[24:]),
-		v2:            le.Uint64(rec[32:]),
-		namePtr:       le.Uint64(rec[40:]),
-		sampleWeight:  le.Uint32(rec[48:]),
-	}, true
-}
-
-func decodeErrorRecord(pid libpf.PID, b []byte) (errorRecord, bool) {
-	if len(b) < errorRecordSize {
-		return errorRecord{}, false
-	}
-	message := b[recordHeaderSize+8 : errorRecordSize]
-	if end := bytes.IndexByte(message, 0); end >= 0 {
-		message = message[:end]
-	}
-	return errorRecord{
-		pid:     pid,
-		code:    int32(binary.LittleEndian.Uint32(b[recordHeaderSize:])),
-		message: string(message),
-	}, true
-}
-
-func decodeAPISpanRecord(pid libpf.PID, b []byte) (apiSpanRecord, bool) {
-	if len(b) < producerRecordSize {
-		return apiSpanRecord{}, false
-	}
-	le := binary.LittleEndian
-	rec := b[recordHeaderSize:]
-	return apiSpanRecord{
-		pid:    pid,
-		start:  le.Uint64(rec[0:]),
-		end:    le.Uint64(rec[8:]),
-		cookie: le.Uint64(rec[16:]),
-	}, true
+func isStringField(num protowire.Number) bool {
+	return num == fieldGPU || num == fieldName || num == fieldRanges
 }

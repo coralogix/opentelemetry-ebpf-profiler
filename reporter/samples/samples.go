@@ -33,7 +33,9 @@ type TraceEventMeta struct {
 
 // TraceEvents holds known information about a trace.
 type TraceEvents struct {
-	Labels     map[libpf.String]libpf.String
+	Labels map[libpf.String]libpf.String
+	// Attributes are sample attributes set by a probe, or nil.
+	Attributes []attribute.KeyValue
 	Frames     libpf.Frames
 	Timestamps []uint64 // in nanoseconds
 	// Values stores one contiguous group per event, with one value for each
@@ -171,7 +173,10 @@ type SnapshotSample struct {
 	PID       libpf.PID
 	TraceHash libpf.TraceHash
 	Frames    libpf.Frames
-	Value     int64
+	// Attributes are added to the exported sample. Samples that differ only in
+	// attributes must differ in TraceHash.
+	Attributes []attribute.KeyValue
+	Value      int64
 	// ProcessMeta, if set, is used for the resource attributes instead of the
 	// metadata looked up at report time, when the process may have exited.
 	ProcessMeta *ProcessMeta
@@ -183,5 +188,7 @@ type ProcessMeta struct {
 	ExecutablePath libpf.String
 	ContainerID    libpf.String
 	EnvVars        map[libpf.String]libpf.String
-	ResourceAttrs  attribute.Set
+	// ExtraMeta holds the key-value pairs of process.MetaEnrichers, or nil.
+	ExtraMeta     map[libpf.String]string
+	ResourceAttrs attribute.Set
 }

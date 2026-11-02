@@ -2291,5 +2291,26 @@
     "name": "BPFProbeRingbufOutputErr",
     "field": "bpf.errors.probe_ringbuf_output",
     "id": 313
+  },
+  {
+    "description": "Number of GPU events dropped because the gpu probe's ring buffer was full",
+    "type": "counter",
+    "name": "BPFGPURingbufOutputErr",
+    "field": "bpf.errors.gpu_ringbuf_output",
+    "id": 314
+  },
+  {
+    "description": "Number of GPU events dropped because their payload exceeded the size the contract allows",
+    "type": "counter",
+    "name": "BPFGPUEventTooLarge",
+    "field": "bpf.errors.gpu_event_too_large",
+    "id": 315
+  },
+  {
+    "description": "Number of GPU events dropped because their header or payload could not be read",
+    "type": "counter",
+    "name": "BPFGPUEventReadErr",
+    "field": "bpf.errors.gpu_event_read",
+    "id": 316
   }
 ]

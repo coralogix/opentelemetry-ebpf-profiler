@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Checks of the call site sampler on simulated call sequences: the sampled
+// Checks of the call sampler on simulated call sequences: the sampled
 // rate, and that the weighted samples estimate the totals. The generator is
 // seeded, so results are deterministic.
 
@@ -29,7 +29,7 @@ static void expect_near(const char *what, double got, double want, double tolera
 }
 
 // A training step: a kernel after a long host-side pause, then a burst of
-// short launches. Sampling that favors call sites after a pause, like a token
+// short launches. Sampling that favors calls after a pause, like a token
 // bucket, overestimates the first kernel several times.
 enum { step_kernels = 7 };
 static const uint64_t step_gaps_ns[step_kernels] = {
@@ -54,13 +54,13 @@ static void test_steps(void)
         if (second > 1) {
           expect(
             sampled_in_second >= RATE / 2 && sampled_in_second <= RATE * 3 / 2,
-            "sampled call sites per second",
+            "sampled calls per second",
             (double)sampled_in_second,
             RATE);
         } else {
           expect(
             sampled_in_second <= 5 * RATE,
-            "sampled call sites in the first second",
+            "sampled calls in the first second",
             (double)sampled_in_second,
             5 * RATE);
         }
@@ -76,11 +76,11 @@ static void test_steps(void)
     }
   }
   for (int k = 0; k < step_kernels; k++) {
-    expect_near("estimated call sites of a kernel", estimate[k], calls[k], 0.1);
+    expect_near("estimated calls of a kernel", estimate[k], calls[k], 0.1);
   }
 }
 
-// Call sites below the rate are all sampled, each standing for itself.
+// Calls below the rate are all sampled, each standing for itself.
 static void test_below_rate(void)
 {
   struct otel_sampler s = {0};
@@ -89,10 +89,10 @@ static void test_below_rate(void)
   for (uint64_t now = NS_PER_S; now < 11 * NS_PER_S; now += NS_PER_S / (RATE / 2)) {
     all_once = all_once && otel_sampler_weight(&s, RATE, now, &rng) == 1;
   }
-  expect(all_once, "every call site sampled once below the rate", 0, 1);
+  expect(all_once, "every call sampled once below the rate", 0, 1);
 }
 
-// A rate of 0 samples every call site.
+// A rate of 0 samples every call.
 static void test_disabled(void)
 {
   struct otel_sampler s = {0};
@@ -101,7 +101,7 @@ static void test_disabled(void)
   for (uint64_t now = NS_PER_S; now < 2 * NS_PER_S; now += 10000) {
     all_once = all_once && otel_sampler_weight(&s, 0, now, &rng) == 1;
   }
-  expect(all_once, "every call site sampled once with sampling disabled", 0, 1);
+  expect(all_once, "every call sampled once with sampling disabled", 0, 1);
 }
 
 // Bursts separated by pauses: the estimate holds across the rate changes.
@@ -119,7 +119,7 @@ static void test_bursts(void)
     }
     now += 5 * NS_PER_S;
   }
-  expect_near("estimated call sites across bursts", estimate, calls, 0.05);
+  expect_near("estimated calls across bursts", estimate, calls, 0.05);
 }
 
 int main(void)

@@ -12,6 +12,7 @@ import (
 
 	cebpf "github.com/cilium/ebpf"
 
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/kallsyms"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
@@ -226,7 +227,7 @@ func (c *ProbeContext) LoadProbeUnwinders(
 		return err
 	}
 	return loadProbeUnwinders(coll, ebpfProgs, kprobeProgs, progs,
-		bpfVerifierLogLevel, perfProgs.FD(), probeMaps)
+		bpfVerifierLogLevel, perfProgs.FD(), probeMaps, c.maps["trace_events"].FD())
 }
 
 // CollectTrampolineRef describes what an external probe's eBPF entry program needs
@@ -468,6 +469,9 @@ type SnapshotSource interface {
 // subsequently fails; they cannot be reclaimed.
 // Enable returns an error if the tracer has already been closed.
 func (t *Tracer) Enable(ctx context.Context, p Probe) error {
+	if !t.probesEnabled {
+		log.Warnf("Probe %T enabled without Config.ProbesEnabled: its traces may be dropped", p)
+	}
 	probeCtx := &ProbeContext{
 		maps:    t.ebpfMaps,
 		sysVars: t.sysConfigVars,
@@ -548,6 +552,7 @@ func (t *Tracer) ProcessMeta(pid libpf.PID) samples.ProcessMeta {
 		ExecutablePath: meta.Executable,
 		ContainerID:    meta.ContainerID,
 		EnvVars:        meta.EnvVariables,
+		ExtraMeta:      meta.ExtraMeta,
 		ResourceAttrs:  resourceAttrs,
 	}
 }

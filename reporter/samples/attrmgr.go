@@ -72,6 +72,24 @@ func (m *AttrTableManager) AppendOptionalString(
 	m.appendAny(attrs, key, compound, value)
 }
 
+// AppendAttribute adds the index for the given attribute to an attribute index
+// slice, keeping its type for booleans, integers, floats and strings; other
+// values are added as strings. Empty strings are skipped.
+func (m *AttrTableManager) AppendAttribute(attrs pcommon.Int32Slice, kv attribute.KeyValue) {
+	switch kv.Value.Type() {
+	case attribute.BOOL:
+		v := kv.Value.AsBool()
+		m.appendAny(attrs, kv.Key, fmt.Sprintf("%v_bool_%t", kv.Key, v), v)
+	case attribute.INT64:
+		m.AppendInt(attrs, kv.Key, kv.Value.AsInt64())
+	case attribute.FLOAT64:
+		v := kv.Value.AsFloat64()
+		m.appendAny(attrs, kv.Key, fmt.Sprintf("%v_float_%g", kv.Key, v), v)
+	default:
+		m.AppendOptionalString(attrs, kv.Key, kv.Value.String())
+	}
+}
+
 func (m *AttrTableManager) appendAny(
 	attrs pcommon.Int32Slice,
 	key attribute.Key,
@@ -89,8 +107,12 @@ func (m *AttrTableManager) appendAny(
 	a.SetKeyStrindex(m.strSet.Add(string(key)))
 
 	switch v := value.(type) {
+	case bool:
+		a.Value().SetBool(v)
 	case int64:
 		a.Value().SetInt(v)
+	case float64:
+		a.Value().SetDouble(v)
 	case string:
 		a.Value().SetStr(v)
 	}

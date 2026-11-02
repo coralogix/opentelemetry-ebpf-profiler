@@ -154,6 +154,8 @@ jobs:
           persist-credentials: false
       - name: Set up environment
         uses: $/.github/workflows/env
+      - name: Install the USDT header for the fake GPU producer
+        run: sudo apt-get install -y --no-install-recommends systemtap-sdt-dev
       - name: Prepare integration test binaries for qemu tests
         run: make integration-test-binaries TARGET_ARCH=${{ matrix.target_arch }}
       - name: Upload integration test binaries

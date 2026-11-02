@@ -166,7 +166,10 @@ func (b *baseReporter) mergeSnapshots(tree samples.TraceEventsTree, ts time.Time
 				meta = hooks.processMeta(sample.PID)
 			}
 			events := snapshotEventsFor(tree, profile.ProfileType, sample.PID, meta)
-			key := samples.SampleKey{Hash: sample.TraceHash}
+			key := samples.SampleKey{
+				Hash:      sample.TraceHash,
+				ExtraMeta: b.snapshotExtraMeta(profile.ProfileType, &sample, meta, ts),
+			}
 			if existing, ok := events[key]; ok {
 				existing.Timestamps = append(existing.Timestamps, timestamp)
 				existing.Values = append(existing.Values, sample.Value)
@@ -174,11 +177,35 @@ func (b *baseReporter) mergeSnapshots(tree samples.TraceEventsTree, ts time.Time
 			}
 			events[key] = &samples.TraceEvents{
 				Frames:     sample.Frames,
+				Attributes: sample.Attributes,
 				Timestamps: []uint64{timestamp},
 				Values:     []int64{sample.Value},
 			}
 		}
 	}
+}
+
+// snapshotExtraMeta returns what the SampleAttrProducer, if any, collects for
+// a snapshot sample, as it does for trace events.
+func (b *baseReporter) snapshotExtraMeta(profileType *samples.TypeMetadata,
+	sample *samples.SnapshotSample, meta samples.ProcessMeta, ts time.Time,
+) any {
+	if b.cfg.ExtraSampleAttrProd == nil {
+		return nil
+	}
+	return b.cfg.ExtraSampleAttrProd.CollectExtraSampleMeta(
+		&libpf.Trace{Frames: sample.Frames},
+		&samples.TraceEventMeta{
+			ExecutablePath: meta.ExecutablePath,
+			ContainerID:    meta.ContainerID,
+			EnvVars:        meta.EnvVars,
+			ExtraMeta:      meta.ExtraMeta,
+			ResourceAttrs:  meta.ResourceAttrs,
+			Timestamp:      libpf.UnixTime64(ts.UnixNano()),
+			ProfileType:    profileType,
+			ContextValues:  []uint64{uint64(sample.Value)},
+			PID:            sample.PID,
+		})
 }
 
 // snapshotEventsFor returns the samples of profileType for the process's

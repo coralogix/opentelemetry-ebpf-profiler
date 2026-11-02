@@ -5,148 +5,92 @@ package gpu
 
 import (
 	"encoding/binary"
-	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/remotememory"
 )
 
-func TestDecodeKernelRecord(t *testing.T) {
-	b := make([]byte, producerRecordSize)
+// encodeEvent lays out an event as support/ebpf/gpu.ebpf.c sends it.
+func encodeEvent(pid uint32, correlationID uint64, sampleWeight uint32, kind uint16,
+	payload []byte,
+) []byte {
+	b := make([]byte, eventHeaderSize, eventHeaderSize+len(payload))
 	le := binary.LittleEndian
-	le.PutUint32(b[0:], recordKernel)
-	le.PutUint32(b[4:], 42)
-	le.PutUint64(b[8:], 1000)
-	le.PutUint64(b[16:], 1500)
-	le.PutUint32(b[24:], 7)
-	le.PutUint32(b[36:], 3)
-	le.PutUint64(b[40:], 0xdead)
-	le.PutUint64(b[48:], 0xbeef)
-	le.PutUint32(b[56:], 5)
+	le.PutUint32(b[0:], pid)
+	le.PutUint64(b[8:], correlationID)
+	le.PutUint32(b[16:], sampleWeight)
+	le.PutUint16(b[20:], kind)
+	le.PutUint16(b[22:], uint16(len(payload)))
+	return append(b, payload...)
+}
 
-	recordType, pid, ok := recordHeader(b)
-	require.True(t, ok)
-	assert.Equal(t, recordKernel, recordType)
-	assert.Equal(t, libpf.PID(42), pid)
+func appendString(b []byte, num protowire.Number, s string) []byte {
+	b = protowire.AppendTag(b, num, protowire.BytesType)
+	return protowire.AppendString(b, s)
+}
 
-	rec, ok := decodeKernelRecord(pid, b)
-	require.True(t, ok)
-	assert.Equal(t, kernelRecord{
-		pid:           42,
-		start:         1000,
-		end:           1500,
-		correlationID: 7,
-		graphID:       3,
-		namePtr:       0xdead,
-		rangesPtr:     0xbeef,
+func appendUint(b []byte, num protowire.Number, v uint64) []byte {
+	b = protowire.AppendTag(b, num, protowire.VarintType)
+	return protowire.AppendVarint(b, v)
+}
+
+func TestDecodeEvent(t *testing.T) {
+	var payload []byte
+	payload = appendString(payload, fieldGPU, "GPU-1")
+	payload = appendString(payload, fieldName, "HtoD")
+	payload = appendString(payload, fieldRanges, "aten::copy_")
+	payload = appendString(payload, fieldRanges, "train_step")
+	payload = appendUint(payload, fieldDurationNS, 1500)
+	payload = appendUint(payload, fieldBytes, 4096)
+
+	ev, err := decodeEvent(encodeEvent(7, 1<<40|42, 5, kindCopy, payload))
+	require.NoError(t, err)
+	assert.Equal(t, event{
+		pid:           libpf.PID(7),
+		correlationID: 1<<40 | 42,
 		sampleWeight:  5,
-	}, rec)
-
-	_, ok = decodeKernelRecord(pid, b[:producerRecordSize-1])
-	assert.False(t, ok)
-	_, _, ok = recordHeader(b[:recordHeaderSize-1])
-	assert.False(t, ok)
+		kind:          kindCopy,
+		gpu:           "GPU-1",
+		name:          "HtoD",
+		ranges:        "aten::copy_" + rangeSeparator + "train_step",
+		durationNS:    1500,
+		bytes:         4096,
+	}, ev)
 }
 
-func TestDemangleName(t *testing.T) {
-	tests := map[string]string{
-		"_Z10vector_addPfS_S_i": "vector_add",
-		"_ZN7cutlass7Kernel2INS_4gemm6kernel4GemmIiEEEEvNT_6ParamsE": "cutlass::Kernel2",
-		"flash_attn_ext_f16": "flash_attn_ext_f16",
-		"":                   "",
-	}
-	for mangled, want := range tests {
-		assert.Equal(t, want, demangleName(mangled), mangled)
-	}
+func TestDecodeEventSkipsUnknownFields(t *testing.T) {
+	var payload []byte
+	payload = appendString(payload, 99, "a later field")
+	payload = appendUint(payload, 100, 7)
+	payload = protowire.AppendTag(payload, 101, protowire.Fixed64Type)
+	payload = protowire.AppendFixed64(payload, 1)
+	payload = appendString(payload, fieldName, "k")
+	// A known field number with another wire type is skipped too.
+	payload = appendUint(payload, fieldName, 1)
+
+	ev, err := decodeEvent(encodeEvent(1, 2, 0, kindKernel, payload))
+	require.NoError(t, err)
+	assert.Equal(t, "k", ev.name)
 }
 
-// pagedMemory is process memory whose readable range ends at limit.
-type pagedMemory struct {
-	data  []byte
-	limit int64
-}
+func TestDecodeEventErrors(t *testing.T) {
+	full := encodeEvent(1, 2, 0, kindKernel, appendString(nil, fieldName, "kernel"))
 
-func (m pagedMemory) ReadAt(p []byte, off int64) (int, error) {
-	if off+int64(len(p)) > m.limit {
-		return 0, errors.New("unmapped")
-	}
-	return copy(p, m.data[off:]), nil
-}
+	_, err := decodeEvent(full[:eventHeaderSize-1])
+	require.ErrorIs(t, err, errShortEvent, "shorter than the header")
 
-func TestReadStringAtMappingEnd(t *testing.T) {
-	const name = "_Z10vector_addPfS_S_i"
-	data := make([]byte, 2*4096)
-	offset := 4096 - len(name) - 1
-	copy(data[offset:], name)
-	rm := remotememory.RemoteMemory{ReaderAt: pagedMemory{data: data, limit: 4096}}
+	_, err = decodeEvent(full[:len(full)-1])
+	require.ErrorIs(t, err, errShortEvent, "shorter than its payload size")
 
-	assert.Equal(t, name, readString(rm, uint64(offset)))
+	truncated := encodeEvent(1, 2, 0, kindKernel, appendString(nil, fieldName, "kernel")[:4])
+	_, err = decodeEvent(truncated)
+	require.Error(t, err, "a string cut inside the payload")
 
-	// A string continuing into the next readable page.
-	rm = remotememory.RemoteMemory{ReaderAt: pagedMemory{data: data, limit: int64(len(data))}}
-	copy(data[4090:], "spans pages\x00")
-	assert.Equal(t, "spans pages", readString(rm, 4090))
-
-	// Unterminated within the readable range.
-	for i := range data {
-		data[i] = 'x'
-	}
-	assert.Empty(t, readString(rm, 0))
-}
-
-func TestDecodeMemcpyAndEventRecords(t *testing.T) {
-	b := make([]byte, producerRecordSize)
-	le := binary.LittleEndian
-	le.PutUint64(b[8:], 100)
-	le.PutUint64(b[16:], 160)
-	le.PutUint32(b[24:], 9)
-	le.PutUint32(b[36:], 2)
-	le.PutUint64(b[40:], 4096)
-	le.PutUint64(b[48:], 0xbeef)
-	le.PutUint32(b[56:], 2)
-
-	memcpy, ok := decodeMemcpyRecord(5, b)
-	require.True(t, ok)
-	assert.Equal(t, memcpyRecord{
-		pid: 5, start: 100, end: 160, correlationID: 9, copyKind: 2, bytes: 4096, rangesPtr: 0xbeef,
-		sampleWeight: 2,
-	}, memcpy)
-
-	le.PutUint32(b[24:], eventAlloc)
-	le.PutUint32(b[28:], 11)
-	le.PutUint64(b[32:], 1<<20)
-	le.PutUint64(b[40:], 3)
-	event, ok := decodeEventRecord(5, b)
-	require.True(t, ok)
-	assert.Equal(t, eventRecord{
-		pid: 5, start: 100, end: 160, kind: eventAlloc, correlationID: 11,
-		v1: 1 << 20, v2: 3, namePtr: 0xbeef, sampleWeight: 2,
-	}, event)
-}
-
-func TestDecodeErrorRecord(t *testing.T) {
-	b := make([]byte, errorRecordSize)
-	binary.LittleEndian.PutUint32(b[recordHeaderSize:], 0xffffffff)
-	copy(b[recordHeaderSize+8:], "cuptiSubscribe failed\x00garbage")
-	rec, ok := decodeErrorRecord(7, b)
-	require.True(t, ok)
-	assert.Equal(t, errorRecord{pid: 7, code: -1, message: "cuptiSubscribe failed"}, rec)
-
-	_, ok = decodeErrorRecord(7, b[:errorRecordSize-1])
-	assert.False(t, ok)
-}
-
-func TestDecodeAPISpanRecord(t *testing.T) {
-	b := make([]byte, producerRecordSize)
-	le := binary.LittleEndian
-	le.PutUint64(b[8:], 10)
-	le.PutUint64(b[16:], 30)
-	le.PutUint64(b[24:], 4)
-	rec, ok := decodeAPISpanRecord(3, b)
-	require.True(t, ok)
-	assert.Equal(t, apiSpanRecord{pid: 3, start: 10, end: 30, cookie: 4}, rec)
+	ev, err := decodeEvent(encodeEvent(1, 2, 3, kindKernel, nil))
+	require.NoError(t, err, "every payload field is optional")
+	assert.Equal(t, uint32(3), ev.sampleWeight)
 }

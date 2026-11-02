@@ -235,6 +235,9 @@ func (pm *ProcessManager) attachProbes(pr process.Process, mappings []addedMappi
 	}
 	pm.attachMu.Lock()
 	defer pm.attachMu.Unlock()
+	if len(pm.probeAttachers) == 0 {
+		return
+	}
 
 	pid := pr.PID()
 	pm.mu.RLock()
@@ -265,7 +268,7 @@ func (pm *ProcessManager) detachProbes(pid libpf.PID) {
 // attachProbesForMapping iterates the registered ProbeAttachers and calls Attach
 // for every attacher whose Match returns true for the given mapping.
 // Attach may be called multiple times for the same attacher if the process
-// has more than one matching mapping. The caller must hold pm.mu for writing.
+// has more than one matching mapping. The caller must hold pm.attachMu.
 func (pm *ProcessManager) attachProbesForMapping(pr process.Process, m *process.RawMapping,
 	fileID libpf.FileID, elfRef *pfelf.Reference,
 ) {

@@ -2,17 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // libotelcupti.so — CUDA injection library (CUDA_INJECTION64_PATH), a
-// reference producer of the otel_gpu USDT probes consumed by probes/gpu.
-// Captures GPU timing and correlation ids through CUPTI and fires them as
-// probes of provider "otel_gpu" (probes/gpu/otel_gpu_usdt.h).
+// reference producer of the otel_gpu_v1 USDT probe consumed by probes/gpu.
+// Captures GPU calls and timing through CUPTI and sends them as events of the
+// otel_gpu_v1:event probe (probes/gpu/otel_gpu_v1_usdt.h).
 //
-// Plain C on purpose: the shim loads into arbitrary host processes, so no
+// Plain C on purpose: the library loads into arbitrary host processes, so no
 // libstdc++/C++ runtime ABI exposure (demangling happens on the Go side).
 //
-// Coexistence: CUPTI allows one subscriber per process before CUDA 13.2 /
-// r610. If another client (Kineto, Nsight, DCGM) holds it, we emit an
-// `error` probe and disable gracefully.
+// Coexistence: CUPTI allows one subscriber per process. If another tool
+// subscribed first, we log an error to stderr and disable gracefully.
 
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -23,19 +23,15 @@
 
 #include <cuda.h> /* CUDA_VERSION */
 #include <cupti.h>
-#include <cupti_pcsampling.h>
 #include <nvtx3/nvToolsExt.h> /* nvtxEventAttributes_t for NVTX range messages (NVTX3) */
 
 #if CUDA_VERSION < 12000
   #error "CUDA 12 or newer is required"
 #endif
 
-static void pc_on_context_created(CUcontext ctx);
-static void pc_on_context_destroy(CUcontext ctx);
-static void uvm_configure_ctx(CUcontext ctx);
-
-#define OTEL_GPU_SEMAPHORES
-#include "otel_gpu_usdt.h"
+#define OTEL_GPU_SEMAPHORE
+#include "cuda_driver.h"
+#include "otel_gpu_v1_usdt.h"
 #include "sampler.h"
 
 // CUPTI fills kernel activity records as the LATEST CUpti_ActivityKernelN
@@ -55,69 +51,25 @@ typedef CUpti_ActivityKernel8 otelcupti_kernel_activity_t;
 static CUpti_SubscriberHandle g_subscriber;
 static int g_enabled;
 
-/* An error fired at cuInit races the profiler's USDT attach, so keep the
- * last error and re-emit it periodically and at exit. msg is static. */
-static pthread_mutex_t g_err_mu = PTHREAD_MUTEX_INITIALIZER;
-static struct otel_gpu_error_rec g_last_err;
-static int g_err_started;
-static void start_error_reemit(void);
-
-/* The mutex keeps the re-emitted (code, msg) pair consistent. Rare path. */
-static void emit_error(int code, const char *msg)
+static void log_error(int code, const char *msg)
 {
-  struct otel_gpu_error_rec rec = {
-    .code    = code,
-    ._pad    = 0,
-    .msg_ptr = (uint64_t)(uintptr_t)msg,
-  };
-  OTEL_GPU_PROBE(error, &rec);
-  pthread_mutex_lock(&g_err_mu);
-  g_last_err = rec;
-  if (!g_err_started) {
-    g_err_started = 1;
-    start_error_reemit();
-  }
-  pthread_mutex_unlock(&g_err_mu);
-}
-
-static void *error_reemit_thread(void *arg)
-{
-  (void)arg;
-  unsigned interval = 60;
-  const char *s     = getenv("OTEL_GPU_ERROR_REEMIT_S");
-  if (s && atoi(s) > 0) {
-    interval = (unsigned)atoi(s);
-  }
-  for (;;) {
-    sleep(interval);
-    pthread_mutex_lock(&g_err_mu);
-    struct otel_gpu_error_rec rec = g_last_err;
-    pthread_mutex_unlock(&g_err_mu);
-    OTEL_GPU_PROBE(error, &rec);
-  }
-  return NULL;
-}
-
-static void start_error_reemit(void)
-{
-  pthread_t t;
-  pthread_attr_t a;
-  pthread_attr_init(&a);
-  pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-  pthread_create(&t, &a, error_reemit_thread, NULL);
-  pthread_attr_destroy(&a);
+  fprintf(stderr, "otelcupti: %s (%d)\n", msg, code);
 }
 
 /* ─── NVTX range tracking ────────────────────────────────────────────────────
  * NVTX ranges carry app-level names stripped host stacks lack. Keep a
  * per-thread range stack, intern the names, and keep the active nesting per
- * call site so buffer_completed can attach it per kernel. */
-#define NVTX_MAX_DEPTH 64
-#define NVTX_POOL_MAX  8192
+ * call so buffer_completed can attach it per kernel. */
+#define NVTX_MAX_DEPTH   64
+#define NVTX_POOL_MAX    (1 << 16)
+/* Slots looked at for a string: a string not found within them is not kept, so
+ * a full pool costs a few comparisons rather than a scan of all of it. */
+#define NVTX_POOL_PROBES 64
 
-/* Intern: dedup + strdup, NEVER freed — the agent reads the strings from
- * /proc/<pid>/mem asynchronously. Insert-only open-addressed hash: lock-free
- * reads, inserts take the mutex and re-probe. */
+/* Intern: dedup + strdup, NEVER freed — the call table keeps pointers to the
+ * joined stacks until the work of a call is reported, from another thread.
+ * Insert-only open-addressed hash: lock-free reads, inserts take the mutex and
+ * re-probe. Holds NVTX names and their joined stacks. */
 static pthread_mutex_t g_nvtx_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static const char *g_nvtx_pool[NVTX_POOL_MAX]; /* power-of-two slots */
 
@@ -136,14 +88,14 @@ static const char *nvtx_intern(const char *s)
     return NULL;
   }
   uint32_t h = fnv1a(s);
-  for (uint32_t i = 0; i < NVTX_POOL_MAX; i++) {
+  for (uint32_t i = 0; i < NVTX_POOL_PROBES; i++) {
     uint32_t slot = (h + i) & (NVTX_POOL_MAX - 1);
     const char *p = __atomic_load_n(&g_nvtx_pool[slot], __ATOMIC_ACQUIRE);
     if (p == NULL) {
       pthread_mutex_lock(&g_nvtx_pool_mu);
       /* Re-probe under the lock: another thread may have inserted. */
       const char *found = NULL;
-      for (; i < NVTX_POOL_MAX; i++) {
+      for (; i < NVTX_POOL_PROBES; i++) {
         slot = (h + i) & (NVTX_POOL_MAX - 1);
         p    = g_nvtx_pool[slot];
         if (p == NULL) {
@@ -157,13 +109,13 @@ static const char *nvtx_intern(const char *s)
         }
       }
       pthread_mutex_unlock(&g_nvtx_pool_mu);
-      return found; /* NULL when the table filled up concurrently */
+      return found; /* NULL when the slots filled up concurrently */
     }
     if (strcmp(p, s) == 0) {
       return p;
     }
   }
-  return NULL; /* table full */
+  return NULL; /* the slots of this string are full */
 }
 
 static __thread const char *t_nvtx_stack[NVTX_MAX_DEPTH];
@@ -219,81 +171,90 @@ static void nvtx_thread_pop(void)
   nvtx_recompute_joined();
 }
 
-/* ─── Call sites by correlation id ───────────────────────────────────────────
- * Every tracked call site leaves its sample weight (0 if not sampled) and its
- * NVTX nesting here, for buffer_completed to filter and label its GPU records.
- * Direct-mapped on sequential correlation ids = FIFO of the last SLOTS ids.
- * Must exceed the ids issued between a call and the flush of its records
- * (CUPTI flushes every second). Zero-page BSS. */
-#define CALL_SITE_SLOTS (1 << 19) /* power of two */
+/* ─── Calls by correlation id ────────────────────────────────────────────────
+ * Every tracked call leaves its sample weight and NVTX nesting here, for
+ * buffer_completed to filter, weigh and label its GPU records. Direct-mapped
+ * on sequential correlation ids = FIFO of the last SLOTS ids. CUDA gives every
+ * API call an id, tracked or not, so this must exceed the calls made between
+ * a call and the flush of its records (FLUSH_PERIOD_MS, plus the time its work
+ * waits on the GPU). Zero-page BSS. */
+#define CALL_SLOTS      (1 << 20) /* power of two */
+#define FLUSH_PERIOD_MS 500
 
-/* correlation id << 32 | sample weight; packed so a reader sees both or neither.
- * A torn read of the NVTX nesting only mislabels a kernel. */
-static uint64_t g_site_key[CALL_SITE_SLOTS];
-static const char *g_site_nvtx[CALL_SITE_SLOTS];
+/* correlation id << 32 | sample weight, 0 if not sampled; packed so a reader
+ * sees both or neither. A torn read of the NVTX nesting only mislabels a
+ * kernel. */
+static uint64_t g_call_key[CALL_SLOTS];
+static const char *g_call_nvtx[CALL_SLOTS];
 
-static void remember_call_site(uint32_t corr, uint32_t weight, const char *nvtx)
+/* CUPTI timestamp at which tracing started, UINT64_MAX while it is off: the GPU
+ * work of an untracked call that started earlier may come from before the
+ * profiler attached. */
+static uint64_t g_tracing_since = UINT64_MAX;
+/* Whether CUPTI records GPU work: LAUNCH events are sent only then. */
+static int g_tracing;
+
+static void remember_call(uint32_t corr, uint32_t weight, const char *nvtx)
 {
   if (corr == 0) {
     return;
   }
-  uint32_t h = corr & (CALL_SITE_SLOTS - 1);
-  __atomic_store_n(&g_site_nvtx[h], nvtx, __ATOMIC_RELEASE);
-  __atomic_store_n(&g_site_key[h], (uint64_t)corr << 32 | weight, __ATOMIC_RELEASE);
+  uint32_t h = corr & (CALL_SLOTS - 1);
+  __atomic_store_n(&g_call_nvtx[h], nvtx, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_call_key[h], (uint64_t)corr << 32 | weight, __ATOMIC_RELEASE);
 }
 
-static void report_lost_call_sites(void)
+static void report_lost_calls(void)
 {
   static int reported;
   if (!__atomic_exchange_n(&reported, 1, __ATOMIC_RELAXED)) {
-    emit_error(-1, "call site table too small: GPU records were dropped");
+    log_error(-1, "call table too small: GPU records were dropped");
   }
 }
 
-/* Returns the sample weight of the GPU records of call corr, 0 to drop them,
- * and its NVTX nesting. Records of untracked calls count once. */
-static uint32_t call_site_weight(uint32_t corr, const char **nvtx)
+/* Returns the sample weight of the call corr, 0 if its GPU records are not
+ * reported, and its NVTX nesting. The records of an untracked call, which sent
+ * no LAUNCH event, count once if they started after tracing did. */
+static uint32_t call_weight(uint32_t corr, uint64_t start, const char **nvtx)
 {
   *nvtx = NULL;
-  if (corr == 0) {
-    return 1;
+  if (corr != 0) {
+    uint32_t h          = corr & (CALL_SLOTS - 1);
+    const uint64_t key  = __atomic_load_n(&g_call_key[h], __ATOMIC_ACQUIRE);
+    const uint32_t call = (uint32_t)(key >> 32);
+    if (key != 0 && call == corr) {
+      *nvtx = __atomic_load_n(&g_call_nvtx[h], __ATOMIC_ACQUIRE);
+      return (uint32_t)key;
+    }
+    if (key != 0 && (int32_t)(call - corr) > 0) {
+      /* A later call took the slot: whether this one was sampled is lost. */
+      report_lost_calls();
+      return 0;
+    }
   }
-  uint32_t h          = corr & (CALL_SITE_SLOTS - 1);
-  const uint64_t key  = __atomic_load_n(&g_site_key[h], __ATOMIC_ACQUIRE);
-  const uint32_t site = (uint32_t)(key >> 32);
-  if (key != 0 && site == corr) {
-    *nvtx = __atomic_load_n(&g_site_nvtx[h], __ATOMIC_ACQUIRE);
-    return (uint32_t)key;
-  }
-  if (key != 0 && (int32_t)(site - corr) > 0) {
-    /* A later call took the slot: whether this one was sampled is lost. */
-    report_lost_call_sites();
-    return 0;
-  }
-  return 1;
+  return start >= __atomic_load_n(&g_tracing_since, __ATOMIC_ACQUIRE) ? 1 : 0;
 }
 
-/* ─── Call site sampling ────────────────────────────────────────────────────
- * Kernel launches, graph launches, memory operations and allocations are
- * sampled apart, so a rare class keeps its samples next to a frequent one. */
-enum call_site_class {
-  SITE_NONE = -1,
-  SITE_KERNEL,
-  SITE_GRAPH,
-  SITE_MEMORY,
-  SITE_ALLOC,
-  SITE_CLASSES,
+/* ─── Call sampling ──────────────────────────────────────────────────────────
+ * Kernel launches, graph launches and memory operations are sampled apart, so
+ * a rare class keeps its samples next to a frequent one. */
+enum call_class {
+  CALL_UNTRACKED,
+  CALL_KERNEL,
+  CALL_GRAPH,
+  CALL_MEMORY,
+  CALL_CLASSES,
 };
 
-/* Default sampled call sites per thread per second. Graph launches are sampled
+/* Default sampled calls per thread per second. Graph launches are sampled
  * less, as each runs many kernels. */
 #define DEFAULT_SAMPLE_RATE       200
 #define DEFAULT_GRAPH_SAMPLE_RATE 20
 
-/* Sampled call sites per thread per second, by class; 0 samples all of them. */
-static uint32_t g_sample_rate[SITE_CLASSES];
+/* Sampled calls per thread per second, by class; 0 samples all of them. */
+static uint32_t g_sample_rate[CALL_CLASSES];
 
-static __thread struct otel_sampler t_samplers[SITE_CLASSES];
+static __thread struct otel_sampler t_samplers[CALL_CLASSES];
 static __thread uint64_t t_rng;
 
 static uint64_t now_ns(void)
@@ -303,7 +264,7 @@ static uint64_t now_ns(void)
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static uint32_t sample_call_site(enum call_site_class cls)
+static uint32_t sample_call(enum call_class cls)
 {
   const uint64_t now = now_ns();
   if (t_rng == 0) {
@@ -382,6 +343,75 @@ static void handle_nvtx(const CUpti_NvtxData *d)
   }
 }
 
+/* ─── Debug totals ───────────────────────────────────────────────────────────
+ * With OTEL_GPU_DEBUG_TOTALS set, the producer adds up the GPU work that
+ * started while it traced, sampled or not, and what its samples stand for. It
+ * prints both every DEBUG_TOTALS_PERIOD_MS while tracing, and when tracing
+ * stops or the process exits: a profile of the same period adds up to the
+ * second, an estimate of the first. */
+#define DEBUG_TOTALS_PERIOD_MS 10000
+
+struct work_totals {
+  uint64_t kernel_ns;
+  uint64_t memory_ns;
+  uint64_t memory_bytes;
+};
+
+static int g_debug_totals;
+static struct work_totals g_exact_totals;
+static struct work_totals g_estimated_totals;
+static uint32_t g_largest_payload;
+
+static void
+add_totals(struct work_totals *t, int memory, uint64_t ns, uint64_t bytes, uint32_t times)
+{
+  __atomic_fetch_add(memory ? &t->memory_ns : &t->kernel_ns, ns * times, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&t->memory_bytes, bytes * times, __ATOMIC_RELAXED);
+}
+
+static void count_work(int memory, uint64_t start, uint64_t end, uint64_t bytes, uint32_t weight)
+{
+  if (!g_debug_totals || start < __atomic_load_n(&g_tracing_since, __ATOMIC_ACQUIRE)) {
+    return;
+  }
+  const uint64_t ns = end > start ? end - start : 0;
+  add_totals(&g_exact_totals, memory, ns, bytes, 1);
+  add_totals(&g_estimated_totals, memory, ns, bytes, weight);
+}
+
+static void count_payload(const struct otel_gpu_event *ev)
+{
+  uint32_t largest = __atomic_load_n(&g_largest_payload, __ATOMIC_RELAXED);
+  while (ev->payload_size > largest &&
+         !__atomic_compare_exchange_n(
+           &g_largest_payload, &largest, ev->payload_size, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+  }
+}
+
+static unsigned long long read_total(uint64_t *v, int reset)
+{
+  return reset ? __atomic_exchange_n(v, 0, __ATOMIC_RELAXED) : __atomic_load_n(v, __ATOMIC_RELAXED);
+}
+
+/* Prints the totals since tracing started; reset starts new ones. */
+static void print_totals(int reset)
+{
+  fprintf(
+    stderr,
+    "otelcupti: debug totals: pid=%d exact_kernel_ns=%llu exact_memory_ns=%llu "
+    "exact_memory_bytes=%llu estimated_kernel_ns=%llu estimated_memory_ns=%llu "
+    "estimated_memory_bytes=%llu largest_payload=%u\n",
+    (int)getpid(),
+    read_total(&g_exact_totals.kernel_ns, reset),
+    read_total(&g_exact_totals.memory_ns, reset),
+    read_total(&g_exact_totals.memory_bytes, reset),
+    read_total(&g_estimated_totals.kernel_ns, reset),
+    read_total(&g_estimated_totals.memory_ns, reset),
+    read_total(&g_estimated_totals.memory_bytes, reset),
+    reset ? __atomic_exchange_n(&g_largest_payload, 0, __ATOMIC_RELAXED)
+          : __atomic_load_n(&g_largest_payload, __ATOMIC_RELAXED));
+}
+
 /* ─── Activity API: real GPU timing ─────────────────────────────────────────── */
 static void CUPTIAPI buffer_requested(uint8_t **buffer, size_t *size, size_t *max_num_records)
 {
@@ -394,6 +424,107 @@ static void CUPTIAPI buffer_requested(uint8_t **buffer, size_t *size, size_t *ma
   }
   *buffer          = (uint8_t *)p; /* freed (same pointer) in buffer_completed */
   *max_num_records = 0;            /* fill as many as fit */
+}
+
+/* emit_event is the only place firing the probe, so the profiler attaches one
+ * uprobe to the library. */
+__attribute__((noinline)) static void emit_event(const struct otel_gpu_event *ev)
+{
+  OTEL_GPU_EVENT(ev);
+}
+
+static void
+begin_event(struct otel_gpu_event *ev, enum otel_gpu_kind kind, uint32_t corr, uint32_t weight)
+{
+  ev->correlation_id = corr;
+  ev->sample_weight  = weight;
+  ev->kind           = (uint16_t)kind;
+  ev->payload_size   = 0;
+}
+
+/* put_work adds the fields of an event of GPU work: the GPU, how long it took,
+ * how many bytes it moved, its name, and the names of the work in progress at
+ * its call, innermost first. Names come last: one too long for the payload is
+ * cut short, and must not crowd out the others. */
+static void put_work(
+  struct otel_gpu_event *ev,
+  uint32_t device,
+  uint64_t start,
+  uint64_t end,
+  uint64_t bytes,
+  const char *name,
+  const char *nvtx)
+{
+  otel_gpu_put_string(ev, OTEL_GPU_FIELD_GPU, gpu_uuid(device));
+  otel_gpu_put_uint(ev, OTEL_GPU_FIELD_DURATION_NS, end > start ? end - start : 0);
+  otel_gpu_put_uint(ev, OTEL_GPU_FIELD_BYTES, bytes);
+  otel_gpu_put_string(ev, OTEL_GPU_FIELD_NAME, name);
+  for (const char *range = nvtx; range && *range;) {
+    const char *sep  = strchr(range, NVTX_SEP);
+    const size_t len = sep ? (size_t)(sep - range) : strlen(range);
+    otel_gpu_put_bytes(ev, OTEL_GPU_FIELD_RANGES, range, len);
+    range = sep ? sep + 1 : NULL;
+  }
+  if (g_debug_totals) {
+    count_payload(ev);
+  }
+}
+
+static void report_kernel(const otelcupti_kernel_activity_t *k)
+{
+  const char *nvtx;
+  const uint32_t weight = call_weight(k->correlationId, k->start, &nvtx);
+  count_work(0, k->start, k->end, 0, weight);
+  if (weight == 0) {
+    return;
+  }
+  struct otel_gpu_event ev;
+  begin_event(&ev, OTEL_GPU_KERNEL, k->correlationId, weight);
+  put_work(&ev, k->deviceId, k->start, k->end, 0, k->name, nvtx);
+  emit_event(&ev);
+}
+
+/* Names of CUpti_ActivityMemcpyKind values: where the data went. */
+static const char *const g_copy_kinds[] = {
+  [CUPTI_ACTIVITY_MEMCPY_KIND_HTOD] = "HtoD",
+  [CUPTI_ACTIVITY_MEMCPY_KIND_DTOH] = "DtoH",
+  [CUPTI_ACTIVITY_MEMCPY_KIND_HTOA] = "HtoA",
+  [CUPTI_ACTIVITY_MEMCPY_KIND_ATOH] = "AtoH",
+  [CUPTI_ACTIVITY_MEMCPY_KIND_ATOA] = "AtoA",
+  [CUPTI_ACTIVITY_MEMCPY_KIND_ATOD] = "AtoD",
+  [CUPTI_ACTIVITY_MEMCPY_KIND_DTOA] = "DtoA",
+  [CUPTI_ACTIVITY_MEMCPY_KIND_DTOD] = "DtoD",
+  [CUPTI_ACTIVITY_MEMCPY_KIND_HTOH] = "HtoH",
+};
+
+static void report_memcpy(const CUpti_ActivityMemcpy *m)
+{
+  const char *nvtx;
+  const uint32_t weight = call_weight(m->correlationId, m->start, &nvtx);
+  count_work(1, m->start, m->end, m->bytes, weight);
+  if (weight == 0) {
+    return;
+  }
+  const char *name =
+    m->copyKind < sizeof(g_copy_kinds) / sizeof(g_copy_kinds[0]) ? g_copy_kinds[m->copyKind] : NULL;
+  struct otel_gpu_event ev;
+  begin_event(&ev, OTEL_GPU_COPY, m->correlationId, weight);
+  put_work(&ev, m->deviceId, m->start, m->end, m->bytes, name, nvtx);
+  emit_event(&ev);
+}
+
+static void report_memset(const CUpti_ActivityMemset *m)
+{
+  const char *nvtx;
+  const uint32_t weight = call_weight(m->correlationId, m->start, &nvtx);
+  count_work(1, m->start, m->end, m->bytes, weight);
+  if (weight == 0) {
+    return;
+  }
+  struct otel_gpu_event ev;
+  begin_event(&ev, OTEL_GPU_FILL, m->correlationId, weight);
+  put_work(&ev, m->deviceId, m->start, m->end, m->bytes, NULL, nvtx);
+  emit_event(&ev);
 }
 
 static void CUPTIAPI
@@ -410,111 +541,10 @@ buffer_completed(CUcontext ctx, uint32_t stream_id, uint8_t *buffer, size_t size
     if (st == CUPTI_SUCCESS) {
       switch (record->kind) {
       case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL:
-      case CUPTI_ACTIVITY_KIND_KERNEL: {
-        otelcupti_kernel_activity_t *k = (otelcupti_kernel_activity_t *)record;
-        const char *nvtx;
-        const uint32_t weight = call_site_weight(k->correlationId, &nvtx);
-        if (weight == 0) {
-          break;
-        }
-        struct otel_gpu_kernel_rec rec = {0};
-        rec.start                      = k->start;
-        rec.end                        = k->end;
-        rec.correlation_id             = k->correlationId;
-        rec.device_id                  = k->deviceId;
-        rec.stream_id                  = k->streamId;
-        rec.graph_id                   = k->graphId;
-        rec.name_ptr                   = (uint64_t)(uintptr_t)(k->name ? k->name : "");
-        rec.ranges_ptr                 = (uint64_t)(uintptr_t)nvtx;
-        rec.sample_weight              = weight;
-        OTEL_GPU_PROBE(kernel_executed, &rec);
+        report_kernel((const otelcupti_kernel_activity_t *)record);
         break;
-      }
-      case CUPTI_ACTIVITY_KIND_MEMCPY: {
-        CUpti_ActivityMemcpy *m = (CUpti_ActivityMemcpy *)record;
-        const char *nvtx;
-        const uint32_t weight = call_site_weight(m->correlationId, &nvtx);
-        if (weight == 0) {
-          break;
-        }
-        struct otel_gpu_mem_rec rec = {0};
-        rec.start                   = m->start;
-        rec.end                     = m->end;
-        rec.correlation_id          = m->correlationId;
-        rec.device_id               = m->deviceId;
-        rec.stream_id               = m->streamId;
-        rec.copy_kind               = m->copyKind;
-        rec.bytes                   = m->bytes;
-        rec.ranges_ptr              = (uint64_t)(uintptr_t)nvtx;
-        rec.sample_weight           = weight;
-        OTEL_GPU_PROBE(gpu_mem, &rec);
-        break;
-      }
-      case CUPTI_ACTIVITY_KIND_MEMSET: {
-        CUpti_ActivityMemset *m = (CUpti_ActivityMemset *)record;
-        const char *nvtx;
-        const uint32_t weight = call_site_weight(m->correlationId, &nvtx);
-        if (weight == 0) {
-          break;
-        }
-        struct otel_gpu_event_rec ev = {0};
-        ev.kind                      = OTEL_GPU_EVENT_MEMSET;
-        ev.start                     = m->start;
-        ev.end                       = m->end;
-        ev.correlation_id            = m->correlationId;
-        ev.v1                        = m->bytes;
-        ev.sample_weight             = weight;
-        OTEL_GPU_PROBE(gpu_event, &ev);
-        break;
-      }
-      case CUPTI_ACTIVITY_KIND_MEMORY2: {
-        CUpti_ActivityMemory3 *m = (CUpti_ActivityMemory3 *)record;
-        const char *nvtx;
-        const uint32_t weight = call_site_weight(m->correlationId, &nvtx);
-        if (weight == 0) {
-          break;
-        }
-        struct otel_gpu_event_rec ev = {0};
-        ev.kind  = (m->memoryOperationType == CUPTI_ACTIVITY_MEMORY_OPERATION_TYPE_ALLOCATION)
-                     ? OTEL_GPU_EVENT_ALLOC
-                     : OTEL_GPU_EVENT_FREE;
-        ev.start = m->timestamp;
-        ev.end   = m->timestamp;
-        ev.correlation_id = m->correlationId;
-        ev.v1             = m->bytes;
-        ev.v2             = m->memoryKind;
-        ev.sample_weight  = weight;
-        OTEL_GPU_PROBE(gpu_event, &ev);
-        break;
-      }
-      case CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER: {
-        CUpti_ActivityUnifiedMemoryCounter2 *u = (CUpti_ActivityUnifiedMemoryCounter2 *)record;
-        struct otel_gpu_event_rec ev           = {0};
-        switch (u->counterKind) {
-        case CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_BYTES_TRANSFER_HTOD:
-          ev.kind = OTEL_GPU_EVENT_UVM_HTOD;
-          break;
-        case CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_BYTES_TRANSFER_DTOH:
-          ev.kind = OTEL_GPU_EVENT_UVM_DTOH;
-          break;
-        case CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_CPU_PAGE_FAULT_COUNT:
-          ev.kind = OTEL_GPU_EVENT_UVM_CPU_FLT;
-          ev.v2   = 1; // value carries the faulting address, not a count
-          break;
-        case CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_GPU_PAGE_FAULT:
-          ev.kind = OTEL_GPU_EVENT_UVM_GPU_FLT;
-          break;
-        default: ev.kind = 0; break;
-        }
-        if (ev.kind != 0) {
-          ev.start = u->start;
-          ev.end   = u->end;
-          ev.v1    = (ev.v2 != 0) ? ev.v2 : u->value; // v2 set = per-record count
-          ev.v2    = 0;
-          OTEL_GPU_PROBE(gpu_event, &ev);
-        }
-        break;
-      }
+      case CUPTI_ACTIVITY_KIND_MEMCPY: report_memcpy((const CUpti_ActivityMemcpy *)record); break;
+      case CUPTI_ACTIVITY_KIND_MEMSET: report_memset((const CUpti_ActivityMemset *)record); break;
       default: break;
       }
     } else if (st != CUPTI_ERROR_MAX_LIMIT_REACHED) {
@@ -527,69 +557,79 @@ buffer_completed(CUcontext ctx, uint32_t stream_id, uint8_t *buffer, size_t size
 
 /* ─── Callback API: launch correlation (CPU side) ──────────────────────────── */
 
-/* Tracked call sites: their callbacks are enabled and they fire on_launch.
- * ggml/llama.cpp and most native backends launch through the driver API. */
+/* Tracked calls send LAUNCH events: the runtime and driver API calls that
+ * launch kernels or graphs, or copy or fill memory. They are found by name at
+ * start, so that every variant is tracked, also those of later CUDA versions.
+ * The first matching prefix decides. */
 static const struct {
-  CUpti_CallbackDomain domain;
-  CUpti_CallbackId cbid;
-  enum call_site_class cls;
-} g_call_sites[] = {
-  {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000, SITE_KERNEL},
-  {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060, SITE_KERNEL},
-  {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000, SITE_GRAPH},
-  {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyAsync_v3020, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaMemset_v3020, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaMemsetAsync_v3020, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020, SITE_ALLOC},
-  {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020, SITE_ALLOC},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, SITE_KERNEL},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel_ptsz, SITE_KERNEL},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx, SITE_KERNEL},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx_ptsz, SITE_KERNEL},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernel, SITE_KERNEL},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernel_ptsz, SITE_KERNEL},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchGridAsync, SITE_KERNEL},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, SITE_GRAPH},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz, SITE_GRAPH},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpy, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpy_ptds, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyAsync, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyAsync_ptsz, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyHtoD_v2, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyHtoD_v2_ptds, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyHtoDAsync_v2, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyHtoDAsync_v2_ptsz, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyDtoH_v2, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyDtoH_v2_ptds, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyDtoHAsync_v2, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyDtoHAsync_v2_ptsz, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyDtoD_v2, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyDtoD_v2_ptds, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyDtoDAsync_v2, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemcpyDtoDAsync_v2_ptsz, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemsetD8_v2, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemsetD32_v2, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemsetD8Async, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemsetD32Async, SITE_MEMORY},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemAlloc_v2, SITE_ALLOC},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemFree_v2, SITE_ALLOC},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemAllocAsync, SITE_ALLOC},
-  {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemFreeAsync, SITE_ALLOC},
+  const char *prefix;
+  enum call_class cls;
+} g_call_prefixes[] = {
+  /* Host functions run on the CPU. */
+  {"cudaLaunchHostFunc", CALL_UNTRACKED},
+  {"cuLaunchHostFunc", CALL_UNTRACKED},
+  {"cudaGraphLaunch", CALL_GRAPH},
+  {"cuGraphLaunch", CALL_GRAPH},
+  {"cudaLaunch", CALL_KERNEL},
+  {"cuLaunch", CALL_KERNEL},
+  {"cudaMemcpy", CALL_MEMORY},
+  {"cudaMemset", CALL_MEMORY},
+  {"cuMemcpy", CALL_MEMORY},
+  {"cuMemset", CALL_MEMORY},
 };
 
-static enum call_site_class call_site_class(CUpti_CallbackDomain domain, CUpti_CallbackId cbid)
+/* The class of each runtime and driver API call, filled at start. */
+static uint8_t g_runtime_class[CUPTI_RUNTIME_TRACE_CBID_SIZE];
+static uint8_t g_driver_class[CUPTI_DRIVER_TRACE_CBID_SIZE];
+
+static enum call_class classify_call(const char *name)
 {
-  for (size_t i = 0; i < sizeof(g_call_sites) / sizeof(g_call_sites[0]); i++) {
-    if (g_call_sites[i].domain == domain && g_call_sites[i].cbid == cbid) {
-      return g_call_sites[i].cls;
+  for (size_t i = 0; i < sizeof(g_call_prefixes) / sizeof(g_call_prefixes[0]); i++) {
+    const char *prefix = g_call_prefixes[i].prefix;
+    if (strncmp(name, prefix, strlen(prefix)) == 0) {
+      return g_call_prefixes[i].cls;
     }
   }
-  return SITE_NONE;
+  return CALL_UNTRACKED;
 }
 
-/* Correlation id of the tracked runtime API call last made on this thread. */
-static __thread uint32_t t_runtime_corr;
+/* Enables the callbacks of the tracked calls among the count calls of a domain,
+ * and returns how many could not be enabled. */
+static uint32_t track_calls(CUpti_CallbackDomain domain, uint8_t *classes, uint32_t count)
+{
+  uint32_t failed = 0;
+  for (uint32_t cbid = 0; cbid < count; cbid++) {
+    const char *name = NULL;
+    if (cuptiGetCallbackName(domain, cbid, &name) != CUPTI_SUCCESS || !name) {
+      continue;
+    }
+    const enum call_class cls = classify_call(name);
+    if (cls == CALL_UNTRACKED) {
+      continue;
+    }
+    if (cuptiEnableCallback(1, g_subscriber, domain, cbid) != CUPTI_SUCCESS) {
+      failed++;
+      continue;
+    }
+    classes[cbid] = (uint8_t)cls;
+  }
+  return failed;
+}
+
+static enum call_class call_class(CUpti_CallbackDomain domain, CUpti_CallbackId cbid)
+{
+  if (domain == CUPTI_CB_DOMAIN_RUNTIME_API && cbid < CUPTI_RUNTIME_TRACE_CBID_SIZE) {
+    return (enum call_class)g_runtime_class[cbid];
+  }
+  if (domain == CUPTI_CB_DOMAIN_DRIVER_API && cbid < CUPTI_DRIVER_TRACE_CBID_SIZE) {
+    return (enum call_class)g_driver_class[cbid];
+  }
+  return CALL_UNTRACKED;
+}
+
+/* Correlation id of the call last decided on this thread: a runtime call and
+ * the driver calls it makes share it, and are decided once. */
+static __thread uint32_t t_decided_corr;
 static void CUPTIAPI
 api_callback(void *userdata, CUpti_CallbackDomain domain, CUpti_CallbackId cbid, const void *cbinfo)
 {
@@ -599,383 +639,213 @@ api_callback(void *userdata, CUpti_CallbackDomain domain, CUpti_CallbackId cbid,
     handle_nvtx((const CUpti_NvtxData *)cbinfo);
     return;
   }
-  if (domain == CUPTI_CB_DOMAIN_RESOURCE) {
-    if (cbid == CUPTI_CBID_RESOURCE_CONTEXT_CREATED) {
-      uvm_configure_ctx(((const CUpti_ResourceData *)cbinfo)->context);
-      pc_on_context_created(((const CUpti_ResourceData *)cbinfo)->context);
-    }
-    if (cbid == CUPTI_CBID_RESOURCE_CONTEXT_DESTROY_STARTING) {
-      pc_on_context_destroy(((const CUpti_ResourceData *)cbinfo)->context);
-    }
-    return;
-  }
   const CUpti_CallbackData *cb = (const CUpti_CallbackData *)cbinfo;
   if (cb->callbackSite != CUPTI_API_ENTER) {
     return;
   }
-  const enum call_site_class cls = call_site_class(domain, cbid);
-  if (cls == SITE_NONE) {
+  const enum call_class cls = call_class(domain, cbid);
+  if (cls == CALL_UNTRACKED) {
     return;
   }
-  // A runtime API call reaches the driver API with the same correlation id:
-  // decide once, at the runtime call.
-  if (domain == CUPTI_CB_DOMAIN_DRIVER_API && cb->correlationId == t_runtime_corr) {
+  // A runtime API call reaches the driver API with the same correlation id,
+  // and so may several driver calls of one untracked runtime call.
+  if (cb->correlationId == t_decided_corr) {
     return;
   }
-  if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
-    t_runtime_corr = cb->correlationId;
-  }
+  t_decided_corr = cb->correlationId;
 
-  // Sampled call sites fire on_launch, the host stack keyed by correlation id.
-  // Without a profiler attached none is: its GPU records would lack the stack.
-  const uint32_t weight = OTEL_GPU_ENABLED(ready) ? sample_call_site(cls) : 0;
+  // Sampled calls send a LAUNCH event, for the profiler to record the host
+  // stack under the correlation id. None is sent while CUPTI does not record
+  // GPU work: the call's GPU records would never come.
+  const int reporting   = OTEL_GPU_ENABLED() && __atomic_load_n(&g_tracing, __ATOMIC_ACQUIRE);
+  const uint32_t weight = reporting ? sample_call(cls) : 0;
   if (weight != 0) {
-    const struct otel_gpu_launch_rec lrec = {
-      .correlation_id = cb->correlationId,
-      .sample_weight  = weight,
-    };
-    OTEL_GPU_PROBE(on_launch, &lrec);
+    struct otel_gpu_event ev;
+    begin_event(&ev, OTEL_GPU_LAUNCH, cb->correlationId, weight);
+    emit_event(&ev);
   }
-  remember_call_site(cb->correlationId, weight, weight != 0 ? t_nvtx_joined : NULL);
+  remember_call(cb->correlationId, weight, weight != 0 ? t_nvtx_joined : NULL);
 }
 
-/* Unified-memory counters (migrations + page faults). Configuring before a
- * context exists fails, so this runs from CONTEXT_CREATED — once per DEVICE
- * (the config carries a deviceId; a single one-shot would cover only device
- * 0 in multi-GPU processes). */
-static void uvm_configure_ctx(CUcontext ctx)
+/* ─── Tracing while the profiler is attached ────────────────────────────────
+ * The activity kinds are on only while the probe's semaphore is raised, so the
+ * producer costs little without a profiler: a check of the semaphore at each
+ * tracked call. */
+static pthread_mutex_t g_tracing_mu = PTHREAD_MUTEX_INITIALIZER;
+/* Set once tracing could not start: the producer then reports nothing. */
+static int g_tracing_failed;
+
+static const CUpti_ActivityKind g_activity_kinds[] = {
+  CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL,
+  CUPTI_ACTIVITY_KIND_MEMCPY,
+  CUPTI_ACTIVITY_KIND_MEMSET,
+};
+#define NUM_ACTIVITY_KINDS (sizeof(g_activity_kinds) / sizeof(g_activity_kinds[0]))
+
+static void disable_activity(size_t count)
 {
-  uint32_t dev = 0;
-  if (cuptiGetDeviceId(ctx, &dev) != CUPTI_SUCCESS || dev >= 64) {
-    return;
-  }
-  static uint64_t done_mask;
-  uint64_t bit = 1ull << dev;
-  if (__atomic_fetch_or(&done_mask, bit, __ATOMIC_RELAXED) & bit) {
-    return;
-  }
-  CUpti_ActivityUnifiedMemoryCounterConfig uvm[4]       = {0};
-  const CUpti_ActivityUnifiedMemoryCounterKind kinds[4] = {
-    CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_BYTES_TRANSFER_HTOD,
-    CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_BYTES_TRANSFER_DTOH,
-    CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_CPU_PAGE_FAULT_COUNT,
-    CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_GPU_PAGE_FAULT,
-  };
-  for (int i = 0; i < 4; i++) {
-    uvm[i].scope    = CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_SCOPE_PROCESS_SINGLE_DEVICE;
-    uvm[i].kind     = kinds[i];
-    uvm[i].deviceId = dev;
-    uvm[i].enable   = 1;
-  }
-  CUptiResult r = cuptiActivityConfigureUnifiedMemoryCounter(uvm, 4);
-  if (r == CUPTI_SUCCESS) {
-    static int kind_enabled;
-    if (!__atomic_exchange_n(&kind_enabled, 1, __ATOMIC_RELAXED)) {
-      r = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER);
-    }
-  }
-  if (r != CUPTI_SUCCESS) {
-    emit_error((int)r, "UVM counter enable failed");
-  }
-}
-
-/* ─── PC sampling: per-kernel stall reasons ──────────────────────────────────
- * Continuous PC sampling (Volta+, CUDA 11.3+): hardware samples warp program
- * counters with stall reasons per context; a worker thread drains them every
- * second into gpu_event records. Needs profiling permission
- * (RmProfilingAdminOnly=0 or root). Opt-in via OTEL_GPU_PC_SAMPLING=1. */
-
-#define PC_MAX_CTX 16
-#define PC_BUF_PCS 4000
-
-static pthread_mutex_t g_pc_mu = PTHREAD_MUTEX_INITIALIZER;
-static CUcontext g_pc_ctx[PC_MAX_CTX];
-static int g_pc_nctx;
-static CUcontext g_pc_pending[PC_MAX_CTX];
-static int g_pc_npending;
-static int g_pc_worker_started;
-static int g_pc_failed;
-static char **g_pc_stall_names; /* CUPTI-owned, stable */
-static uint32_t *g_pc_stall_idx;
-static size_t g_pc_nstall;
-/* CUPTI fills g_pc_collect continuously; GetData drains into g_pc_data. */
-static CUpti_PCSamplingData g_pc_collect;
-static CUpti_PCSamplingData g_pc_data;
-
-static int pc_fetch_stall_names(CUcontext ctx)
-{
-  if (g_pc_nstall > 0) {
-    return 1;
-  }
-  CUpti_PCSamplingGetNumStallReasonsParams np = {
-    .size = CUpti_PCSamplingGetNumStallReasonsParamsSize,
-    .ctx  = ctx,
-  };
-  size_t n           = 0;
-  np.numStallReasons = &n;
-  CUptiResult r      = cuptiPCSamplingGetNumStallReasons(&np);
-  if (r != CUPTI_SUCCESS || n == 0) {
-    emit_error((int)r, "PC sampling: GetNumStallReasons failed");
-    return 0;
-  }
-  g_pc_stall_names = (char **)calloc(n, sizeof(char *));
-  g_pc_stall_idx   = (uint32_t *)calloc(n, sizeof(uint32_t));
-  for (size_t i = 0; i < n; i++) {
-    g_pc_stall_names[i] = (char *)calloc(128, 1);
-  }
-  CUpti_PCSamplingGetStallReasonsParams sp = {
-    .size             = CUpti_PCSamplingGetStallReasonsParamsSize,
-    .ctx              = ctx,
-    .numStallReasons  = n,
-    .stallReasonIndex = g_pc_stall_idx,
-    .stallReasons     = g_pc_stall_names,
-  };
-  if (cuptiPCSamplingGetStallReasons(&sp) != CUPTI_SUCCESS) {
-    return 0;
-  }
-  g_pc_nstall = n;
-  return 1;
-}
-
-static const char *pc_stall_name(uint32_t idx)
-{
-  for (size_t i = 0; i < g_pc_nstall; i++) {
-    if (g_pc_stall_idx[i] == idx) {
-      return g_pc_stall_names[i];
-    }
-  }
-  return NULL;
-}
-
-static void pc_drain_ctx(CUcontext ctx)
-{
-  CUpti_PCSamplingGetDataParams gp = {
-    .size           = CUpti_PCSamplingGetDataParamsSize,
-    .ctx            = ctx,
-    .pcSamplingData = &g_pc_data,
-  };
-  if (cuptiPCSamplingGetData(&gp) != CUPTI_SUCCESS) {
-    return;
-  }
-  for (size_t i = 0; i < g_pc_data.totalNumPcs && i < PC_BUF_PCS; i++) {
-    CUpti_PCSamplingPCData *pc = &g_pc_data.pPcData[i];
-    const char *fn             = nvtx_intern(pc->functionName); /* CUPTI reuses the buffer */
-    if (!fn) {
-      continue;
-    }
-    for (size_t s = 0; s < pc->stallReasonCount; s++) {
-      const char *reason = pc_stall_name(pc->stallReason[s].pcSamplingStallReasonIndex);
-      if (!reason || pc->stallReason[s].samples == 0) {
-        continue;
-      }
-      struct otel_gpu_event_rec ev = {0};
-      ev.kind                      = OTEL_GPU_EVENT_STALL;
-      ev.name_ptr                  = (uint64_t)(uintptr_t)fn;
-      ev.v1                        = (uint64_t)(uintptr_t)reason;
-      ev.v2                        = pc->stallReason[s].samples;
-      OTEL_GPU_PROBE(gpu_event, &ev);
+  for (size_t i = 0; i < count; i++) {
+    CUptiResult r = cuptiActivityDisable(g_activity_kinds[i]);
+    if (r != CUPTI_SUCCESS) {
+      log_error((int)r, "activity disable failed");
     }
   }
 }
 
-/* PC sampling configuration may NOT run inside a CUPTI callback
- * (INVALID_OPERATION), so contexts are queued and set up on the worker. */
-static void pc_setup_ctx(CUcontext ctx)
+/* Starts tracing. Called with g_tracing_mu held. */
+static void start_tracing(void)
 {
-  /* Enable before stall-reason enumeration, per NVIDIA's
-   * pc_sampling_continuous sample. Unverified end-to-end: T4 enumerates zero
-   * stall reasons — don't rule out ordering when debugging that. */
-  CUpti_PCSamplingEnableParams ep = {
-    .size = CUpti_PCSamplingEnableParamsSize,
-    .ctx  = ctx,
-  };
-  CUptiResult er = cuptiPCSamplingEnable(&ep);
-  if (er != CUPTI_SUCCESS) {
-    g_pc_failed = 1;
-    emit_error((int)er, "PC sampling enable failed (needs RmProfilingAdminOnly=0 or root)");
-    return;
-  }
-  if (!pc_fetch_stall_names(ctx)) {
-    g_pc_failed = 1;
-    return; // error emitted with the CUPTI result code by the fetch
-  }
-  if (g_pc_data.pPcData == NULL) {
-    CUpti_PCSamplingData *bufs[2] = {&g_pc_collect, &g_pc_data};
-    for (int b = 0; b < 2; b++) {
-      bufs[b]->size          = sizeof(CUpti_PCSamplingData);
-      bufs[b]->collectNumPcs = PC_BUF_PCS;
-      bufs[b]->pPcData =
-        (CUpti_PCSamplingPCData *)calloc(PC_BUF_PCS, sizeof(CUpti_PCSamplingPCData));
-      for (size_t i = 0; i < PC_BUF_PCS; i++) {
-        bufs[b]->pPcData[i].stallReason =
-          (CUpti_PCSamplingStallReason *)calloc(g_pc_nstall, sizeof(CUpti_PCSamplingStallReason));
-      }
+  uint64_t since = 0;
+  cuptiGetTimestamp(&since);
+  __atomic_store_n(&g_tracing_since, since, __ATOMIC_RELEASE);
+  for (size_t i = 0; i < NUM_ACTIVITY_KINDS; i++) {
+    CUptiResult r = cuptiActivityEnable(g_activity_kinds[i]);
+    if (r != CUPTI_SUCCESS) {
+      log_error((int)r, "activity enable failed; GPU profiling disabled");
+      disable_activity(i);
+      __atomic_store_n(&g_tracing_since, UINT64_MAX, __ATOMIC_RELEASE);
+      g_tracing_failed = 1;
+      return;
     }
   }
-
-  /* Continuous collection, period 2^7 cycles, all stall reasons. */
-  CUpti_PCSamplingConfigurationInfo cfg[4] = {0};
-  CUpti_PCSamplingCollectionMode mode      = CUPTI_PC_SAMPLING_COLLECTION_MODE_CONTINUOUS;
-  cfg[0].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_COLLECTION_MODE;
-  cfg[0].attributeData.collectionModeData.collectionMode = mode;
-  cfg[1].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_STALL_REASON;
-  cfg[1].attributeData.stallReasonData.stallReasonCount  = g_pc_nstall;
-  cfg[1].attributeData.stallReasonData.pStallReasonIndex = g_pc_stall_idx;
-  cfg[2].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_DATA_BUFFER;
-  cfg[2].attributeData.samplingDataBufferData.samplingDataBuffer = &g_pc_collect;
-  cfg[3].attributeType = CUPTI_PC_SAMPLING_CONFIGURATION_ATTR_TYPE_SAMPLING_PERIOD;
-  cfg[3].attributeData.samplingPeriodData.samplingPeriod = 7;
-  CUpti_PCSamplingConfigurationInfoParams cp             = {
-                .size                         = CUpti_PCSamplingConfigurationInfoParamsSize,
-                .ctx                          = ctx,
-                .numAttributes                = 4,
-                .pPCSamplingConfigurationInfo = cfg,
-  };
-  CUptiResult r = cuptiPCSamplingSetConfigurationAttribute(&cp);
-  if (r != CUPTI_SUCCESS) {
-    g_pc_failed = 1;
-    emit_error((int)r, "PC sampling configuration failed");
-    return;
-  }
-  if (g_pc_nctx < PC_MAX_CTX) {
-    g_pc_ctx[g_pc_nctx++] = ctx;
-  }
+  __atomic_store_n(&g_tracing, 1, __ATOMIC_RELEASE);
 }
 
-static void *pc_worker(void *arg)
+/* Stops tracing. Called with g_tracing_mu held. */
+static void stop_tracing(void)
+{
+  __atomic_store_n(&g_tracing, 0, __ATOMIC_RELEASE);
+  disable_activity(NUM_ACTIVITY_KINDS);
+  if (g_debug_totals) {
+    cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+    print_totals(1);
+  }
+  __atomic_store_n(&g_tracing_since, UINT64_MAX, __ATOMIC_RELEASE);
+}
+
+/* Follows the probe's semaphore: on when the profiler attached, off when it
+ * left. */
+static void update_tracing(void)
+{
+  const int want = OTEL_GPU_ENABLED() != 0;
+  if (want == __atomic_load_n(&g_tracing, __ATOMIC_ACQUIRE)) {
+    return;
+  }
+  pthread_mutex_lock(&g_tracing_mu);
+  if (want != g_tracing && !g_tracing_failed) {
+    if (want) {
+      start_tracing();
+    } else {
+      stop_tracing();
+    }
+  }
+  pthread_mutex_unlock(&g_tracing_mu);
+}
+
+static void start_detached(void *(*fn)(void *))
+{
+  pthread_t t;
+  pthread_attr_t a;
+  pthread_attr_init(&a);
+  pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+  pthread_create(&t, &a, fn, NULL);
+  pthread_attr_destroy(&a);
+}
+
+static void *tracing_worker(void *arg)
 {
   (void)arg;
-  for (;;) {
-    sleep(1);
-    pthread_mutex_lock(&g_pc_mu);
-    while (g_pc_npending > 0 && !g_pc_failed) {
-      pc_setup_ctx(g_pc_pending[--g_pc_npending]);
+  for (uint64_t round = 1;; round++) {
+    // Here, not in the application's CUDA calls: turning tracing off can take
+    // seconds.
+    update_tracing();
+    if (__atomic_load_n(&g_tracing, __ATOMIC_ACQUIRE)) {
+      // CUPTI hands over a buffer of records only once it is full, unless asked.
+      cuptiActivityFlushAll(0);
+      if (g_debug_totals && round % (DEBUG_TOTALS_PERIOD_MS / FLUSH_PERIOD_MS) == 0) {
+        print_totals(0);
+      }
     }
-    for (int i = 0; i < g_pc_nctx; i++) {
-      pc_drain_ctx(g_pc_ctx[i]);
-    }
-    pthread_mutex_unlock(&g_pc_mu);
+    usleep(FLUSH_PERIOD_MS * 1000);
   }
   return NULL;
-}
-
-/* The worker must never touch a dangling CUcontext. */
-static void pc_on_context_destroy(CUcontext ctx)
-{
-  pthread_mutex_lock(&g_pc_mu);
-  for (int i = 0; i < g_pc_npending; i++) {
-    if (g_pc_pending[i] == ctx) {
-      g_pc_pending[i] = g_pc_pending[--g_pc_npending];
-      break;
-    }
-  }
-  for (int i = 0; i < g_pc_nctx; i++) {
-    if (g_pc_ctx[i] == ctx) {
-      g_pc_ctx[i]                      = g_pc_ctx[--g_pc_nctx];
-      CUpti_PCSamplingDisableParams dp = {
-        .size = CUpti_PCSamplingDisableParamsSize,
-        .ctx  = ctx,
-      };
-      cuptiPCSamplingDisable(&dp);
-      break;
-    }
-  }
-  pthread_mutex_unlock(&g_pc_mu);
-}
-
-static void pc_on_context_created(CUcontext ctx)
-{
-  /* Opt-in: hardware warp sampling inside customer workloads must cost
-   * nothing by default. */
-  if (g_pc_failed || !getenv("OTEL_GPU_PC_SAMPLING")) {
-    return;
-  }
-  pthread_mutex_lock(&g_pc_mu);
-  if (g_pc_npending < PC_MAX_CTX) {
-    g_pc_pending[g_pc_npending++] = ctx;
-  }
-  if (!g_pc_worker_started) {
-    g_pc_worker_started = 1;
-    pthread_t t;
-    pthread_attr_t a;
-    pthread_attr_init(&a);
-    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    pthread_create(&t, &a, pc_worker, NULL);
-    pthread_attr_destroy(&a);
-  }
-  pthread_mutex_unlock(&g_pc_mu);
 }
 
 static int setup(void)
 {
-  g_sample_rate[SITE_KERNEL] = env_rate("OTEL_GPU_SAMPLE_RATE", DEFAULT_SAMPLE_RATE);
-  g_sample_rate[SITE_MEMORY] = g_sample_rate[SITE_KERNEL];
-  g_sample_rate[SITE_ALLOC]  = g_sample_rate[SITE_KERNEL];
+  g_sample_rate[CALL_KERNEL] = env_rate("OTEL_GPU_SAMPLE_RATE", DEFAULT_SAMPLE_RATE);
+  g_sample_rate[CALL_MEMORY] = g_sample_rate[CALL_KERNEL];
   /* Sampling switched off covers graph launches too, unless they are set apart. */
-  g_sample_rate[SITE_GRAPH]  = env_rate(
-    "OTEL_GPU_GRAPH_SAMPLE_RATE", g_sample_rate[SITE_KERNEL] == 0 ? 0 : DEFAULT_GRAPH_SAMPLE_RATE);
+  g_sample_rate[CALL_GRAPH]  = env_rate(
+    "OTEL_GPU_GRAPH_SAMPLE_RATE", g_sample_rate[CALL_KERNEL] == 0 ? 0 : DEFAULT_GRAPH_SAMPLE_RATE);
+  const char *totals = getenv("OTEL_GPU_DEBUG_TOTALS");
+  g_debug_totals     = totals && *totals && strcmp(totals, "0") != 0;
 
   CUptiResult r = cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)api_callback, NULL);
   if (r == CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED) {
-    emit_error(
-      (int)r, "another CUPTI subscriber present (Kineto/Nsight/DCGM?); GPU profiling disabled");
+    log_error((int)r, "another CUPTI subscriber present; GPU profiling disabled");
     return 0;
   }
   if (r != CUPTI_SUCCESS) {
-    emit_error((int)r, "cuptiSubscribe failed");
+    log_error((int)r, "cuptiSubscribe failed");
     return 0;
   }
-  for (size_t i = 0; i < sizeof(g_call_sites) / sizeof(g_call_sites[0]); i++) {
-    cuptiEnableCallback(1, g_subscriber, g_call_sites[i].domain, g_call_sites[i].cbid);
+  const uint32_t untracked =
+    track_calls(CUPTI_CB_DOMAIN_RUNTIME_API, g_runtime_class, CUPTI_RUNTIME_TRACE_CBID_SIZE) +
+    track_calls(CUPTI_CB_DOMAIN_DRIVER_API, g_driver_class, CUPTI_DRIVER_TRACE_CBID_SIZE);
+  if (untracked != 0) {
+    log_error((int)untracked, "GPU calls not tracked, their work is reported without a stack");
   }
 
-  // Enabling the NVTX domain makes CUPTI register itself as the NVTX
-  // injection, routing nvtxRangePush/Pop to api_callback.
-  cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_NVTX);
-  cuptiEnableCallback(
-    1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE, CUPTI_CBID_RESOURCE_CONTEXT_CREATED);
-  cuptiEnableCallback(
-    1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE, CUPTI_CBID_RESOURCE_CONTEXT_DESTROY_STARTING);
+  // Enabling the NVTX domain routes to api_callback the ranges of an NVTX
+  // library that NVTX_INJECTION64_PATH points at this CUPTI.
+  r = cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_NVTX);
+  if (r != CUPTI_SUCCESS) {
+    log_error((int)r, "NVTX ranges unavailable");
+  }
 
-  if (cuptiActivityRegisterCallbacks(buffer_requested, buffer_completed) != CUPTI_SUCCESS) {
-    emit_error(-1, "cuptiActivityRegisterCallbacks failed");
+  r = cuptiActivityRegisterCallbacks(buffer_requested, buffer_completed);
+  if (r != CUPTI_SUCCESS) {
+    log_error((int)r, "cuptiActivityRegisterCallbacks failed");
+    cuptiUnsubscribe(g_subscriber);
     return 0;
   }
-  cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
-  cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME);
-  cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY);
-  cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMSET);
-  cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMORY2);
 
-  /* Otherwise records sit until the 8 MiB buffer fills, delaying export and
-   * aging out the call site table. */
-  cuptiActivityFlushPeriod(1000);
+  update_tracing();
+  start_detached(tracing_worker);
   return 1;
 }
 
 static void flush_at_exit(void)
 {
-  if (g_enabled) {
-    cuptiActivityFlushAll(1);
+  if (!g_enabled) {
+    return;
   }
-  pthread_mutex_lock(&g_err_mu);
-  if (g_err_started) {
-    OTEL_GPU_PROBE(error, &g_last_err); /* last chance for the agent to see it */
+  cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+  if (g_debug_totals && __atomic_load_n(&g_tracing, __ATOMIC_ACQUIRE)) {
+    print_totals(0);
   }
-  pthread_mutex_unlock(&g_err_mu);
 }
 
+/* Locks taken in the order the producer's threads nest them, so that fork
+ * never waits on a lock held by a thread that waits on another. */
 static void fork_prepare(void)
 {
-  pthread_mutex_lock(&g_err_mu);
+  pthread_mutex_lock(&g_tracing_mu);
   pthread_mutex_lock(&g_nvtx_pool_mu);
-  pthread_mutex_lock(&g_pc_mu);
+  pthread_mutex_lock(&g_gpu_mu);
 }
 static void fork_parent(void)
 {
-  pthread_mutex_unlock(&g_pc_mu);
+  pthread_mutex_unlock(&g_gpu_mu);
   pthread_mutex_unlock(&g_nvtx_pool_mu);
-  pthread_mutex_unlock(&g_err_mu);
+  pthread_mutex_unlock(&g_tracing_mu);
+}
+/* A child of a CUDA process cannot use CUDA, nor flush CUPTI at its exit. */
+static void fork_child(void)
+{
+  fork_parent();
+  g_enabled = 0;
 }
 
 /* CUDA_INJECTION64_PATH entry point, called once at cuInit. Exported; the
@@ -984,9 +854,8 @@ __attribute__((visibility("default"))) int InitializeInjection(void)
 {
   /* Hold our mutexes across fork: a child must never start with one locked
    * by a dead thread (PyTorch DataLoader forks while threads push NVTX). */
-  pthread_atfork(fork_prepare, fork_parent, fork_parent);
-  OTEL_GPU_PROBE(ready, NULL);
+  pthread_atfork(fork_prepare, fork_parent, fork_child);
   g_enabled = setup();
-  atexit(flush_at_exit); /* error re-emit starts from emit_error itself */
-  return 1;              /* must return non-zero; lib stays loaded regardless of our state */
+  atexit(flush_at_exit);
+  return 1; /* must return non-zero; lib stays loaded regardless of our state */
 }

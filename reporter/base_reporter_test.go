@@ -537,7 +537,8 @@ func TestMergeSnapshots(t *testing.T) {
 			Samples: []samples.SnapshotSample{
 				{PID: 1000, TraceHash: kernelA, Frames: singleNativeFrameTrace().Frames, Value: 10},
 				{PID: 1000, TraceHash: kernelA, Frames: singleNativeFrameTrace().Frames, Value: 5},
-				{PID: 2000, TraceHash: kernelB, Frames: singleNativeFrameTrace().Frames, Value: 7},
+				{PID: 2000, TraceHash: kernelB, Frames: singleNativeFrameTrace().Frames, Value: 7,
+					Attributes: []attribute.KeyValue{attribute.String("gpu.uuid", "GPU-1")}},
 			},
 		}}
 	}, func(pid libpf.PID) samples.ProcessMeta { return processMeta[pid] })
@@ -564,11 +565,14 @@ func TestMergeSnapshots(t *testing.T) {
 	v, _ := created.ResourceAttrs.Value(semconv.ServiceNameKey)
 	assert.Equal(t, "gpu-svc", v.AsString())
 	assert.Equal(t, []int64{7}, created.Events[snapshotType][samples.SampleKey{Hash: kernelB}].Values)
+	assert.Equal(t, []attribute.KeyValue{attribute.String("gpu.uuid", "GPU-1")},
+		created.Events[snapshotType][samples.SampleKey{Hash: kernelB}].Attributes)
 
 	profiles, err := reporter.pdata.Generate(tree, reporter.name, reporter.version,
 		reporter.collectionStartTime, end)
 	require.NoError(t, err)
 	dictionary := profiles.Dictionary()
+	exported := make(map[string]string)
 	for i := 0; i < profiles.ResourceProfiles().Len(); i++ {
 		profs := profiles.ResourceProfiles().At(i).ScopeProfiles().At(0).Profiles()
 		for j := 0; j < profs.Len(); j++ {
@@ -583,10 +587,59 @@ func TestMergeSnapshots(t *testing.T) {
 					key := dictionary.StringTable().At(int(attr.KeyStrindex()))
 					assert.NotEqual(t, string(semconv.ThreadIDKey), key)
 					assert.NotEqual(t, string(semconv.CPULogicalNumberKey), key)
+					exported[key] = attr.Value().Str()
 				}
 			}
 		}
 	}
+	assert.Equal(t, "GPU-1", exported["gpu.uuid"], "probe attributes are exported")
+}
+
+// extraMetaRecorder records what CollectExtraSampleMeta receives.
+type extraMetaRecorder struct {
+	metas []samples.TraceEventMeta
+}
+
+func (r *extraMetaRecorder) CollectExtraSampleMeta(_ *libpf.Trace,
+	meta *samples.TraceEventMeta,
+) any {
+	r.metas = append(r.metas, *meta)
+	return meta.ExtraMeta[libpf.Intern("team")]
+}
+
+func (r *extraMetaRecorder) ExtraSampleAttrs(*samples.AttrTableManager, any) []int32 {
+	return nil
+}
+
+func TestMergeSnapshotsCollectsExtraSampleMeta(t *testing.T) {
+	producer := &extraMetaRecorder{}
+	reporter := createTestBaseReporter(t, &Config{
+		Name:                "test-agent",
+		Version:             "v1.0.0",
+		ExtraSampleAttrProd: producer,
+	})
+	hash := libpf.NewTraceHash(4, 4)
+	reporter.SetSnapshotSources(func() []samples.SnapshotProfile {
+		return []samples.SnapshotProfile{{
+			ProfileType: profileTypeOffCPU,
+			Samples:     []samples.SnapshotSample{{PID: 4000, TraceHash: hash, Value: 3}},
+		}}
+	}, func(libpf.PID) samples.ProcessMeta {
+		return samples.ProcessMeta{
+			ExecutablePath: libpf.Intern("/bin/job"),
+			ExtraMeta:      map[libpf.String]string{libpf.Intern("team"): "ml"},
+		}
+	})
+
+	tree := make(samples.TraceEventsTree)
+	reporter.mergeSnapshots(tree, time.Now())
+	require.Len(t, producer.metas, 1)
+	assert.Equal(t, libpf.PID(4000), producer.metas[0].PID)
+	assert.Equal(t, "/bin/job", producer.metas[0].ExecutablePath.String())
+	assert.Equal(t, []uint64{3}, producer.metas[0].ContextValues)
+	events := tree[samples.ResourceKey{ExecutablePath: libpf.Intern("/bin/job"), PID: 4000}]
+	assert.Contains(t, events.Events[profileTypeOffCPU],
+		samples.SampleKey{Hash: hash, ExtraMeta: "ml"})
 }
 
 func TestMergeSnapshotsWithoutSources(t *testing.T) {

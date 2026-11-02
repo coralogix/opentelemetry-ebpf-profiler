@@ -317,6 +317,9 @@ func (p *Pdata) setProfile(
 				attribute.Key("process.context.label."+key.String()),
 				value.String())
 		}
+		for _, attr := range traceInfo.Attributes {
+			attrMgr.AppendAttribute(sample.AttributeIndices(), attr)
+		}
 
 		if !profileType.OmitThreadContext {
 			attrMgr.AppendOptionalString(sample.AttributeIndices(),

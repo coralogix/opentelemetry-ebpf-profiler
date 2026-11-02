@@ -5,6 +5,7 @@
 /.idea
 /go
 ci-kernels
+probes/gpu/testdata/producer
 # Ignore target directory
 target/*
 

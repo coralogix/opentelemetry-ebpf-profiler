@@ -48,7 +48,7 @@
   <text x="52" y="236" class="d-t">Producer library</text>
   <text x="52" y="256" class="d-s">NVIDIA specific, loaded through</text>
   <text x="52" y="274" class="d-m">CUDA_INJECTION64_PATH</text>
-  <text x="52" y="294" class="d-s">samples calls, fires USDT probes</text>
+  <text x="52" y="294" class="d-s">samples calls, fires a USDT probe</text>
   <path d="M36,162 H24 V388 H34" class="d-a gpu" marker-end="url(#ahg)"/>
   <text x="44" y="338" class="d-s">launch: returns at once</text>
   <path d="M300,356 V312" class="d-a gpu d-dash" marker-end="url(#ahg)"/>
@@ -64,12 +64,12 @@
 
   <rect x="370" y="16" width="250" height="420" rx="14" class="d-zone"/>
   <text x="390" y="44" class="d-zl">LINUX KERNEL · eBPF</text>
-  <text x="394" y="112" class="d-m">on_launch</text>
+  <text x="394" y="112" class="d-m">event: LAUNCH</text>
   <rect x="390" y="120" width="210" height="64" rx="9" class="d-neu"/>
   <text x="406" y="144" class="d-t">Capture the stack</text>
   <text x="406" y="162" class="d-s">at each GPU call,</text>
   <text x="406" y="177" class="d-s">like a CPU sample</text>
-  <text x="394" y="252" class="d-m">kernel_executed, …</text>
+  <text x="394" y="252" class="d-m">event: KERNEL, COPY, …</text>
   <rect x="390" y="260" width="210" height="64" rx="9" class="d-neu"/>
   <text x="406" y="286" class="d-t">Forward GPU timings</text>
   <text x="406" y="304" class="d-s">as the producer reports them</text>

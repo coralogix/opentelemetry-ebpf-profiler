@@ -1,22 +1,24 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-// Package gpu implements GPU profiling as a probe. Workloads emit the otel_gpu
-// USDT probes defined in otel_gpu_usdt.h through an injected producer, such as
-// a CUPTI library loaded with CUDA_INJECTION64_PATH. The probe attaches to
-// those probes per process, captures the host stack at each GPU call site and
-// attributes the GPU time measured later to that stack.
+// Package gpu implements GPU profiling as a probe. Workloads fire the
+// otel_gpu_v1:event USDT probe defined in otel_gpu_v1_usdt.h through an injected
+// producer, such as a CUPTI library loaded with CUDA_INJECTION64_PATH. The probe
+// attaches to it once per producer library, captures the host stack at each GPU
+// call and attributes the GPU time measured later to that stack.
 //
 // An OTel config using this probe could look like this:
 //
 //	receivers:
-//	  ebpf_profiler:
+//	  profiling:
 //	    probes:
 //	      - gpu
 //
 //	extensions:
 //	  gpu:
-//	    api_spans: true	# optional: spans of cuDNN and cuBLAS calls
+//
+//	service:
+//	  extensions: [gpu]
 package gpu // import "go.opentelemetry.io/ebpf-profiler/probes/gpu"
 
 import (
@@ -38,33 +40,43 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
-// Config is the configuration of the gpu probe.
-type Config struct {
-	// APISpans reports the time spent in cuDNN and cuBLAS calls. It adds a
-	// uprobe and a uretprobe to every call, and needs Linux 5.15 or newer.
-	APISpans bool `mapstructure:"api_spans"`
-}
+// Config is the configuration of the gpu probe, which has no options yet.
+type Config struct{}
 
-// launchProfileType counts GPU call sites per host stack. PreHandleTrace leaves
-// the sample weight of the launch as the trace value.
+// launchProfileType counts GPU calls per host stack, each as often as its
+// sample weight.
 var launchProfileType = &samples.TypeMetadata{
-	SampleType:   "gpu_launches",
-	SampleUnit:   "count",
+	SampleTypes:  []samples.SampleType{{Type: "gpu_launches", Unit: "count"}},
 	ReportValues: true,
+	AppendValues: appendLaunchWeight,
 }
 
-// usdtPrograms maps each otel_gpu probe name to the eBPF program consuming it.
-var usdtPrograms = map[string]string{
-	"ready":           "uprobe__gpu_ready",
-	"on_launch":       "uprobe__gpu_launch",
-	"kernel_executed": "uprobe__gpu_kernel_executed",
-	"gpu_mem":         "uprobe__gpu_mem",
-	"gpu_event":       "uprobe__gpu_event",
-	"error":           "uprobe__gpu_error",
+// Context values of a launch trace, which support/ebpf/gpu.ebpf.c pushes.
+const (
+	launchCorrelationID = iota
+	launchSampleWeight
+	launchContextValues
+)
+
+// appendLaunchWeight appends the sample weight of a launch; a weight of 0
+// counts as 1.
+func appendLaunchWeight(dst []int64, meta *samples.TraceEventMeta) []int64 {
+	if len(meta.ContextValues) < launchContextValues {
+		return append(dst, 1)
+	}
+	return append(dst, int64(max(meta.ContextValues[launchSampleWeight], 1)))
 }
 
-// eventsMap carries the GPU records from eBPF.
-const eventsMap = "gpu_events"
+const (
+	// usdtProbe is the only probe of the otel_gpu_v1 contract.
+	usdtProbe = "event"
+	// eventProgram is the eBPF program consuming it.
+	eventProgram = "uprobe__gpu_event"
+	// eventsMap carries the events from eBPF.
+	eventsMap = "gpu_events"
+	// scratchMap holds the event eBPF is forwarding.
+	scratchMap = "gpu_event_scratch"
+)
 
 type probe struct {
 	config Config
@@ -73,8 +85,8 @@ type probe struct {
 	// serializes.
 	discoverer *usdt.Discoverer
 
-	// programs holds the loaded eBPF programs by name; set once by Load.
-	programs map[string]*cebpf.Program
+	// program consumes the probe; set once by Load.
+	program *cebpf.Program
 
 	launchOrigin uint16
 	// launch is the launch whose trace is being symbolized. PreHandleTrace
@@ -84,18 +96,38 @@ type probe struct {
 		correlationID uint32
 	}
 
-	matcher   *matcher
-	names     *nameCache
-	events    *cebpf.Map
-	apiStarts *cebpf.Map
-	reader    *ringbuf.Reader
-	drained   sync.WaitGroup
+	matcher *matcher
+	names   *nameCache
+	events  *cebpf.Map
+	scratch *cebpf.Map
+	reader  *ringbuf.Reader
+	drained sync.WaitGroup
+	// decodeErrorLogged is set once an undecodable event was logged; it is
+	// only used by the goroutine reading events.
+	decodeErrorLogged bool
 
-	// mu serializes attaching with Unload, which closes the programs.
+	// mu serializes attaching with Unload, which closes the program.
 	mu       sync.Mutex
 	unloaded bool
-	// links holds the uprobe links of each process, per attached file.
-	links map[libpf.PID]map[util.OnDiskFileIdentifier][]link.Link
+	// files holds the uprobes of each file that has some, and users the files
+	// with uprobes that each process maps.
+	files map[util.OnDiskFileIdentifier]*fileProbes
+	users map[libpf.PID]libpf.Set[util.OnDiskFileIdentifier]
+	// removing is closed for each file once the uprobes it had are removed.
+	removing map[util.OnDiskFileIdentifier]chan struct{}
+	// detaching tracks the uprobes still being removed.
+	detaching sync.WaitGroup
+}
+
+// fileProbes are the uprobes of a file, and the number of processes that map it.
+type fileProbes struct {
+	links []link.Link
+	// lastModified is the modification time of the file the uprobes were
+	// placed in.
+	lastModified int64
+	users        int
+	// idle removes the uprobes once no process has mapped the file for a while.
+	idle *time.Timer
 }
 
 // New returns the gpu probe.
@@ -104,11 +136,17 @@ func New(config Config) (tracer.Probe, error) {
 	if err != nil {
 		return nil, err
 	}
+	names, err := newNameCache()
+	if err != nil {
+		return nil, err
+	}
 	return &probe{
 		config:     config,
 		discoverer: discoverer,
-		names:      newNameCache(),
-		links:      make(map[libpf.PID]map[util.OnDiskFileIdentifier][]link.Link),
+		names:      names,
+		files:      make(map[util.OnDiskFileIdentifier]*fileProbes),
+		users:      make(map[libpf.PID]libpf.Set[util.OnDiskFileIdentifier]),
+		removing:   make(map[util.OnDiskFileIdentifier]chan struct{}),
 	}, nil
 }
 
@@ -123,21 +161,13 @@ func (p *probe) Load(_ context.Context, reg tracer.ProbeRegistrar, probeCtx *tra
 		return fmt.Errorf("registering GPU launch origin: %w", err)
 	}
 	p.launchOrigin = launchOrigin
-	if p.matcher, err = newMatcher(probeCtx.ProcessMeta, p.names); err != nil {
+	if p.matcher, err = newMatcher(probeCtx.ProcessMeta); err != nil {
 		return err
 	}
 
-	programNames := make([]string, 0, len(usdtPrograms))
-	loaders := make([]tracer.ProgLoaderHelper, 0, len(usdtPrograms))
-	for _, name := range usdtPrograms {
-		programNames = append(programNames, name)
-		loaders = append(loaders, tracer.ProgLoaderHelper{
-			Name: name, NoTailCallTarget: true, Enable: true,
-		})
-	}
 	coll, err := probeCtx.CollectionSpecWith(
-		[]string{eventsMap},
-		programNames,
+		[]string{eventsMap, scratchMap},
+		[]string{eventProgram},
 		[]string{"origin_id_gpu_launch"},
 	)
 	if err != nil {
@@ -147,28 +177,25 @@ func (p *probe) Load(_ context.Context, reg tracer.ProbeRegistrar, probeCtx *tra
 		return fmt.Errorf("set origin_id_gpu_launch: %w", err)
 	}
 
-	if p.events, err = cebpf.NewMap(coll.Maps[eventsMap]); err != nil {
-		return fmt.Errorf("creating %s: %w", eventsMap, err)
+	if err := p.createMaps(coll); err != nil {
+		return err
 	}
-	if err := probeCtx.RewriteMaps(coll, map[string]*cebpf.Map{eventsMap: p.events}); err != nil {
-		_ = p.events.Close()
+	maps := map[string]*cebpf.Map{eventsMap: p.events, scratchMap: p.scratch}
+	if err := probeCtx.RewriteMaps(coll, maps); err != nil {
+		p.closeMaps()
 		return err
 	}
 	programs := make(map[string]*cebpf.Program)
+	loaders := []tracer.ProgLoaderHelper{{Name: eventProgram, NoTailCallTarget: true, Enable: true}}
 	if err := probeCtx.LoadProbeUnwinders(coll, programs, loaders, 0); err != nil {
-		_ = p.events.Close()
+		p.closeMaps()
 		return err
 	}
-	p.programs = programs
-	if p.config.APISpans {
-		if err := p.loadAPISpans(probeCtx); err != nil {
-			log.Warnf("gpu: cuDNN and cuBLAS API spans are disabled: %v", err)
-		}
-	}
+	p.program = programs[eventProgram]
 
 	if p.reader, err = ringbuf.NewReader(p.events); err != nil {
-		p.closePrograms()
-		_ = p.events.Close()
+		p.closeProgram()
+		p.closeMaps()
 		return fmt.Errorf("reading %s: %w", eventsMap, err)
 	}
 	p.drained.Add(1)
@@ -176,14 +203,37 @@ func (p *probe) Load(_ context.Context, reg tracer.ProbeRegistrar, probeCtx *tra
 
 	if err := probeCtx.AddAttacher(p); err != nil {
 		p.stopDrain()
-		p.closePrograms()
-		_ = p.events.Close()
+		p.closeProgram()
+		p.closeMaps()
 		return fmt.Errorf("registering process attacher: %w", err)
 	}
 	return nil
 }
 
-// drain forwards the GPU records from eBPF until the reader is closed.
+// createMaps creates the maps the probe owns.
+func (p *probe) createMaps(coll *cebpf.CollectionSpec) error {
+	var err error
+	if p.events, err = cebpf.NewMap(coll.Maps[eventsMap]); err != nil {
+		return fmt.Errorf("creating %s: %w", eventsMap, err)
+	}
+	if p.scratch, err = cebpf.NewMap(coll.Maps[scratchMap]); err != nil {
+		p.closeMaps()
+		return fmt.Errorf("creating %s: %w", scratchMap, err)
+	}
+	return nil
+}
+
+func (p *probe) closeMaps() error {
+	var errs error
+	for _, m := range []*cebpf.Map{p.events, p.scratch} {
+		if m != nil {
+			errs = errors.Join(errs, m.Close())
+		}
+	}
+	return errs
+}
+
+// drain forwards the events from eBPF until the reader is closed.
 func (p *probe) drain() {
 	defer p.drained.Done()
 	var record ringbuf.Record
@@ -194,63 +244,38 @@ func (p *probe) drain() {
 				return
 			}
 			if !errorLogged {
-				log.Warnf("gpu: reading GPU records: %v", err)
+				log.Warnf("gpu: reading GPU events: %v", err)
 				errorLogged = true
 			}
 			// Avoid spinning on a persistent error.
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		p.handleRecord(record.RawSample)
+		p.handleEvent(record.RawSample)
 	}
 }
 
-func (p *probe) handleRecord(b []byte) {
-	recordType, pid, ok := recordHeader(b)
-	if !ok {
+func (p *probe) handleEvent(b []byte) {
+	ev, err := decodeEvent(b)
+	if err != nil {
+		if !p.decodeErrorLogged {
+			log.Warnf("gpu: dropping an event that does not decode: %v", err)
+			p.decodeErrorLogged = true
+		}
 		return
 	}
-	now := time.Now()
-	switch recordType {
-	case recordKernel:
-		if rec, ok := decodeKernelRecord(pid, b); ok {
-			p.matcher.addWork(kernelWork(rec, p.names.resolve(pid, rec.namePtr),
-				p.names.resolve(pid, rec.rangesPtr)), now)
-		}
-	case recordMemcpy:
-		if rec, ok := decodeMemcpyRecord(pid, b); ok {
-			p.matcher.addWork(memcpyWork(rec, p.names.resolve(pid, rec.rangesPtr)), now)
-		}
-	case recordEvent:
-		rec, ok := decodeEventRecord(pid, b)
-		if !ok {
-			return
-		}
-		switch rec.kind {
-		case eventStall:
-			p.matcher.addWork(stallWork(rec, p.names.resolve(pid, rec.namePtr),
-				p.names.resolve(pid, rec.v1)), now)
-		case eventCollective:
-			p.matcher.addWork(collectiveWork(rec, p.names.resolve(pid, rec.namePtr)), now)
-		default:
-			if work, ok := eventWork(rec); ok {
-				p.matcher.addWork(work, now)
-			}
-		}
-	case recordAPISpan:
-		if rec, ok := decodeAPISpanRecord(pid, b); ok {
-			p.matcher.addWork(apiWork(rec), now)
-		}
-	case recordError:
-		// Producers re-emit errors periodically, which bounds this logging.
-		if rec, ok := decodeErrorRecord(pid, b); ok {
-			log.Warnf("gpu: producer error in PID %d (code %d): %s", rec.pid, rec.code, rec.message)
-		}
+	if ev.kind == kindKernel && ev.name != "" {
+		ev.name = p.names.demangle(ev.name)
+	}
+	if work, ok := eventWork(ev); ok {
+		p.matcher.addWork(work, time.Now())
 	}
 }
 
 func (p *probe) stopDrain() {
-	_ = p.reader.Close()
+	if p.reader != nil {
+		_ = p.reader.Close()
+	}
 	p.drained.Wait()
 }
 
@@ -259,13 +284,15 @@ func (p *probe) PreOrigins() []uint16 {
 	return []uint16{p.launchOrigin}
 }
 
-// PreHandleTrace implements tracer.PreTraceHandler. The trace value carries
-// the launch's correlation id, kept for PostHandleTrace, and its sample weight,
-// left as the value to report.
+// PreHandleTrace implements tracer.PreTraceHandler. It keeps the launch's
+// correlation id, of which the profiler matches the low half, for
+// PostHandleTrace.
 func (p *probe) PreHandleTrace(trace *libpf.EbpfTrace) bool {
+	if len(trace.ContextValues) < launchContextValues {
+		return false
+	}
 	p.launch.pid = trace.PID
-	p.launch.correlationID = uint32(trace.Value)
-	trace.Value = int64(max(uint64(trace.Value)>>32, 1))
+	p.launch.correlationID = uint32(trace.ContextValues[launchCorrelationID])
 	return true
 }
 
@@ -291,31 +318,34 @@ func (p *probe) Unload() error {
 	p.unloaded = true
 
 	var errs error
-	for pid, files := range p.links {
-		for _, fileLinks := range files {
-			errs = errors.Join(errs, closeLinks(fileLinks))
+	for file, probes := range p.files {
+		if probes.idle != nil {
+			probes.idle.Stop()
 		}
-		delete(p.links, pid)
+		errs = errors.Join(errs, closeLinks(probes.links))
+		delete(p.files, file)
 	}
+	clear(p.users)
+	p.detaching.Wait()
 	p.stopDrain()
-	p.closePrograms()
-	errs = errors.Join(errs, p.events.Close())
-	if p.apiStarts != nil {
-		errs = errors.Join(errs, p.apiStarts.Close())
-	}
-	return errs
+	p.closeProgram()
+	return errors.Join(errs, p.closeMaps())
 }
 
-func (p *probe) closePrograms() {
-	for _, prog := range p.programs {
-		_ = prog.Close()
+func (p *probe) closeProgram() {
+	if p.program != nil {
+		_ = p.program.Close()
 	}
 }
 
+// closeLinks closes links all at once: removing a uprobe waits for the kernel,
+// about a quarter second each on recent kernels.
 func closeLinks(links []link.Link) error {
-	var errs error
-	for _, l := range links {
-		errs = errors.Join(errs, l.Close())
+	errs := make([]error, len(links))
+	var wg sync.WaitGroup
+	for i, l := range links {
+		wg.Go(func() { errs[i] = l.Close() })
 	}
-	return errs
+	wg.Wait()
+	return errors.Join(errs...)
 }

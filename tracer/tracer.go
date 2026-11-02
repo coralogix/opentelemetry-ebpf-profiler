@@ -144,8 +144,8 @@ var probeOwnedMaps = libpf.Set[string]{
 	// Off-CPU probe.
 	"sched_times": {},
 	// GPU probe.
-	"gpu_events":     {},
-	"gpu_api_starts": {},
+	"gpu_events":        {},
+	"gpu_event_scratch": {},
 }
 
 // onlineCPUs once resolves and caches the list of online CPUs.
@@ -154,6 +154,10 @@ var onlineCPUsOnce = sync.OnceValues(getOnlineCPUIDs)
 // Tracer provides an interface for loading and initializing the eBPF components as
 // well as for monitoring the output maps for new traces and count updates.
 type Tracer struct {
+	// probesEnabled tells whether the ring buffer of probe traces was sized
+	// for probes.
+	probesEnabled bool
+
 	// ebpfMaps holds the currently loaded eBPF maps.
 	ebpfMaps map[string]*cebpf.Map
 	// ebpfProgs holds the currently loaded eBPF programs.
@@ -292,6 +296,10 @@ type Config struct {
 	// ProcessMetaEnrichers are optional hooks for enriching process metadata at
 	// process discovery time. Multiple enrichers are called in order.
 	ProcessMetaEnrichers []process.MetaEnricher
+	// ProbesEnabled tells that probes, such as the off-CPU or GPU probes, will
+	// be enabled. Their traces then get a ring buffer as large as the one of
+	// sampled traces; otherwise it is kept to a single page.
+	ProbesEnabled bool
 	// PIDNamespaceTranslationMode controls the scope of PID namespace translation.
 	// It supports None (disabled, default), Auto (translates recursively when kernel BTF
 	// layout is available, otherwise Exact), Exact, and Recursive (requires BTF).
@@ -406,6 +414,7 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		samplesPerSecond:       cfg.SamplesPerSecond,
 		probabilisticInterval:  cfg.ProbabilisticInterval,
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
+		probesEnabled:          cfg.ProbesEnabled,
 		done:                   make(chan libpf.Void),
 		origins:                origins,
 		sysConfigVars:          sysConfigVars,
@@ -577,7 +586,7 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config, origins *orig
 		return nil, nil, nil, err
 	}
 	probeJobs, err = probeUnwinderJobs(coll, ebpfMaps["kprobe_progs"], tailCallProgs,
-		ebpfMaps["perf_progs"].FD(), probeMaps)
+		ebpfMaps["perf_progs"].FD(), probeMaps, ebpfMaps["trace_events"].FD())
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to prepare kprobe eBPF programs: %v", err)
 	}
@@ -778,7 +787,12 @@ func loadAllMaps(coll *cebpf.CollectionSpec, cfg *Config,
 	}
 	ringbufSize := uint64(cfg.SamplesPerSecond * len(onlineCPUs) * support.Sizeof_TraceWithData)
 	adaption["trace_events"] = uint32(min(util.NextPowerOfTwo(ringbufSize), 1<<31))
-	adaption["probe_trace_events"] = adaption["trace_events"]
+	// The ring buffer of probe traces costs kernel memory for every CPU, so it is
+	// sized for probes only if some will be enabled.
+	adaption["probe_trace_events"] = uint32(os.Getpagesize())
+	if cfg.ProbesEnabled {
+		adaption["probe_trace_events"] = adaption["trace_events"]
+	}
 
 	for i := support.StackDeltaBucketSmallest; i <= support.StackDeltaBucketLargest; i++ {
 		mapName := fmt.Sprintf("exe_id_to_%d_stack_deltas", i)
@@ -954,13 +968,16 @@ func probeUnwinderMaps(maps map[string]*cebpf.Map) (map[int]*cebpf.Map, error) {
 // loadProbeUnwinders reuses large parts of perfUnwinderJobs. By default all eBPF programs
 // are written as perf event eBPF programs. loadProbeUnwinders dynamically rewrites the
 // specification of these programs to xProbe eBPF programs and adjusts tail call maps if needed.
-// probeMaps, from probeUnwinderMaps, replaces the perf unwinders' maps.
+// probeMaps, from probeUnwinderMaps, replaces the perf unwinders' maps;
+// external perf_event probes only get the replacement of trace_events, whose
+// FD is traceEventsFD.
 func loadProbeUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.Program,
 	tailcallMap *cebpf.Map, progs []ProgLoaderHelper,
 	bpfVerifierLogLevel uint32, perfTailCallMapFD int,
-	probeMaps map[int]*cebpf.Map,
+	probeMaps map[int]*cebpf.Map, traceEventsFD int,
 ) error {
-	jobs, err := probeUnwinderJobs(coll, tailcallMap, progs, perfTailCallMapFD, probeMaps)
+	jobs, err := probeUnwinderJobs(coll, tailcallMap, progs, perfTailCallMapFD, probeMaps,
+		traceEventsFD)
 	if err != nil {
 		return err
 	}
@@ -969,9 +986,12 @@ func loadProbeUnwinders(coll *cebpf.CollectionSpec, ebpfProgs map[string]*cebpf.
 
 // probeUnwinderJobs rewrites the probe program specifications and collects their load
 // jobs. It only prepares the jobs, it does not load anything into the kernel.
-// probeMaps, from probeUnwinderMaps, replaces the perf unwinders' maps.
+// probeMaps, from probeUnwinderMaps, replaces the perf unwinders' maps;
+// external perf_event probes only get the replacement of trace_events, whose
+// FD is traceEventsFD.
 func probeUnwinderJobs(coll *cebpf.CollectionSpec, tailcallMap *cebpf.Map,
 	progs []ProgLoaderHelper, perfTailCallMapFD int, probeMaps map[int]*cebpf.Map,
+	traceEventsFD int,
 ) ([]progEntry, error) {
 	jobs := make([]progEntry, 0, len(progs))
 	for _, unwindProg := range progs {
@@ -990,7 +1010,16 @@ func probeUnwinderJobs(coll *cebpf.CollectionSpec, tailcallMap *cebpf.Map,
 		}
 
 		// Skip rewriting tail call maps for external perf_event based probes.
-		if unwindProgName != "perf_event__external" {
+		// Their traces still go to the probe trace buffer, where their ring
+		// buffer errors are counted.
+		if unwindProgName == "perf_event__external" {
+			traceMap := probeMaps[traceEventsFD]
+			for _, ins := range progArrayReferences(traceEventsFD, progSpec.Instructions) {
+				if err := progSpec.Instructions[ins].AssociateMap(traceMap); err != nil {
+					return nil, fmt.Errorf("failed to rewrite %s ptr: %v", traceMap, err)
+				}
+			}
+		} else {
 			// Replace the prog array for the tail calls.
 			insns := progArrayReferences(perfTailCallMapFD, progSpec.Instructions)
 			for _, ins := range insns {

@@ -3,7 +3,7 @@
 //
 // Test workload: launches a busy kernel in a loop for ~40s, each launch
 // wrapped in an NVTX range, to exercise the CUPTI producer's NVTX correlation path
-// (kernel samples should carry an nvtx:vecop_range frame).
+// (kernel samples should carry a range:vecop_range frame).
 
 #include <chrono>
 #include <cstdio>

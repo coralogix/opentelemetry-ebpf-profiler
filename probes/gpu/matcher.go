@@ -10,6 +10,7 @@ import (
 
 	lru "github.com/elastic/go-freelru"
 	"github.com/zeebo/xxh3"
+	"go.opentelemetry.io/otel/attribute"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
@@ -20,10 +21,13 @@ const (
 	launchCapacity = 1 << 17
 	// stackCapacity bounds the distinct host stacks those launches refer to.
 	stackCapacity = 1 << 14
-	// processCapacity bounds the processes whose metadata is kept.
+	// processCapacity bounds the processes whose generation and metadata are
+	// kept.
 	processCapacity = 1 << 12
 	// pendingCapacity bounds the distinct GPU work waiting for its launch.
 	pendingCapacity = 1 << 16
+	// gpuUUIDKey is the sample attribute naming the GPU that did the work.
+	gpuUUIDKey = attribute.Key("gpu.uuid")
 	// matchGrace is how long a GPU record waits for its launch stack, which
 	// takes the slower path through the trace pipeline.
 	matchGrace = 2 * time.Second
@@ -34,22 +38,20 @@ const (
 
 // gpuWork is GPU activity to attribute to the host stack of its launch.
 type gpuWork struct {
-	pid           libpf.PID
+	pid libpf.PID
+	// correlationID is the low half of the call's correlation id, all that the
+	// launch trace has room for.
 	correlationID uint32
+	// sampleWeight is the number of calls the work's call stands for.
+	sampleWeight uint32
 	// leaf names the work in the leaf frame, e.g. the kernel name.
 	leaf string
-	// function, if set, names the GPU function the work ran in.
-	function string
-	// ranges is the stack of annotation ranges active at the call site, such
-	// as NVTX ranges, or empty.
+	// ranges is the stack of annotation ranges active at the call, such as
+	// NVTX ranges, or empty.
 	ranges string
+	// gpu is the UUID of the GPU that did the work, or empty.
+	gpu    string
 	values []profileValue
-	// consumesLaunch is set for the only work of its launch, a kernel
-	// launched outside of a CUDA graph.
-	consumesLaunch bool
-	// noLaunch is set for work without a call site, attributed to the
-	// process only.
-	noLaunch bool
 }
 
 // profileValue is what gpuWork adds to a profile.
@@ -58,8 +60,8 @@ type profileValue struct {
 	value       int64
 }
 
-// processKey identifies one process: generation changes when the PID exits,
-// so a reused PID is never mistaken for the previous process.
+// processKey identifies one process: each process gets its own generation, so
+// a reused PID is never mistaken for the previous process.
 type processKey struct {
 	pid        libpf.PID
 	generation uint32
@@ -69,7 +71,7 @@ func (k processKey) hash32() uint32 {
 	return uint32(k.pid)*0x9e3779b1 ^ k.generation*0xc2b2ae35
 }
 
-// launchKey identifies the GPU call site that issued some GPU work.
+// launchKey identifies the GPU call that issued some GPU work.
 type launchKey struct {
 	processKey
 	correlationID uint32
@@ -85,15 +87,16 @@ type bucketKey struct {
 	profileType *samples.TypeMetadata
 	pid         libpf.PID
 	// stack is the hash of the host stack, zero if the launch was not captured.
-	stack    libpf.TraceHash
-	leaf     string
-	function string
-	ranges   string
+	stack  libpf.TraceHash
+	leaf   string
+	ranges string
+	gpu    string
 }
 
 type bucket struct {
 	frames libpf.Frames
 	hash   libpf.TraceHash
+	attrs  []attribute.KeyValue
 	value  int64
 	// meta is the process metadata captured while the process ran, or nil.
 	meta *samples.ProcessMeta
@@ -103,9 +106,9 @@ type bucket struct {
 // for the launch stack: a CUDA graph launch runs hundreds of kernels, mostly
 // repeating a few.
 type workKey struct {
-	leaf     string
-	function string
-	ranges   string
+	leaf   string
+	ranges string
+	gpu    string
 }
 
 // pendingWork is GPU work whose launch stack has not arrived yet.
@@ -121,26 +124,35 @@ type matcher struct {
 	// processMeta looks up process metadata in the tracer. It must not be
 	// called with mu held: Detach runs under the process manager's lock.
 	processMeta func(libpf.PID) samples.ProcessMeta
-	names       *nameCache
 
 	mu sync.Mutex
-	// generations holds the current generation of each PID with GPU activity.
-	generations map[libpf.PID]uint32
+	// generations holds the generation of each process with GPU activity, and
+	// lastGeneration the one given last. Work arriving after its process was
+	// retired starts a generation that no exit retires: the table drops the
+	// least recently active processes when full.
+	generations    *lru.LRU[libpf.PID, uint32]
+	lastGeneration uint32
 	// exits holds when processes with GPU activity exited, until their state
 	// is retired after exitGrace.
-	exits    map[libpf.PID]time.Time
+	exits map[libpf.PID]time.Time
+	// launches holds the host stack of each launch.
 	launches *lru.LRU[launchKey, libpf.TraceHash]
 	stacks   *lru.LRU[libpf.TraceHash, libpf.Frames]
-	// metas holds the metadata of processes seen launching GPU work, for
+	// metas holds the metadata of processes with GPU activity, captured while
+	// they run, and retiredMetas that of retired processes by PID, both for
 	// samples reported after the process exited.
-	metas      *lru.LRU[processKey, *samples.ProcessMeta]
-	pending    map[launchKey]map[workKey]*pendingWork
-	numPending int
-	buckets    map[bucketKey]*bucket
+	metas        *lru.LRU[processKey, *samples.ProcessMeta]
+	retiredMetas *lru.LRU[libpf.PID, *samples.ProcessMeta]
+	pending      map[launchKey]map[workKey]*pendingWork
+	numPending   int
+	buckets      map[bucketKey]*bucket
 }
 
-func newMatcher(processMeta func(libpf.PID) samples.ProcessMeta, names *nameCache,
-) (*matcher, error) {
+func newMatcher(processMeta func(libpf.PID) samples.ProcessMeta) (*matcher, error) {
+	generations, err := lru.New[libpf.PID, uint32](processCapacity, libpf.PID.Hash32)
+	if err != nil {
+		return nil, err
+	}
 	launches, err := lru.New[launchKey, libpf.TraceHash](launchCapacity, launchKey.hash32)
 	if err != nil {
 		return nil, err
@@ -153,16 +165,20 @@ func newMatcher(processMeta func(libpf.PID) samples.ProcessMeta, names *nameCach
 	if err != nil {
 		return nil, err
 	}
+	retiredMetas, err := lru.New[libpf.PID, *samples.ProcessMeta](processCapacity, libpf.PID.Hash32)
+	if err != nil {
+		return nil, err
+	}
 	return &matcher{
-		processMeta: processMeta,
-		names:       names,
-		generations: make(map[libpf.PID]uint32),
-		exits:       make(map[libpf.PID]time.Time),
-		launches:    launches,
-		stacks:      stacks,
-		metas:       metas,
-		pending:     make(map[launchKey]map[workKey]*pendingWork),
-		buckets:     make(map[bucketKey]*bucket),
+		processMeta:  processMeta,
+		generations:  generations,
+		exits:        make(map[libpf.PID]time.Time),
+		launches:     launches,
+		stacks:       stacks,
+		metas:        metas,
+		retiredMetas: retiredMetas,
+		pending:      make(map[launchKey]map[workKey]*pendingWork),
+		buckets:      make(map[bucketKey]*bucket),
 	}, nil
 }
 
@@ -172,9 +188,11 @@ func (m *matcher) processKeyLocked(pid libpf.PID, now time.Time) processKey {
 	if exited, ok := m.exits[pid]; ok && now.Sub(exited) >= exitGrace {
 		m.retireLocked(pid)
 	}
-	generation, ok := m.generations[pid]
+	generation, ok := m.generations.Get(pid)
 	if !ok {
-		m.generations[pid] = 0
+		m.lastGeneration++
+		generation = m.lastGeneration
+		m.generations.Add(pid, generation)
 	}
 	return processKey{pid: pid, generation: generation}
 }
@@ -183,8 +201,8 @@ func (m *matcher) launchKeyLocked(pid libpf.PID, correlationID uint32, now time.
 	return launchKey{processKey: m.processKeyLocked(pid, now), correlationID: correlationID}
 }
 
-// addLaunch records the host stack of a GPU call site and folds the GPU
-// records that arrived before it.
+// addLaunch records the host stack of a GPU call and folds the GPU records
+// that arrived before it.
 func (m *matcher) addLaunch(pid libpf.PID, correlationID uint32, trace *libpf.Trace,
 	now time.Time,
 ) {
@@ -196,49 +214,43 @@ func (m *matcher) addLaunch(pid libpf.PID, correlationID uint32, trace *libpf.Tr
 	key := m.launchKeyLocked(pid, correlationID, now)
 	m.stacks.Add(stack, trace.Frames)
 
+	// The launch is kept even once work arrived: more may follow, like the
+	// other kernels of a graph. The table drops the oldest launches when full.
+	m.launches.Add(key, stack)
 	pending, ok := m.pending[key]
 	if !ok {
-		m.launches.Add(key, stack)
 		return
 	}
 	delete(m.pending, key)
 	m.numPending -= len(pending)
-	consumed := false
 	for _, p := range pending {
 		m.foldLocked(p.work, stack, trace.Frames)
-		consumed = consumed || p.work.consumesLaunch
-	}
-	if !consumed {
-		// More work of the launch may follow, like other kernels of a graph.
-		m.launches.Add(key, stack)
 	}
 }
 
-// addWork folds GPU work into its launch stack's samples, or keeps it until the
-// launch arrives.
+// addWork folds GPU work, multiplied by its sample weight, into its launch
+// stack's samples, or keeps it until the launch arrives.
 func (m *matcher) addWork(work gpuWork, now time.Time) {
 	if len(work.values) == 0 {
 		return
 	}
+	work = work.scaled()
+	m.rememberMeta(work.pid, now)
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if work.noLaunch {
-		m.processKeyLocked(work.pid, now)
-		m.foldLocked(work, libpf.TraceHash{}, nil)
-		return
-	}
 	key := m.launchKeyLocked(work.pid, work.correlationID, now)
 	if stack, ok := m.launches.Get(key); ok {
 		if frames, ok := m.stacks.Get(stack); ok {
-			if work.consumesLaunch {
-				m.launches.Remove(key)
-			}
 			m.foldLocked(work, stack, frames)
-			return
+		} else {
+			// The stack was evicted and will not arrive again.
+			m.foldLocked(work, libpf.TraceHash{}, nil)
 		}
+		return
 	}
 	works := m.pending[key]
-	wk := workKey{leaf: work.leaf, function: work.function, ranges: work.ranges}
+	wk := workKey{leaf: work.leaf, ranges: work.ranges, gpu: work.gpu}
 	if p, ok := works[wk]; ok {
 		p.work.merge(work)
 		return
@@ -264,14 +276,15 @@ func (m *matcher) foldLocked(work gpuWork, stack libpf.TraceHash, hostFrames lib
 			pid:         work.pid,
 			stack:       stack,
 			leaf:        work.leaf,
-			function:    work.function,
 			ranges:      work.ranges,
+			gpu:         work.gpu,
 		}
 		b, ok := m.buckets[key]
 		if !ok {
 			b = &bucket{
 				frames: sampleFrames(work, hostFrames),
 				hash:   sampleHash(stack, work),
+				attrs:  sampleAttributes(work),
 				meta:   m.capturedMetaLocked(work.pid),
 			}
 			m.buckets[key] = b
@@ -283,14 +296,11 @@ func (m *matcher) foldLocked(work gpuWork, stack libpf.TraceHash, hostFrames lib
 // rangeSeparator separates the ranges of a range stack.
 const rangeSeparator = "\x1f"
 
-// sampleFrames returns the frames of a sample: the work, its GPU function, the
-// annotation ranges it ran in from the innermost outwards, then the host stack.
+// sampleFrames returns the frames of a sample: the work, the annotation ranges
+// it ran in from the innermost outwards, then the host stack.
 func sampleFrames(work gpuWork, hostFrames libpf.Frames) libpf.Frames {
 	frames := make(libpf.Frames, 0, len(hostFrames)+2)
 	frames.Append(&libpf.Frame{Type: libpf.GPUFrame, FunctionName: libpf.Intern(work.leaf)})
-	if work.function != "" {
-		frames.Append(&libpf.Frame{Type: libpf.GPUFrame, FunctionName: libpf.Intern(work.function)})
-	}
 	for name := range strings.SplitSeq(work.ranges, rangeSeparator) {
 		if name != "" {
 			frames.Append(&libpf.Frame{
@@ -302,31 +312,38 @@ func sampleFrames(work gpuWork, hostFrames libpf.Frames) libpf.Frames {
 	return append(frames, hostFrames...)
 }
 
-// capturedMetaLocked returns the metadata captured for the current or, after
-// it exited, the previous process with this PID. The caller must hold m.mu.
+// capturedMetaLocked returns the metadata captured for the current process
+// with this PID or, once it was retired, for the last one. The caller must hold
+// m.mu.
 func (m *matcher) capturedMetaLocked(pid libpf.PID) *samples.ProcessMeta {
-	generation := m.generations[pid]
-	if meta, ok := m.metas.Get(processKey{pid: pid, generation: generation}); ok {
-		return meta
+	if generation, ok := m.generations.Peek(pid); ok {
+		if meta, ok := m.metas.Get(processKey{pid: pid, generation: generation}); ok {
+			return meta
+		}
 	}
-	if generation == 0 {
-		return nil
-	}
-	meta, _ := m.metas.Get(processKey{pid: pid, generation: generation - 1})
+	meta, _ := m.retiredMetas.Get(pid)
 	return meta
 }
 
-// sampleHash identifies a sample's stack. libpf.Trace.Hash does not cover
-// function names, the only difference between synthesized frames.
+// sampleAttributes returns the attributes of a sample, or nil.
+func sampleAttributes(work gpuWork) []attribute.KeyValue {
+	if work.gpu == "" {
+		return nil
+	}
+	return []attribute.KeyValue{gpuUUIDKey.String(work.gpu)}
+}
+
+// sampleHash identifies a sample. libpf.Trace.Hash does not cover function
+// names, the only difference between synthesized frames, nor attributes.
 func sampleHash(stack libpf.TraceHash, work gpuWork) libpf.TraceHash {
 	h := xxh3.New128()
 	_, _ = h.Write(stack.Bytes())
 	// The separators keep "a"+"bc" apart from "ab"+"c".
 	_, _ = h.WriteString(work.leaf)
 	_, _ = h.WriteString(rangeSeparator)
-	_, _ = h.WriteString(work.function)
-	_, _ = h.WriteString(rangeSeparator)
 	_, _ = h.WriteString(work.ranges)
+	_, _ = h.WriteString(rangeSeparator)
+	_, _ = h.WriteString(work.gpu)
 	sum := h.Sum128()
 	return libpf.NewTraceHash(sum.Hi, sum.Lo)
 }
@@ -354,18 +371,32 @@ func (m *matcher) expirePendingLocked(now time.Time) {
 func (m *matcher) processExited(pid libpf.PID, now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.generations[pid]; ok {
+	if m.generations.Contains(pid) {
 		m.exits[pid] = now
 	}
 }
 
+// processStarted retires the previous process with this PID at once if it
+// exited: a new process reused the PID before exitGrace passed.
+func (m *matcher) processStarted(pid libpf.PID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.exits[pid]; ok {
+		m.retireLocked(pid)
+	}
+}
+
 // retireLocked forgets the state of an exited process. Its buffered launches
-// become unreachable under the next generation, so a process reusing the PID
-// never matches them. The caller must hold m.mu.
+// become unreachable, since a process reusing the PID gets a new generation.
+// The caller must hold m.mu.
 func (m *matcher) retireLocked(pid libpf.PID) {
+	if generation, ok := m.generations.Peek(pid); ok {
+		if meta, ok := m.metas.Get(processKey{pid: pid, generation: generation}); ok {
+			m.retiredMetas.Add(pid, meta)
+		}
+	}
 	delete(m.exits, pid)
-	m.generations[pid]++
-	m.names.forget(pid)
+	m.generations.Remove(pid)
 }
 
 // retireExitedLocked retires the processes that exited more than exitGrace ago.
@@ -378,8 +409,9 @@ func (m *matcher) retireExitedLocked(now time.Time) {
 	}
 }
 
-// rememberMeta captures the metadata of a process the first time it launches
-// GPU work, for samples reported after it exited.
+// rememberMeta captures the metadata of a process the first time it has GPU
+// activity that the tracer knows the process, for samples reported after it
+// exited.
 func (m *matcher) rememberMeta(pid libpf.PID, now time.Time) {
 	m.mu.Lock()
 	key := m.processKeyLocked(pid, now)
@@ -390,6 +422,10 @@ func (m *matcher) rememberMeta(pid libpf.PID, now time.Time) {
 	}
 
 	meta := m.processMeta(pid)
+	if meta.ExecutablePath == libpf.NullString {
+		// The tracer has not loaded the process yet: try again later.
+		return
+	}
 	m.mu.Lock()
 	m.metas.Add(key, &meta)
 	m.mu.Unlock()
@@ -427,6 +463,7 @@ func (m *matcher) snapshot(now time.Time) []samples.SnapshotProfile {
 			PID:         key.pid,
 			TraceHash:   b.hash,
 			Frames:      b.frames,
+			Attributes:  b.attrs,
 			Value:       b.value,
 			ProcessMeta: sampleMeta,
 		})

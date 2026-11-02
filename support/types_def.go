@@ -318,4 +318,7 @@ var MetricsTranslation = []metrics.MetricID{
 	C.metricID_UnwindThreadContextReadSuccesses:           metrics.IDUnwindThreadContextReadSuccesses,
 	C.metricID_UnwindThreadContextAttrsTruncated:          metrics.IDUnwindThreadContextAttrsTruncated,
 	C.metricID_BPFProbeRingbufOutputErr:                   metrics.IDBPFProbeRingbufOutputErr,
+	C.metricID_BPFGPURingbufOutputErr:                     metrics.IDBPFGPURingbufOutputErr,
+	C.metricID_BPFGPUEventTooLarge:                        metrics.IDBPFGPUEventTooLarge,
+	C.metricID_BPFGPUEventReadErr:                         metrics.IDBPFGPUEventReadErr,
 }

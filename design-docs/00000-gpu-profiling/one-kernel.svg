@@ -51,7 +51,7 @@
 
         <path d="M230,68 V98" class="d-a" marker-end="url(#ah)"/>
         <rect x="196" y="100" width="144" height="32" rx="6" class="d-ven"/>
-        <text x="208" y="120" class="d-m">on_launch, id 42</text>
+        <text x="208" y="120" class="d-m">LAUNCH, id 42</text>
         <path d="M270,132 V162" class="d-a" marker-end="url(#ah)"/>
         <rect x="212" y="164" width="140" height="32" rx="6" class="d-neu"/>
         <text x="224" y="184" class="d-m">capture stack</text>
@@ -66,7 +66,7 @@
         <path d="M680,308 H700 V116 H714" class="d-a gpu d-dash" marker-end="url(#ahg)"/>
         <text x="708" y="326" class="d-s">times arrive later, in a batch</text>
         <rect x="716" y="100" width="240" height="32" rx="6" class="d-ven"/>
-        <text x="728" y="120" class="d-m">kernel_executed, id 42</text>
+        <text x="728" y="120" class="d-m">KERNEL, id 42</text>
         <path d="M850,132 V162" class="d-a" marker-end="url(#ah)"/>
         <rect x="780" y="164" width="140" height="32" rx="6" class="d-neu"/>
         <text x="792" y="184" class="d-m">forward timing</text>
