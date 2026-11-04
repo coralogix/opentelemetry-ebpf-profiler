@@ -11,6 +11,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pprofile"
+	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.34.0"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -102,4 +103,29 @@ func TestAttrTableManager(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAppendAttributeKeepsType(t *testing.T) {
+	strSet := orderedset.OrderedSet[string]{}
+	attrTable := pprofile.NewKeyValueAndUnitSlice()
+	mgr := NewAttrTableManager(strSet, attrTable)
+	indices := pcommon.NewInt32Slice()
+	for _, kv := range []attribute.KeyValue{
+		attribute.Bool("b", true),
+		attribute.Int64("i", 5),
+		attribute.Float64("f", 1.5),
+		attribute.String("s", "5"),
+		attribute.String("empty", ""),
+		attribute.Int64("i", 5),
+	} {
+		mgr.AppendAttribute(indices, kv)
+	}
+
+	require.Equal(t, []int32{0, 1, 2, 3, 1}, indices.AsRaw())
+	values := make(map[string]any)
+	for i := range attrTable.Len() {
+		attr := attrTable.At(i)
+		values[strSet.ToSlice()[attr.KeyStrindex()]] = attr.Value().AsRaw()
+	}
+	assert.Equal(t, map[string]any{"b": true, "i": int64(5), "f": 1.5, "s": "5"}, values)
 }

@@ -362,6 +362,20 @@ enum {
   // number of thread context attribute payloads truncated to fit the buffer
   metricID_UnwindThreadContextAttrsTruncated,
 
+  // number of bpf_ringbuf_output failures when sending the traces of probes
+  metricID_BPFProbeRingbufOutputErr,
+
+  // number of GPU events dropped because the gpu probe's ring buffer was full
+  metricID_BPFGPURingbufOutputErr,
+
+  // number of GPU events dropped because their payload exceeded the size the
+  // contract allows
+  metricID_BPFGPUEventTooLarge,
+
+  // number of GPU events dropped because their header or payload could not be
+  // read
+  metricID_BPFGPUEventReadErr,
+
   //
   // Metric IDs above are for counters (cumulative values)
   //

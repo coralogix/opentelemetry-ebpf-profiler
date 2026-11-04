@@ -2,7 +2,7 @@
 	test-junit test-luajit-offsets protobuf docker-image agent license-check license-save \
 	integration-test-binaries \
 	codespell lint format format-ebpf format-go pprof-execs \
-	processctx-execs tlsvar-execs host-integration-tests \
+	processctx-execs tlsvar-execs host-integration-tests gpu-test-producer \
 	pprof_1_23 pprof_1_24 pprof_1_24_cgo otelcol-ebpf-profiler \
 	rust-components rust-targets rust-tests vanity-import-check vanity-import-fix \
 	otel-from-tree otel-from-lib
@@ -147,7 +147,12 @@ test-deps: $(GOLABELS_TESTDATA_TARGETS)
 		($(MAKE) -C "$(testdata_dir)") || exit ; \
 	)
 
-TEST_INTEGRATION_BINARY_DIRS := tracer processmanager/ebpf kallsyms support interpreter/go/integrationtests
+TEST_INTEGRATION_BINARY_DIRS := tracer processmanager/ebpf kallsyms support interpreter/go/integrationtests probes/gpu
+
+# The fake GPU producer, embedded into the gpu probe's static test binary. It
+# needs sys/sdt.h, from systemtap-sdt-dev.
+gpu-test-producer:
+	$(CC) -static -O2 -g -o probes/gpu/testdata/producer probes/gpu/testdata/producer.c
 
 processctx-execs:
 	$(MAKE) -C process/processcontext/integrationtests/testdata
@@ -187,7 +192,7 @@ pprof_stable_cgo:
 pprof_stable_cgo_pie:
 	CGO_ENABLED=1 go test -C ./interpreter/go/integrationtests/pprof -c -ldflags '-extldflags "-static"' -trimpath -buildmode=pie -tags $(GO_TAGS),withcgo,integration -o ./../$@
 
-integration-test-binaries: generate ebpf pprof-execs
+integration-test-binaries: generate ebpf pprof-execs gpu-test-producer
 	$(foreach test_name, $(TEST_INTEGRATION_BINARY_DIRS), \
 		(go test -ldflags='-extldflags=-static' -trimpath -c \
 			-tags $(GO_TAGS),static_build,integration \

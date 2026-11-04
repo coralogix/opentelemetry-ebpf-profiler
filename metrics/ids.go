@@ -710,6 +710,18 @@ const (
 	// Number of processes whose published thread-context label schema was rejected
 	IDThreadContextSchemaRejected = 312
 
+	// Number of bpf_ringbuf_output failures when sending the traces of probes
+	IDBPFProbeRingbufOutputErr = 313
+
+	// Number of GPU events dropped because the gpu probe's ring buffer was full
+	IDBPFGPURingbufOutputErr = 314
+
+	// Number of GPU events dropped because their payload exceeded the size the contract allows
+	IDBPFGPUEventTooLarge = 315
+
+	// Number of GPU events dropped because their header or payload could not be read
+	IDBPFGPUEventReadErr = 316
+
 	// max number of ID values, keep this as *last entry*
-	IDMax = 313
+	IDMax = 317
 )

@@ -39,6 +39,16 @@ const (
 	BEAM InterpreterType = support.FrameMarkerBEAM
 )
 
+// Interpreters whose frames are synthesized in Go by probes instead of being
+// unwound in eBPF. eBPF frame headers hold the frame type in 4 bits, so these
+// start above that range.
+const (
+	// CUDA identifies GPU work reported through NVIDIA's CUDA runtime.
+	CUDA InterpreterType = 0x10
+	// ROCm identifies GPU work reported through AMD's ROCm runtime.
+	ROCm InterpreterType = 0x11
+)
+
 // Pseudo-interpreters without a corresponding frame type.
 const (
 	// pseudoInterpreterStart marks the start of the pseudo interpreter ID space.
@@ -74,6 +84,8 @@ var interpreterTypeToString = map[InterpreterType]string{
 	ThreadContext: "thread-context",
 	LuaJIT:        "luajit",
 	Go:            "go",
+	CUDA:          "cuda",
+	ROCm:          "rocm",
 }
 
 var stringToInterpreterType = make(map[string]InterpreterType, len(interpreterTypeToString))

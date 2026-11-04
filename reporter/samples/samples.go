@@ -33,7 +33,9 @@ type TraceEventMeta struct {
 
 // TraceEvents holds known information about a trace.
 type TraceEvents struct {
-	Labels     map[libpf.String]libpf.String
+	Labels map[libpf.String]libpf.String
+	// Attributes are sample attributes set by a probe, or nil.
+	Attributes []attribute.KeyValue
 	Frames     libpf.Frames
 	Timestamps []uint64 // in nanoseconds
 	// Values stores one contiguous group per event, with one value for each
@@ -140,6 +142,10 @@ type TypeMetadata struct {
 	// a single sample type. The function must consume ContextValues
 	// synchronously because they alias a pooled trace.
 	AppendValues func(dst []int64, meta *TraceEventMeta) []int64
+
+	// OmitThreadContext indicates that samples carry no thread or CPU
+	// attribution, e.g. values aggregated across threads by a probe.
+	OmitThreadContext bool
 }
 
 // AppendFirstContextValue is the AppendValues for origins with a single sample
@@ -151,4 +157,38 @@ func AppendFirstContextValue(dst []int64, meta *TraceEventMeta) []int64 {
 		return append(dst, 0)
 	}
 	return append(dst, int64(meta.ContextValues[0]))
+}
+
+// SnapshotProfile holds the samples a probe produced for one profile type,
+// which has a single sample type, since the previous report.
+type SnapshotProfile struct {
+	ProfileType *TypeMetadata
+	Samples     []SnapshotSample
+}
+
+// SnapshotSample is one stack and its value produced by a probe. The probe
+// computes TraceHash: frames synthesized in Go may differ only in fields that
+// libpf.Trace.Hash does not cover, such as the function name.
+type SnapshotSample struct {
+	PID       libpf.PID
+	TraceHash libpf.TraceHash
+	Frames    libpf.Frames
+	// Attributes are added to the exported sample. Samples that differ only in
+	// attributes must differ in TraceHash.
+	Attributes []attribute.KeyValue
+	Value      int64
+	// ProcessMeta, if set, is used for the resource attributes instead of the
+	// metadata looked up at report time, when the process may have exited.
+	ProcessMeta *ProcessMeta
+}
+
+// ProcessMeta is the process metadata used for the resource attributes of
+// samples that do not come from a trace event.
+type ProcessMeta struct {
+	ExecutablePath libpf.String
+	ContainerID    libpf.String
+	EnvVars        map[libpf.String]libpf.String
+	// ExtraMeta holds the key-value pairs of process.MetaEnrichers, or nil.
+	ExtraMeta     map[libpf.String]string
+	ResourceAttrs attribute.Set
 }

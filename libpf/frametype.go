@@ -55,6 +55,10 @@ const (
 	BEAMFrame FrameType = support.FrameMarkerBEAM
 	// LuaJITFrame identifies the LuaJIT interpreter frames.
 	LuaJITFrame FrameType = support.FrameMarkerLuaJIT
+	// CUDAFrame identifies frames synthesized for GPU work reported through CUDA.
+	CUDAFrame FrameType = FrameType(CUDA)
+	// ROCmFrame identifies frames synthesized for GPU work reported through ROCm.
+	ROCmFrame FrameType = FrameType(ROCm)
 )
 
 const (

@@ -7,9 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	cebpf "github.com/cilium/ebpf"
 
+	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/kallsyms"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	pm "go.opentelemetry.io/ebpf-profiler/processmanager"
@@ -23,6 +26,7 @@ type ProbeContext struct {
 	maps             map[string]*cebpf.Map
 	sysVars          SysConfigVars
 	registerAttacher func(pm.ProbeAttacher) error
+	processMeta      func(libpf.PID) samples.ProcessMeta
 	KernelSymbolizer *kallsyms.Symbolizer
 	reg              ProbeRegistrar
 }
@@ -218,16 +222,12 @@ func (c *ProbeContext) LoadProbeUnwinders(
 	if perfProgs == nil {
 		return fmt.Errorf("perf_progs map not available")
 	}
-	perCPURecords := c.maps["per_cpu_records"]
-	if perCPURecords == nil {
-		return fmt.Errorf("per_cpu_records map not available")
-	}
-	perCPURecordsKp := c.maps["per_cpu_records_kp"]
-	if perCPURecordsKp == nil {
-		return fmt.Errorf("per_cpu_records_kp map not available")
+	probeMaps, err := probeUnwinderMaps(c.maps)
+	if err != nil {
+		return err
 	}
 	return loadProbeUnwinders(coll, ebpfProgs, kprobeProgs, progs,
-		bpfVerifierLogLevel, perfProgs.FD(), perCPURecords.FD(), perCPURecordsKp)
+		bpfVerifierLogLevel, perfProgs.FD(), probeMaps, c.maps["trace_events"].FD())
 }
 
 // CollectTrampolineRef describes what an external probe's eBPF entry program needs
@@ -370,6 +370,13 @@ func (c *ProbeContext) RegisterCollectTrampoline(meta *samples.TypeMetadata, kin
 	}, nil
 }
 
+// ProcessMeta returns the metadata the tracer tracks for pid. Probes reporting
+// snapshot samples use it to attribute samples of processes that may exit
+// before the next report.
+func (c *ProbeContext) ProcessMeta(pid libpf.PID) samples.ProcessMeta {
+	return c.processMeta(pid)
+}
+
 // AddAttacher registers a per-process attacher with the process manager.
 // ProcessManager calls Match/Attach as new mappings appear and Detach on process exit.
 func (c *ProbeContext) AddAttacher(a pm.ProbeAttacher) error {
@@ -436,13 +443,22 @@ type PostTraceHandler interface {
 	PostHandleTrace(trace *libpf.Trace)
 }
 
+// SnapshotSource is an optional interface that Probe implementations may
+// satisfy to contribute samples that do not map to a single trace, such as
+// values aggregated in Go. The reporter calls ProduceSnapshots once per report
+// interval; it must return only what accumulated since the previous call.
+type SnapshotSource interface {
+	ProduceSnapshots() []samples.SnapshotProfile
+}
+
 // Enable builds a ProbeContext from the tracer's current state and calls p.Load.
 // Attachers registered via AddAttacher receive per-process lifecycle callbacks
 // from the ProcessManager.
 //
 // If the probe satisfies PreTraceHandler and/or PostTraceHandler, it is
 // registered to intercept traces before symbolization or receive them after
-// symbolization, respectively.
+// symbolization, respectively. If it satisfies SnapshotSource, its snapshots
+// are included in CollectSnapshots.
 //
 // Enable requires that the kprobe tail-call unwinder chain was loaded at tracer
 // startup, which happens when off-CPU profiling is enabled (OffCPUThreshold > 0).
@@ -453,6 +469,9 @@ type PostTraceHandler interface {
 // subsequently fails; they cannot be reclaimed.
 // Enable returns an error if the tracer has already been closed.
 func (t *Tracer) Enable(ctx context.Context, p Probe) error {
+	if !t.probesEnabled {
+		log.Warnf("Probe %T enabled without Config.ProbesEnabled: its traces may be dropped", p)
+	}
 	probeCtx := &ProbeContext{
 		maps:    t.ebpfMaps,
 		sysVars: t.sysConfigVars,
@@ -465,6 +484,7 @@ func (t *Tracer) Enable(ctx context.Context, p Probe) error {
 			t.processManager.RegisterProbeAttacher(a)
 			return nil
 		},
+		processMeta:      t.ProcessMeta,
 		KernelSymbolizer: t.kernelSymbolizer,
 	}
 
@@ -472,17 +492,67 @@ func (t *Tracer) Enable(ctx context.Context, p Probe) error {
 		return fmt.Errorf("failed to load probe: %w", err)
 	}
 
-	if pth, ok := p.(PreTraceHandler); ok {
-		for _, origin := range pth.PreOrigins() {
-			t.preTraceHandlers[origin] = append(t.preTraceHandlers[origin], pth)
-		}
-	}
+	t.addTraceHandlers(p)
 
-	if pth, ok := p.(PostTraceHandler); ok {
-		for _, origin := range pth.PostOrigins() {
-			t.postTraceHandlers[origin] = append(t.postTraceHandlers[origin], pth)
-		}
+	if ss, ok := p.(SnapshotSource); ok {
+		t.snapshotSourcesMu.Lock()
+		t.snapshotSources = append(t.snapshotSources, ss)
+		t.snapshotSourcesMu.Unlock()
 	}
 
 	return nil
+}
+
+// traceHandlers holds the pre- and post-trace handlers registered per origin.
+// It is never modified once published.
+type traceHandlers struct {
+	pre  map[uint16][]PreTraceHandler
+	post map[uint16][]PostTraceHandler
+}
+
+// addTraceHandlers registers p for the origins it handles. Traces may be handled
+// concurrently, so it publishes updated copies of the handler maps.
+func (t *Tracer) addTraceHandlers(p Probe) {
+	t.traceHandlersMu.Lock()
+	defer t.traceHandlersMu.Unlock()
+
+	current := t.traceHandlers.Load()
+	next := &traceHandlers{pre: maps.Clone(current.pre), post: maps.Clone(current.post)}
+	if pth, ok := p.(PreTraceHandler); ok {
+		for _, origin := range pth.PreOrigins() {
+			next.pre[origin] = append(slices.Clip(next.pre[origin]), pth)
+		}
+	}
+	if pth, ok := p.(PostTraceHandler); ok {
+		for _, origin := range pth.PostOrigins() {
+			next.post[origin] = append(slices.Clip(next.post[origin]), pth)
+		}
+	}
+	t.traceHandlers.Store(next)
+}
+
+// CollectSnapshots returns the snapshot profiles of all enabled probes that
+// satisfy SnapshotSource.
+func (t *Tracer) CollectSnapshots() []samples.SnapshotProfile {
+	t.snapshotSourcesMu.Lock()
+	sources := slices.Clone(t.snapshotSources)
+	t.snapshotSourcesMu.Unlock()
+
+	var profiles []samples.SnapshotProfile
+	for _, source := range sources {
+		profiles = append(profiles, source.ProduceSnapshots()...)
+	}
+	return profiles
+}
+
+// ProcessMeta returns the metadata the tracer tracks for pid.
+func (t *Tracer) ProcessMeta(pid libpf.PID) samples.ProcessMeta {
+	meta, resourceAttrs := t.processManager.MetaForPID(pid)
+	return samples.ProcessMeta{
+		ExecutablePath: meta.Executable,
+		ContainerID:    meta.ContainerID,
+		EnvVars:        meta.EnvVariables,
+		ExtraMeta:      meta.ExtraMeta,
+		ResourceAttrs:  resourceAttrs,
+	}
 }

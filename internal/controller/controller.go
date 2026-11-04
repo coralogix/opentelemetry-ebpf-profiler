@@ -104,12 +104,17 @@ func (c *Controller) Start(ctx context.Context) error {
 		OBIProcessCtx:               c.config.OBIProcessCtx,
 		ProcessMetaEnrichers:        c.config.ProcessMetaEnrichers,
 		PIDNamespaceTranslationMode: c.config.PIDNamespaceTranslationMode,
+		ProbesEnabled:               len(c.config.Probes) > 0,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to load eBPF tracer: %w", err)
 	}
 	c.tracer = trc
 	log.Info("eBPF tracer loaded")
+
+	if merger, ok := c.reporter.(reporter.SnapshotMerger); ok {
+		merger.SetSnapshotSources(trc.CollectSnapshots, trc.ProcessMeta)
+	}
 
 	now := time.Now()
 

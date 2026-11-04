@@ -226,10 +226,49 @@ func (pm *ProcessManager) handleNewInterpreter(pr process.Process, bias libpf.Ad
 	return anonymousMappingsWanted || instance.UsesAnonymousMappings(), nil
 }
 
+// attachProbes attaches the registered ProbeAttachers to the given new mappings of
+// a process, unless the process exited in the meantime: its probes were then
+// already detached, and attaching now would leak them.
+func (pm *ProcessManager) attachProbes(pr process.Process, mappings []addedMapping) {
+	if len(mappings) == 0 {
+		return
+	}
+	pm.attachMu.Lock()
+	defer pm.attachMu.Unlock()
+	if len(pm.probeAttachers) == 0 {
+		return
+	}
+
+	pid := pr.PID()
+	pm.mu.RLock()
+	_, exited := pm.exitEvents[pid]
+	_, known := pm.pidToProcessInfo[pid]
+	pm.mu.RUnlock()
+	if exited || !known {
+		return
+	}
+	for i := range mappings {
+		m := &mappings[i].mapping
+		elfRef := mappingELFReference(pr, m)
+		pm.attachProbesForMapping(pr, m, mappings[i].fileID, elfRef)
+		elfRef.Close()
+	}
+}
+
+// detachProbes detaches the ProbeAttachers attached to an exited process.
+func (pm *ProcessManager) detachProbes(pid libpf.PID) {
+	pm.attachMu.Lock()
+	defer pm.attachMu.Unlock()
+	for a := range pm.attachedProbes[pid] {
+		a.Detach(pid)
+	}
+	delete(pm.attachedProbes, pid)
+}
+
 // attachProbesForMapping iterates the registered ProbeAttachers and calls Attach
 // for every attacher whose Match returns true for the given mapping.
 // Attach may be called multiple times for the same attacher if the process
-// has more than one matching mapping. The caller must hold pm.mu for writing.
+// has more than one matching mapping. The caller must hold pm.attachMu.
 func (pm *ProcessManager) attachProbesForMapping(pr process.Process, m *process.RawMapping,
 	fileID libpf.FileID, elfRef *pfelf.Reference,
 ) {
@@ -239,7 +278,12 @@ func (pm *ProcessManager) attachProbesForMapping(pr process.Process, m *process.
 			continue
 		}
 		if err := a.Attach(pr, m, fileID, elfRef); err != nil {
-			log.Errorf("Failed to attach probe for PID %d, mapping %s: %v", pid, m.Path, err)
+			if alive, _ := isPIDLive(pid); alive {
+				log.Errorf("Failed to attach probe for PID %d, mapping %s: %v", pid, m.Path, err)
+			} else {
+				log.Debugf("Failed to attach probe for PID %d, mapping %s: process exited",
+					pid, m.Path)
+			}
 			continue
 		}
 		if pm.attachedProbes[pid] == nil {
@@ -395,14 +439,14 @@ func (pm *ProcessManager) processRemovedInterpreters(pid libpf.PID,
 
 var errInvalidVirtualAddress = errors.New("invalid ELF virtual address")
 
-func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapping,
-	anonymousMappingsWanted bool,
-) (libpf.FrameMapping, bool, error) {
+// mappingELFReference returns a reference to the ELF file of a mapping, opened
+// on first use.
+func mappingELFReference(pr process.Process, m *process.RawMapping) *pfelf.Reference {
 	// Open the mapping's own file via OpenMappingFile, which can open deleted
 	// or replaced files (e.g. via /proc/<pid>/map_files) and VDSO from process
 	// memory. Auxiliary opens such as .gnu_debuglink targets go through the
 	// pr fs.FS.
-	elfRef := pfelf.NewReferenceWithOpenFunc(m.Path, pr, func() (*pfelf.File, error) {
+	return pfelf.NewReferenceWithOpenFunc(m.Path, pr, func() (*pfelf.File, error) {
 		f, err := pr.OpenMappingFile(m)
 		if err != nil {
 			return nil, fmt.Errorf("OpenMappingFile path=%q vaddr=%#x: %w",
@@ -410,6 +454,18 @@ func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapp
 		}
 		return pfelf.NewFileFromFS(f)
 	})
+}
+
+// addedMapping is a mapping new to a process, whose file is fileID.
+type addedMapping struct {
+	mapping process.RawMapping
+	fileID  libpf.FileID
+}
+
+func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapping,
+	anonymousMappingsWanted bool,
+) (libpf.FrameMapping, bool, error) {
+	elfRef := mappingELFReference(pr, m)
 	defer elfRef.Close()
 
 	info := pm.getELFInfo(pr, m, elfRef)
@@ -457,7 +513,6 @@ func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapp
 			anonymousMappingsWanted = updatedAnonymousMappingsWanted
 		}
 	}
-	pm.attachProbesForMapping(pr, m, info.mappingFile.Value().FileID, elfRef)
 	pm.mu.Unlock()
 
 	return libpf.NewFrameMapping(libpf.FrameMappingData{
@@ -501,6 +556,8 @@ func (pm *ProcessManager) processPIDExit(pid libpf.PID) {
 		}
 	}()
 	defer pm.ebpf.RemoveReportedPID(pid)
+	// Detach probes once mu is released: detaching can take seconds.
+	defer pm.detachProbes(pid)
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -531,11 +588,6 @@ func (pm *ProcessManager) processPIDExit(pid libpf.PID) {
 	}
 	pm.pidPageToMappingInfoSize -= min(pm.pidPageToMappingInfoSize, deleted)
 	pm.processRemovedInterpreters(pid, libpf.Set[util.OnDiskFileIdentifier]{})
-
-	for a := range pm.attachedProbes[pid] {
-		a.Detach(pid)
-	}
-	delete(pm.attachedProbes, pid)
 }
 
 // isInterpreterMapping reports whether a mapping should be passed to interpreter
@@ -667,6 +719,8 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	capHint := max(32, min(len(oldMappings), 256))
 	mappings := make([]Mapping, 0, capHint)
 	mpAdd := make([]*Mapping, 0, capHint)
+	// attach holds the new mappings to attach probes to, once eBPF knows them.
+	var attach []addedMapping
 
 	pm.mappingStats.numProcAttempts.Add(1)
 	start := time.Now()
@@ -734,6 +788,10 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 				})
 				if newMapping {
 					mpAdd = append(mpAdd, &mappings[len(mappings)-1])
+					attach = append(attach, addedMapping{
+						mapping: m,
+						fileID:  fm.Value().File.Value().FileID,
+					})
 				}
 			}
 		}
@@ -837,6 +895,10 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 	interpreters := pm.interpreters[pid]
 	pm.mu.Unlock()
 
+	// Probes fire right after attaching: their traces must find the process, so
+	// attach only now that its mappings are published.
+	pm.attachProbes(pr, attach)
+
 	// Synchronize all interpreters with updated mappings
 	for _, instance := range interpreters {
 		err := instance.SynchronizeMappings(pm.ebpf, pm.exeReporter, pr, interpreterMappings.mappings())
@@ -894,9 +956,9 @@ func (pm *ProcessManager) CleanupPIDs() {
 	}
 }
 
-// metaForPID returns the process metadata and process-context resource
+// MetaForPID returns the process metadata and process-context resource
 // attributes for pid, read under one lock.
-func (pm *ProcessManager) metaForPID(pid libpf.PID) (process.Meta, attribute.Set) {
+func (pm *ProcessManager) MetaForPID(pid libpf.PID) (process.Meta, attribute.Set) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	if procInfo, ok := pm.pidToProcessInfo[pid]; ok {
