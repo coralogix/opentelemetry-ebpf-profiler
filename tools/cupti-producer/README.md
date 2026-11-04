@@ -49,9 +49,10 @@ graphs, or copy or fill memory. It finds them by name when it starts, so that
 every variant is tracked, also those of later CUDA versions.
 
 The library samples the tracked calls, so that launch-heavy workloads do not
-unwind a host stack per kernel. Each thread samples kernel launches and memory
+unwind a host stack per kernel. Each process samples kernel launches and memory
 operations at about `OTEL_GPU_SAMPLE_RATE` calls per second each (default 200),
-and CUDA graph launches at `OTEL_GPU_GRAPH_SAMPLE_RATE` (default 20). A sampled
+and CUDA graph launches at `OTEL_GPU_GRAPH_SAMPLE_RATE` (default 20), across
+all its threads. A sampled
 call's `LAUNCH` event and the events of its GPU work carry its sample weight,
 the number of calls it stands for, and the profiler scales the call's GPU time
 and bytes by it. Unsampled calls send no event at all. `OTEL_GPU_SAMPLE_RATE=0`
@@ -67,6 +68,16 @@ never wait for either. Without a profiler, the library costs a check of the
 semaphore at each tracked CUDA call, and keeps the NVTX ranges of each thread.
 GPU work launched before tracing started is not reported, rather than reported
 without its launch stack.
+
+## Events
+
+Copies are sent as the kind of their direction, copies from and to CUDA
+arrays as copies from and to the GPU's memory. Events of work name their GPU
+by an index, its ordinal plus one: a `DEVICE` event tells the profiler the UUID
+an index stands for, before the first work on that GPU after tracing starts,
+and again every 10 seconds, in case one was lost. Ranges are sent only if they
+fit whole in the event's payload, and the kernel name last, cut short if
+needed.
 
 ## Debug totals
 

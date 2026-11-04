@@ -16,9 +16,13 @@ import (
 // Kinds of events, from enum otel_gpu_kind in otel_gpu_v1_usdt.h. LAUNCH events
 // never get here: support/ebpf/gpu.ebpf.c turns them into traces.
 const (
-	kindKernel uint16 = 2
-	kindCopy   uint16 = 3
-	kindFill   uint16 = 4
+	kindKernel   uint16 = 2
+	kindFill     uint16 = 3
+	kindCopyHtoD uint16 = 4
+	kindCopyDtoH uint16 = 5
+	kindCopyDtoD uint16 = 6
+	kindCopyHtoH uint16 = 7
+	kindDevice   uint16 = 8
 )
 
 // Fields of the payload, from enum otel_gpu_field in otel_gpu_v1_usdt.h.
@@ -28,6 +32,14 @@ const (
 	fieldRanges     protowire.Number = 3
 	fieldDurationNS protowire.Number = 4
 	fieldBytes      protowire.Number = 5
+	fieldRuntime    protowire.Number = 6
+	fieldGPUIndex   protowire.Number = 7
+)
+
+// Runtimes that report work, from enum otel_gpu_runtime in otel_gpu_v1_usdt.h.
+const (
+	runtimeCUDA uint64 = 1
+	runtimeROCm uint64 = 2
 )
 
 // eventHeaderSize is what support/ebpf/gpu.ebpf.c sends before the payload: the
@@ -47,6 +59,10 @@ type event struct {
 	ranges     string
 	durationNS uint64
 	bytes      uint64
+	runtime    uint64
+	// gpuIndex stands for the GPU's UUID that a DEVICE event of the process
+	// gave, 0 if none.
+	gpuIndex uint64
 }
 
 var errShortEvent = errors.New("event shorter than its header and payload")
@@ -100,17 +116,13 @@ func (ev *event) decodePayload(b []byte) error {
 			default:
 				ranges = append(ranges, string(value))
 			}
-		case typ == protowire.VarintType && (num == fieldDurationNS || num == fieldBytes):
+		case typ == protowire.VarintType && ev.numberField(num) != nil:
 			value, n := protowire.ConsumeVarint(b)
 			if n < 0 {
 				return protowire.ParseError(n)
 			}
 			b = b[n:]
-			if num == fieldDurationNS {
-				ev.durationNS = value
-			} else {
-				ev.bytes = value
-			}
+			*ev.numberField(num) = value
 		default:
 			n := protowire.ConsumeFieldValue(num, typ, b)
 			if n < 0 {
@@ -125,4 +137,20 @@ func (ev *event) decodePayload(b []byte) error {
 
 func isStringField(num protowire.Number) bool {
 	return num == fieldGPU || num == fieldName || num == fieldRanges
+}
+
+// numberField returns where the number field num goes, nil if it is not one.
+func (ev *event) numberField(num protowire.Number) *uint64 {
+	switch num {
+	case fieldDurationNS:
+		return &ev.durationNS
+	case fieldBytes:
+		return &ev.bytes
+	case fieldRuntime:
+		return &ev.runtime
+	case fieldGPUIndex:
+		return &ev.gpuIndex
+	default:
+		return nil
+	}
 }

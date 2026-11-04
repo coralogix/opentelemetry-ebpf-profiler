@@ -43,9 +43,10 @@ const (
 // unwound in eBPF. eBPF frame headers hold the frame type in 4 bits, so these
 // start above that range.
 const (
-	// GPU identifies work run on GPUs and other accelerators, such as kernels
-	// and memory operations, reported by GPU probes.
-	GPU InterpreterType = 0x10
+	// CUDA identifies GPU work reported through NVIDIA's CUDA runtime.
+	CUDA InterpreterType = 0x10
+	// ROCm identifies GPU work reported through AMD's ROCm runtime.
+	ROCm InterpreterType = 0x11
 )
 
 // Pseudo-interpreters without a corresponding frame type.
@@ -83,7 +84,8 @@ var interpreterTypeToString = map[InterpreterType]string{
 	ThreadContext: "thread-context",
 	LuaJIT:        "luajit",
 	Go:            "go",
-	GPU:           "gpu",
+	CUDA:          "cuda",
+	ROCm:          "rocm",
 }
 
 var stringToInterpreterType = make(map[string]InterpreterType, len(interpreterTypeToString))

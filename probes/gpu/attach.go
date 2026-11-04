@@ -6,12 +6,15 @@ package gpu // import "go.opentelemetry.io/ebpf-profiler/probes/gpu"
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/cilium/ebpf/link"
+	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -62,16 +65,23 @@ func (p *probe) Attach(pr process.Process, mapping *process.RawMapping, fileID l
 		p.addUser(pid, file)
 		return nil
 	}
+	if refusedAt, ok := p.refused[file]; ok && refusedAt == lastModified {
+		return nil
+	}
 
 	points := p.discover(elfRef, fileID, mapping.Path)
 	if len(points) == 0 {
 		return nil
 	}
-	users := 0
+	if err := checkPoints(points); err != nil {
+		p.refuseLocked(file, lastModified, mapping.Path, err)
+		return nil
+	}
+	users, pinned := 0, false
 	if attached {
 		// The file was rewritten in place: its uprobes point into the old code.
 		p.removeLocked(file, probes)
-		users = probes.users
+		users, pinned = probes.users, probes.pinned
 	}
 	// Uprobes still being removed would fire next to the new ones.
 	p.waitRemovedLocked(file)
@@ -79,10 +89,68 @@ func (p *probe) Attach(pr process.Process, mapping *process.RawMapping, fileID l
 	if err != nil {
 		return err
 	}
-	p.files[file] = &fileProbes{links: links, lastModified: lastModified, users: users}
+	p.files[file] = &fileProbes{links: links, lastModified: lastModified, users: users,
+		pinned: pinned}
 	p.addUser(pid, file)
 	log.Debugf("gpu: attached %d probes in %s", len(links), mapping.Path)
 	return nil
+}
+
+// attachPath attaches to the producer library at path, for every process that
+// will load it, and keeps its uprobes while the probe is loaded.
+func (p *probe) attachPath(path string) error {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	var st unix.Stat_t
+	if err = unix.Stat(path, &st); err != nil {
+		return err
+	}
+	file := util.OnDiskFileIdentifier{DeviceID: st.Dev, InodeNum: st.Ino}
+	fileID, err := libpf.FileIDFromExecutableFile(path)
+	if err != nil {
+		return err
+	}
+	ref := pfelf.NewReference(pfelf.FSPath(path), os.DirFS("/"))
+	defer ref.Close()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.unloaded {
+		return nil
+	}
+	if probes, ok := p.files[file]; ok {
+		probes.pinned = true
+		return nil
+	}
+	points := p.discover(ref, fileID, path)
+	if len(points) == 0 {
+		return errors.New("it has no otel_gpu_v1:event probe")
+	}
+	if err = checkPoints(points); err != nil {
+		return err
+	}
+	exe, err := link.OpenExecutable(path)
+	if err != nil {
+		return err
+	}
+	links, err := p.attachPoints(exe, points, path)
+	if err != nil {
+		return err
+	}
+	p.files[file] = &fileProbes{links: links, lastModified: st.Mtim.Nano(), pinned: true}
+	log.Infof("gpu: attached to producer %s", path)
+	return nil
+}
+
+// refuseLocked refuses a file whose probe breaks the contract, until it
+// changes, and logs why once. The caller must hold p.mu.
+func (p *probe) refuseLocked(file util.OnDiskFileIdentifier, lastModified int64, path string,
+	err error,
+) {
+	p.refused[file] = lastModified
+	log.Warnf("gpu: refusing %s: %v", path, err)
 }
 
 // addUser records that the process maps a file with uprobes. The caller must
@@ -113,7 +181,7 @@ func (p *probe) Detach(pid libpf.PID) {
 			continue
 		}
 		probes.users--
-		if probes.users > 0 {
+		if probes.users > 0 || probes.pinned {
 			continue
 		}
 		if probes.idle == nil {
@@ -135,7 +203,7 @@ func (p *probe) Detach(pid libpf.PID) {
 func (p *probe) removeUnused(file util.OnDiskFileIdentifier, probes *fileProbes) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.unloaded || p.files[file] != probes || probes.users > 0 {
+	if p.unloaded || p.files[file] != probes || probes.users > 0 || probes.pinned {
 		return
 	}
 	p.removeLocked(file, probes)
@@ -197,12 +265,6 @@ func (p *probe) discover(ref *pfelf.Reference, fileID libpf.FileID,
 func (p *probe) attachMapping(pr process.Process, mapping *process.RawMapping,
 	points []usdt.AttachmentPoint,
 ) ([]link.Link, error) {
-	for _, point := range points {
-		if err := checkArguments(point); err != nil {
-			return nil, err
-		}
-	}
-
 	f, err := pr.OpenMappingFile(mapping)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", mapping.Path, err)
@@ -248,6 +310,21 @@ func (p *probe) attachPoints(exe *link.Executable, points []usdt.AttachmentPoint
 		return nil, err
 	}
 	return links, nil
+}
+
+// checkPoints verifies that a file fires the probe from a single place, and
+// passes the event pointer where the eBPF program reads it.
+func checkPoints(points []usdt.AttachmentPoint) error {
+	if len(points) > 1 {
+		return fmt.Errorf("it fires otel_gpu_v1:event from %d places, the contract allows one",
+			len(points))
+	}
+	for _, point := range points {
+		if err := checkArguments(point); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // checkArguments verifies that a probe passes its event pointer where the eBPF

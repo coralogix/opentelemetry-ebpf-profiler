@@ -158,3 +158,28 @@ func TestAddUserRetiresReusedPID(t *testing.T) {
 	p.mu.Unlock()
 	assert.NotContains(t, p.matcher.exits, libpf.PID(10), "the exited process is retired at once")
 }
+
+func TestCheckPointsAllowsOneSite(t *testing.T) {
+	pinned := map[string]string{"amd64": "8@%rax", "arm64": "8@x0"}[runtime.GOARCH]
+	site := usdt.AttachmentPoint{Provider: usdtProvider, Name: usdtProbe, Arguments: pinned}
+	require.NoError(t, checkPoints([]usdt.AttachmentPoint{site}))
+	require.Error(t, checkPoints([]usdt.AttachmentPoint{site, site}),
+		"a library firing the probe from two places")
+}
+
+func TestPinnedFileProbesStay(t *testing.T) {
+	p := newAttachTestProbe(t)
+	file := util.OnDiskFileIdentifier{DeviceID: 1, InodeNum: 2}
+	var closed atomic.Int32
+	probes := addFile(p, file, &closed)
+	probes.pinned = true
+
+	p.mu.Lock()
+	p.addUser(10, file)
+	p.mu.Unlock()
+	p.Detach(10)
+	assert.Nil(t, probes.idle, "no removal scheduled for a configured producer")
+	p.removeUnused(file, probes)
+	assert.Same(t, probes, p.files[file])
+	assert.Zero(t, closed.Load())
+}

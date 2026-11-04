@@ -237,7 +237,9 @@ static uint32_t call_weight(uint32_t corr, uint64_t start, const char **nvtx)
 
 /* ─── Call sampling ──────────────────────────────────────────────────────────
  * Kernel launches, graph launches and memory operations are sampled apart, so
- * a rare class keeps its samples next to a frequent one. */
+ * a rare class keeps its samples next to a frequent one. Each class is sampled
+ * for the whole process, so that a process with many threads is not reported
+ * more often than one with a single thread. */
 enum call_class {
   CALL_UNTRACKED,
   CALL_KERNEL,
@@ -246,15 +248,21 @@ enum call_class {
   CALL_CLASSES,
 };
 
-/* Default sampled calls per thread per second. Graph launches are sampled
+/* Default sampled calls per process per second. Graph launches are sampled
  * less, as each runs many kernels. */
 #define DEFAULT_SAMPLE_RATE       200
 #define DEFAULT_GRAPH_SAMPLE_RATE 20
 
-/* Sampled calls per thread per second, by class; 0 samples all of them. */
+/* Sampled calls per process per second, by class; 0 samples all of them. */
 static uint32_t g_sample_rate[CALL_CLASSES];
 
-static __thread struct otel_sampler t_samplers[CALL_CLASSES];
+static struct otel_sampler g_samplers[CALL_CLASSES];
+static pthread_mutex_t g_sampler_mu[CALL_CLASSES] = {
+  PTHREAD_MUTEX_INITIALIZER,
+  PTHREAD_MUTEX_INITIALIZER,
+  PTHREAD_MUTEX_INITIALIZER,
+  PTHREAD_MUTEX_INITIALIZER,
+};
 static __thread uint64_t t_rng;
 
 static uint64_t now_ns(void)
@@ -266,11 +274,17 @@ static uint64_t now_ns(void)
 
 static uint32_t sample_call(enum call_class cls)
 {
+  if (g_sample_rate[cls] == 0) {
+    return 1;
+  }
   const uint64_t now = now_ns();
   if (t_rng == 0) {
     t_rng = (now ^ (uint64_t)(uintptr_t)&t_rng) | 1;
   }
-  return otel_sampler_weight(&t_samplers[cls], g_sample_rate[cls], now, &t_rng);
+  pthread_mutex_lock(&g_sampler_mu[cls]);
+  const uint32_t weight = otel_sampler_weight(&g_samplers[cls], g_sample_rate[cls], now, &t_rng);
+  pthread_mutex_unlock(&g_sampler_mu[cls]);
+  return weight;
 }
 
 /* Reads a sampling rate from the environment; fallback if unset or invalid. */
@@ -428,7 +442,7 @@ static void CUPTIAPI buffer_requested(uint8_t **buffer, size_t *size, size_t *ma
 
 /* emit_event is the only place firing the probe, so the profiler attaches one
  * uprobe to the library. */
-__attribute__((noinline)) static void emit_event(const struct otel_gpu_event *ev)
+OTEL_GPU_EMITTER static void emit_event(const struct otel_gpu_event *ev)
 {
   OTEL_GPU_EVENT(ev);
 }
@@ -442,10 +456,42 @@ begin_event(struct otel_gpu_event *ev, enum otel_gpu_kind kind, uint32_t corr, u
   ev->payload_size   = 0;
 }
 
+/* ─── GPU indexes ────────────────────────────────────────────────────────────
+ * Events of work name their GPU by an index, its ordinal plus one; a DEVICE
+ * event tells the profiler which UUID an index stands for. It is sent before
+ * the first work on a GPU in each epoch: a new epoch starts when tracing does,
+ * as the profiler may be a new one, and every GPU_RESEND_PERIOD_MS, in case a
+ * DEVICE event was lost. */
+#define GPU_RESEND_PERIOD_MS 10000
+
+static uint32_t g_gpu_epoch;
+static uint32_t g_gpu_sent_epoch[MAX_GPUS];
+
+/* Returns the index of GPU dev, 0 if its UUID is unknown, telling the profiler
+ * its UUID first if needed. */
+static uint32_t gpu_index(uint32_t dev)
+{
+  const char *uuid = gpu_uuid(dev);
+  if (!uuid) {
+    return 0;
+  }
+  const uint32_t epoch = __atomic_load_n(&g_gpu_epoch, __ATOMIC_ACQUIRE);
+  if (__atomic_load_n(&g_gpu_sent_epoch[dev], __ATOMIC_ACQUIRE) != epoch) {
+    struct otel_gpu_event ev;
+    begin_event(&ev, OTEL_GPU_DEVICE, 0, 0);
+    otel_gpu_put_string(&ev, OTEL_GPU_FIELD_GPU, uuid);
+    otel_gpu_put_uint(&ev, OTEL_GPU_FIELD_GPU_INDEX, dev + 1);
+    emit_event(&ev);
+    // Marked once sent: no other thread may report work on the GPU before it.
+    __atomic_store_n(&g_gpu_sent_epoch[dev], epoch, __ATOMIC_RELEASE);
+  }
+  return dev + 1;
+}
+
 /* put_work adds the fields of an event of GPU work: the GPU, how long it took,
- * how many bytes it moved, its name, and the names of the work in progress at
- * its call, innermost first. Names come last: one too long for the payload is
- * cut short, and must not crowd out the others. */
+ * how many bytes it moved and the runtime, then the names of the work in
+ * progress at its call, innermost first, as long as they fit whole, and last
+ * its name, cut short if needed. */
 static void put_work(
   struct otel_gpu_event *ev,
   uint32_t device,
@@ -455,16 +501,19 @@ static void put_work(
   const char *name,
   const char *nvtx)
 {
-  otel_gpu_put_string(ev, OTEL_GPU_FIELD_GPU, gpu_uuid(device));
+  otel_gpu_put_uint(ev, OTEL_GPU_FIELD_GPU_INDEX, gpu_index(device));
   otel_gpu_put_uint(ev, OTEL_GPU_FIELD_DURATION_NS, end > start ? end - start : 0);
   otel_gpu_put_uint(ev, OTEL_GPU_FIELD_BYTES, bytes);
-  otel_gpu_put_string(ev, OTEL_GPU_FIELD_NAME, name);
+  otel_gpu_put_uint(ev, OTEL_GPU_FIELD_RUNTIME, OTEL_GPU_RUNTIME_CUDA);
   for (const char *range = nvtx; range && *range;) {
     const char *sep  = strchr(range, NVTX_SEP);
     const size_t len = sep ? (size_t)(sep - range) : strlen(range);
-    otel_gpu_put_bytes(ev, OTEL_GPU_FIELD_RANGES, range, len);
+    if (!otel_gpu_put_whole_bytes(ev, OTEL_GPU_FIELD_RANGES, range, len)) {
+      break;
+    }
     range = sep ? sep + 1 : NULL;
   }
+  otel_gpu_put_string(ev, OTEL_GPU_FIELD_NAME, name);
   if (g_debug_totals) {
     count_payload(ev);
   }
@@ -484,17 +533,18 @@ static void report_kernel(const otelcupti_kernel_activity_t *k)
   emit_event(&ev);
 }
 
-/* Names of CUpti_ActivityMemcpyKind values: where the data went. */
-static const char *const g_copy_kinds[] = {
-  [CUPTI_ACTIVITY_MEMCPY_KIND_HTOD] = "HtoD",
-  [CUPTI_ACTIVITY_MEMCPY_KIND_DTOH] = "DtoH",
-  [CUPTI_ACTIVITY_MEMCPY_KIND_HTOA] = "HtoA",
-  [CUPTI_ACTIVITY_MEMCPY_KIND_ATOH] = "AtoH",
-  [CUPTI_ACTIVITY_MEMCPY_KIND_ATOA] = "AtoA",
-  [CUPTI_ACTIVITY_MEMCPY_KIND_ATOD] = "AtoD",
-  [CUPTI_ACTIVITY_MEMCPY_KIND_DTOA] = "DtoA",
-  [CUPTI_ACTIVITY_MEMCPY_KIND_DTOD] = "DtoD",
-  [CUPTI_ACTIVITY_MEMCPY_KIND_HTOH] = "HtoH",
+/* Kinds of events of CUpti_ActivityMemcpyKind values, 0 for those not
+ * reported. CUDA arrays are the GPU's memory. */
+static const uint16_t g_copy_kinds[] = {
+  [CUPTI_ACTIVITY_MEMCPY_KIND_HTOD] = OTEL_GPU_COPY_HTOD,
+  [CUPTI_ACTIVITY_MEMCPY_KIND_DTOH] = OTEL_GPU_COPY_DTOH,
+  [CUPTI_ACTIVITY_MEMCPY_KIND_HTOA] = OTEL_GPU_COPY_HTOD,
+  [CUPTI_ACTIVITY_MEMCPY_KIND_ATOH] = OTEL_GPU_COPY_DTOH,
+  [CUPTI_ACTIVITY_MEMCPY_KIND_ATOA] = OTEL_GPU_COPY_DTOD,
+  [CUPTI_ACTIVITY_MEMCPY_KIND_ATOD] = OTEL_GPU_COPY_DTOD,
+  [CUPTI_ACTIVITY_MEMCPY_KIND_DTOA] = OTEL_GPU_COPY_DTOD,
+  [CUPTI_ACTIVITY_MEMCPY_KIND_DTOD] = OTEL_GPU_COPY_DTOD,
+  [CUPTI_ACTIVITY_MEMCPY_KIND_HTOH] = OTEL_GPU_COPY_HTOH,
 };
 
 static void report_memcpy(const CUpti_ActivityMemcpy *m)
@@ -505,11 +555,14 @@ static void report_memcpy(const CUpti_ActivityMemcpy *m)
   if (weight == 0) {
     return;
   }
-  const char *name =
-    m->copyKind < sizeof(g_copy_kinds) / sizeof(g_copy_kinds[0]) ? g_copy_kinds[m->copyKind] : NULL;
+  const uint16_t kind =
+    m->copyKind < sizeof(g_copy_kinds) / sizeof(g_copy_kinds[0]) ? g_copy_kinds[m->copyKind] : 0;
+  if (kind == 0) {
+    return;
+  }
   struct otel_gpu_event ev;
-  begin_event(&ev, OTEL_GPU_COPY, m->correlationId, weight);
-  put_work(&ev, m->deviceId, m->start, m->end, m->bytes, name, nvtx);
+  begin_event(&ev, (enum otel_gpu_kind)kind, m->correlationId, weight);
+  put_work(&ev, m->deviceId, m->start, m->end, m->bytes, NULL, nvtx);
   emit_event(&ev);
 }
 
@@ -698,6 +751,7 @@ static void start_tracing(void)
   uint64_t since = 0;
   cuptiGetTimestamp(&since);
   __atomic_store_n(&g_tracing_since, since, __ATOMIC_RELEASE);
+  __atomic_add_fetch(&g_gpu_epoch, 1, __ATOMIC_ACQ_REL);
   for (size_t i = 0; i < NUM_ACTIVITY_KINDS; i++) {
     CUptiResult r = cuptiActivityEnable(g_activity_kinds[i]);
     if (r != CUPTI_SUCCESS) {
@@ -762,6 +816,9 @@ static void *tracing_worker(void *arg)
     if (__atomic_load_n(&g_tracing, __ATOMIC_ACQUIRE)) {
       // CUPTI hands over a buffer of records only once it is full, unless asked.
       cuptiActivityFlushAll(0);
+      if (round % (GPU_RESEND_PERIOD_MS / FLUSH_PERIOD_MS) == 0) {
+        __atomic_add_fetch(&g_gpu_epoch, 1, __ATOMIC_ACQ_REL);
+      }
       if (g_debug_totals && round % (DEBUG_TOTALS_PERIOD_MS / FLUSH_PERIOD_MS) == 0) {
         print_totals(0);
       }
@@ -834,9 +891,15 @@ static void fork_prepare(void)
   pthread_mutex_lock(&g_tracing_mu);
   pthread_mutex_lock(&g_nvtx_pool_mu);
   pthread_mutex_lock(&g_gpu_mu);
+  for (size_t i = 0; i < CALL_CLASSES; i++) {
+    pthread_mutex_lock(&g_sampler_mu[i]);
+  }
 }
 static void fork_parent(void)
 {
+  for (size_t i = CALL_CLASSES; i > 0; i--) {
+    pthread_mutex_unlock(&g_sampler_mu[i - 1]);
+  }
   pthread_mutex_unlock(&g_gpu_mu);
   pthread_mutex_unlock(&g_nvtx_pool_mu);
   pthread_mutex_unlock(&g_tracing_mu);

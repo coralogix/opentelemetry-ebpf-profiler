@@ -7,6 +7,7 @@ import (
 	"math"
 	"slices"
 
+	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
 
@@ -28,6 +29,45 @@ func gpuProfileType(sampleType, unit string) *samples.TypeMetadata {
 
 // unknownKernel names kernels without a name.
 const unknownKernel = "[unknown kernel]"
+
+// copyLeaves names copies by their kind.
+var copyLeaves = map[uint16]string{
+	kindCopyHtoD: "memcpy:HtoD",
+	kindCopyDtoH: "memcpy:DtoH",
+	kindCopyDtoD: "memcpy:DtoD",
+	kindCopyHtoH: "memcpy:HtoH",
+}
+
+// frameType returns the frame type of the frames added for work that runtime
+// reported.
+func frameType(runtime uint64) libpf.FrameType {
+	switch runtime {
+	case runtimeCUDA:
+		return libpf.CUDAFrame
+	case runtimeROCm:
+		return libpf.ROCmFrame
+	default:
+		return libpf.UnknownFrame
+	}
+}
+
+// saturatingAdd returns a + b, or math.MaxInt64 if it does not fit. Both are
+// not negative.
+func saturatingAdd(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+// saturatingMul returns a * b, or math.MaxInt64 if it does not fit. Both are
+// not negative.
+func saturatingMul(a, b int64) int64 {
+	if b != 0 && a > math.MaxInt64/b {
+		return math.MaxInt64
+	}
+	return a * b
+}
 
 // int64Value converts a payload number, which the producer controls, to a
 // profile value; values out of range count as 0.
@@ -56,7 +96,7 @@ func (w *gpuWork) merge(other gpuWork) {
 			w.values = append(w.values, ov)
 			continue
 		}
-		w.values[i].value += ov.value
+		w.values[i].value = saturatingAdd(w.values[i].value, ov.value)
 	}
 }
 
@@ -64,20 +104,25 @@ func (w *gpuWork) merge(other gpuWork) {
 // number of calls it stands for. A weight of 0 counts as 1.
 func (w gpuWork) scaled() gpuWork {
 	for i := range w.values {
-		w.values[i].value *= int64(max(w.sampleWeight, 1))
+		w.values[i].value = saturatingMul(w.values[i].value, int64(max(w.sampleWeight, 1)))
 	}
 	return w
 }
 
-// eventWork translates an event into GPU work; ok is false for kinds the probe
-// does not know. Kernel names must already be demangled.
+// eventWork translates an event into GPU work; ok is false for kinds that are
+// not work, or that the probe does not know. Kernel names must already be
+// demangled.
 func eventWork(ev event) (work gpuWork, ok bool) {
 	work = gpuWork{
 		pid:           ev.pid,
-		correlationID: uint32(ev.correlationID),
+		correlationID: ev.correlationID,
 		sampleWeight:  ev.sampleWeight,
+		frameType:     frameType(ev.runtime),
 		ranges:        ev.ranges,
 		gpu:           ev.gpu,
+	}
+	if ev.gpu == "" && ev.gpuIndex <= math.MaxUint32 {
+		work.gpuIndex = uint32(ev.gpuIndex)
 	}
 	switch ev.kind {
 	case kindKernel:
@@ -86,16 +131,14 @@ func eventWork(ev event) (work gpuWork, ok bool) {
 			work.leaf = unknownKernel
 		}
 		return work.withValue(kernelTimeProfileType, int64Value(ev.durationNS)), true
-	case kindCopy:
-		direction := ev.name
-		if direction == "" {
-			direction = "unknown"
-		}
-		work.leaf = "memcpy:" + direction
 	case kindFill:
 		work.leaf = "memset"
 	default:
-		return gpuWork{}, false
+		leaf, isCopy := copyLeaves[ev.kind]
+		if !isCopy {
+			return gpuWork{}, false
+		}
+		work.leaf = leaf
 	}
 	return work.withValue(memTimeProfileType, int64Value(ev.durationNS)).
 		withValue(memBytesProfileType, int64Value(ev.bytes)), true

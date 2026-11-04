@@ -16,6 +16,8 @@
 //
 //	extensions:
 //	  gpu:
+//	    # Optional: producer libraries to attach to at start.
+//	    producer_paths: [/opt/otelgpu/libotelcupti.so]
 //
 //	service:
 //	  extensions: [gpu]
@@ -25,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -41,7 +44,12 @@ import (
 )
 
 // Config is the configuration of the gpu probe, which has no options yet.
-type Config struct{}
+type Config struct {
+	// ProducerPaths are producer libraries to attach to at start, so that every
+	// process loading one is covered from its first GPU call, rather than from
+	// when the profiler scans its mappings.
+	ProducerPaths []string `mapstructure:"producer_paths"`
+}
 
 // launchProfileType counts GPU calls per host stack, each as often as its
 // sample weight.
@@ -93,7 +101,7 @@ type probe struct {
 	// sets it for PostHandleTrace, both called from the trace handling loop.
 	launch struct {
 		pid           libpf.PID
-		correlationID uint32
+		correlationID uint64
 	}
 
 	matcher *matcher
@@ -115,6 +123,9 @@ type probe struct {
 	users map[libpf.PID]libpf.Set[util.OnDiskFileIdentifier]
 	// removing is closed for each file once the uprobes it had are removed.
 	removing map[util.OnDiskFileIdentifier]chan struct{}
+	// refused holds the modification time of each file whose probe breaks the
+	// contract, so that it is refused and logged once.
+	refused map[util.OnDiskFileIdentifier]int64
 	// detaching tracks the uprobes still being removed.
 	detaching sync.WaitGroup
 }
@@ -126,6 +137,9 @@ type fileProbes struct {
 	// placed in.
 	lastModified int64
 	users        int
+	// pinned uprobes, of a producer path of the configuration, stay while the
+	// probe is loaded.
+	pinned bool
 	// idle removes the uprobes once no process has mapped the file for a while.
 	idle *time.Timer
 }
@@ -147,6 +161,7 @@ func New(config Config) (tracer.Probe, error) {
 		files:      make(map[util.OnDiskFileIdentifier]*fileProbes),
 		users:      make(map[libpf.PID]libpf.Set[util.OnDiskFileIdentifier]),
 		removing:   make(map[util.OnDiskFileIdentifier]chan struct{}),
+		refused:    make(map[util.OnDiskFileIdentifier]int64),
 	}, nil
 }
 
@@ -207,6 +222,11 @@ func (p *probe) Load(_ context.Context, reg tracer.ProbeRegistrar, probeCtx *tra
 		p.closeMaps()
 		return fmt.Errorf("registering process attacher: %w", err)
 	}
+	for _, path := range p.config.ProducerPaths {
+		if err := p.attachPath(path); err != nil {
+			log.Warnf("gpu: not attaching to producer %s: %v", path, err)
+		}
+	}
 	return nil
 }
 
@@ -264,11 +284,18 @@ func (p *probe) handleEvent(b []byte) {
 		}
 		return
 	}
+	now := time.Now()
+	if ev.kind == kindDevice {
+		if ev.gpu != "" && ev.gpuIndex != 0 && ev.gpuIndex <= math.MaxUint32 {
+			p.matcher.setGPU(ev.pid, uint32(ev.gpuIndex), ev.gpu, now)
+		}
+		return
+	}
 	if ev.kind == kindKernel && ev.name != "" {
 		ev.name = p.names.demangle(ev.name)
 	}
 	if work, ok := eventWork(ev); ok {
-		p.matcher.addWork(work, time.Now())
+		p.matcher.addWork(work, now)
 	}
 }
 
@@ -285,14 +312,13 @@ func (p *probe) PreOrigins() []uint16 {
 }
 
 // PreHandleTrace implements tracer.PreTraceHandler. It keeps the launch's
-// correlation id, of which the profiler matches the low half, for
-// PostHandleTrace.
+// correlation id for PostHandleTrace.
 func (p *probe) PreHandleTrace(trace *libpf.EbpfTrace) bool {
 	if len(trace.ContextValues) < launchContextValues {
 		return false
 	}
 	p.launch.pid = trace.PID
-	p.launch.correlationID = uint32(trace.ContextValues[launchCorrelationID])
+	p.launch.correlationID = trace.ContextValues[launchCorrelationID]
 	return true
 }
 

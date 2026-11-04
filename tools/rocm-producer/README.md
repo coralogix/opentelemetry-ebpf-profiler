@@ -45,5 +45,6 @@ in the CUDA producer.
 - No `FILL` events: rocprofiler-sdk reports memory fills as the kernels that do
   them.
 - GPUs are named by their UUID alone, without the `GPU-` prefix of NVIDIA's.
-- Copies between GPUs are reported, as `DtoD`.
+- Copies between GPUs are reported, as copies from the GPU's memory to the
+  GPU's.
 - Only ranges pushed with `roctxRangePushA` are named.

@@ -10,7 +10,10 @@
 // totals it prints as "expect <profile type> <leaf> <value>", and the kernel
 // with the long name, whose leaf it prints as "expect long-name <prefix>".
 //
-// Build: nvcc -O2 -o kinds_app kinds_app.cu -lcuda
+// It also launches kernels from the GPU, which no host call starts, and
+// prints their name as "expect device-launch <leaf>".
+//
+// Build: nvcc -O2 -rdc=true -o kinds_app kinds_app.cu -lcuda -lcudadevrt
 // Usage: kinds_app <seconds to wait for the profiler> [devices]
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +37,8 @@ constexpr size_t kArrayBytes    = kArrayWidth * kArrayHeight * sizeof(float);
 constexpr size_t kLineWidth     = 65536;
 constexpr size_t kLineBytes     = kLineWidth * sizeof(float);
 constexpr int    kLongNames     = 10;
+constexpr int    kParents       = 10;
+constexpr int    kChildren      = 20;
 
 static void check(cudaError_t err, const char *what)
 {
@@ -80,6 +85,23 @@ template <typename T> __global__ void long_name(float *x)
 }
 using LongType = std::make_integer_sequence<int, 1000>;
 
+__global__ void child(float *x)
+{
+  if (threadIdx.x == 0) {
+    x[0] += 1.0f;
+  }
+}
+
+// parent launches child kernels from the GPU.
+__global__ void parent(float *x, int children)
+{
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    for (int i = 0; i < children; i++) {
+      child<<<1, 32>>>(x);
+    }
+  }
+}
+
 static void run_device(int device)
 {
   const size_t n = kBytes / sizeof(float);
@@ -117,6 +139,9 @@ static void run_device(int device)
 
   for (int k = 0; k < kLongNames; k++) {
     long_name<LongType><<<1, 32>>>(a);
+  }
+  for (int k = 0; k < kParents; k++) {
+    parent<<<1, 1>>>(a, kChildren);
   }
 
   for (int k = 0; k < kKernels; k++) {
@@ -171,15 +196,15 @@ int main(int argc, char **argv)
   }
 
   const long long repeated = (long long)kRepeats * kBytes * devices;
-  printf("expect gpu_mem_bytes memcpy:HtoD %lld\n", repeated);
-  printf("expect gpu_mem_bytes memcpy:DtoH %lld\n", repeated);
+  // Copies to and from arrays, through the runtime and through the driver,
+  // count as copies to and from the GPU's memory.
+  const long long arrays = (long long)kRepeats * (kArrayBytes + kLineBytes) * devices;
+  printf("expect gpu_mem_bytes memcpy:HtoD %lld\n", repeated + arrays);
+  printf("expect gpu_mem_bytes memcpy:DtoH %lld\n", repeated + arrays);
   printf("expect gpu_mem_bytes memcpy:DtoD %lld\n", repeated);
   printf("expect gpu_mem_bytes memset %lld\n", repeated);
-  // Copies to and from arrays run through the runtime and through the driver.
-  const long long arrays = (long long)kRepeats * (kArrayBytes + kLineBytes) * devices;
-  printf("expect gpu_mem_bytes memcpy:HtoA %lld\n", arrays);
-  printf("expect gpu_mem_bytes memcpy:AtoH %lld\n", arrays);
   printf("expect kernels spin %d\n", (kKernels + kGraphKernels * kGraphLaunches) * devices);
   printf("expect long-name _Z9long_nameISt16integer_sequenceIiJLi0ELi1ELi2E\n");
+  printf("expect device-launch child\n");
   return 0;
 }

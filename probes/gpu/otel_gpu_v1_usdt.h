@@ -12,7 +12,9 @@
 // register, rax on x86-64 and x0 on arm64, so the profiler never has to work
 // out where a compiler put it; it refuses probes that pass it any other way.
 // Each place that fires the probe is one more uprobe for the profiler to
-// attach, so a producer fires it from one function. A change to the header of
+// attach, so a producer fires it from one function marked OTEL_GPU_EMITTER,
+// which the compiler can neither inline nor copy; the profiler refuses a
+// library that fires it from more than one place. A change to the header of
 // an event, or to what a kind or a field means, needs a new provider,
 // otel_gpu_v2.
 //
@@ -22,14 +24,23 @@
 //
 //   message Payload {
 //     string gpu = 1;              // the UUID of the GPU that did the work
-//     string name = 2;             // what the work was, by kind as below
+//     string name = 2;             // the kernel's name, for KERNEL events
 //     repeated string ranges = 3;  // names of the work in progress, innermost first
 //     uint64 duration_ns = 4;      // how long the GPU worked
 //     uint64 bytes = 5;            // how many bytes were copied or filled
+//     uint64 runtime = 6;          // the runtime that reported the work
+//     uint64 gpu_index = 7;        // the GPU's index, from a DEVICE event
 //   }
 //
-// which otel_gpu_put_string, otel_gpu_put_bytes and otel_gpu_put_uint write.
-// The profiler skips fields it does not know, so new ones need no new provider.
+// which otel_gpu_put_string, otel_gpu_put_bytes, otel_gpu_put_whole_bytes and
+// otel_gpu_put_uint write. A payload holds at most OTEL_GPU_PAYLOAD_MAX bytes:
+// a producer writes the fields of fixed size first, leaves out ranges that do
+// not fit whole, and writes the kernel name last, cut short if needed. The
+// profiler skips fields it does not know, so new ones need no new provider.
+//
+// Work that no host call started, such as kernels launched by other kernels,
+// is sent with correlation_id 0: the profiler counts it for the process,
+// without a stack.
 //
 // To keep its cost low, the producer may report only some of the
 // application's GPU calls. It then sends a LAUNCH event only for the calls it
@@ -68,6 +79,14 @@ __attribute__((
   #error "otel_gpu_v1 USDT probes support x86-64 and arm64 only"
 #endif
 
+// OTEL_GPU_EMITTER marks the one function that fires the probe: the compiler
+// must neither inline it nor copy it, as each copy is one more probe site.
+#if defined(__clang__)
+  #define OTEL_GPU_EMITTER __attribute__((noinline))
+#else
+  #define OTEL_GPU_EMITTER __attribute__((noipa))
+#endif
+
 // OTEL_GPU_EVENT fires the probe with the event `ev`.
 #define OTEL_GPU_EVENT(ev)                                                                         \
   do {                                                                                             \
@@ -77,19 +96,32 @@ __attribute__((
 
 // What happened. The profiler ignores events of kinds it does not know.
 enum otel_gpu_kind {
-  // The application asked the GPU to do something, such as running a kernel or
-  // copying memory. Sent on the application's own thread: the profiler records
-  // the thread's stack, so it can later show which code caused the work. Has
-  // no payload.
-  OTEL_GPU_LAUNCH = 1,
+  // The application asked the GPU to do something. Sent on the application's
+  // own thread: the profiler records the thread's stack, so it can later show
+  // which code caused the work. Has no payload.
+  OTEL_GPU_LAUNCH    = 1,
   // The GPU ran a kernel, a function that runs on the GPU. Its name is the
   // kernel's name, as the compiler wrote it.
-  OTEL_GPU_KERNEL = 2,
-  // The GPU copied memory. Its name says where the data went, such as "HtoD":
-  // H is the CPU's memory, D the GPU's and P another GPU's.
-  OTEL_GPU_COPY   = 3,
-  // The GPU filled memory with a value. It has no name.
-  OTEL_GPU_FILL   = 4,
+  OTEL_GPU_KERNEL    = 2,
+  // The GPU filled memory with a value.
+  OTEL_GPU_FILL      = 3,
+  // The GPU copied memory, from the CPU's memory (H, host) or the GPU's (D,
+  // device) to either. Copies from or to CUDA arrays count as the GPU's.
+  OTEL_GPU_COPY_HTOD = 4,
+  OTEL_GPU_COPY_DTOH = 5,
+  OTEL_GPU_COPY_DTOD = 6,
+  OTEL_GPU_COPY_HTOH = 7,
+  // A GPU of the process: its gpu field is the UUID that the gpu_index field
+  // stands for in the events of the process's work. The producer sends it
+  // before the first work on that GPU since tracing started, and again from
+  // time to time, in case it was lost.
+  OTEL_GPU_DEVICE    = 8,
+};
+
+// The runtime that reported the work.
+enum otel_gpu_runtime {
+  OTEL_GPU_RUNTIME_CUDA = 1,
+  OTEL_GPU_RUNTIME_ROCM = 2,
 };
 
 // The fields of a payload.
@@ -99,6 +131,8 @@ enum otel_gpu_field {
   OTEL_GPU_FIELD_RANGES      = 3,
   OTEL_GPU_FIELD_DURATION_NS = 4,
   OTEL_GPU_FIELD_BYTES       = 5,
+  OTEL_GPU_FIELD_RUNTIME     = 6,
+  OTEL_GPU_FIELD_GPU_INDEX   = 7,
 };
 
 // The largest payload the profiler accepts; it drops events with a larger one.
@@ -166,6 +200,21 @@ static inline void otel_gpu_put_bytes(
   n += otel_gpu_varint_(p + n, len);
   memcpy(p + n, data, len);
   ev->payload_size += (uint16_t)(n + len);
+}
+
+// otel_gpu_put_whole_bytes appends a string field of len bytes to the payload
+// only if it fits whole, and reports whether it did. Empty strings are left
+// out.
+static inline int otel_gpu_put_whole_bytes(
+  struct otel_gpu_event *ev, enum otel_gpu_field field, const char *data, size_t len)
+{
+  // A key and a length of at most OTEL_GPU_PAYLOAD_MAX take up to 3 bytes.
+  enum { prefix_max = 3 };
+  if (len == 0 || ev->payload_size + prefix_max + len > OTEL_GPU_PAYLOAD_MAX) {
+    return 0;
+  }
+  otel_gpu_put_bytes(ev, field, data, len);
+  return 1;
 }
 
 // otel_gpu_put_string appends a string field to the payload, cut short if it

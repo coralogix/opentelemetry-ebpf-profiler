@@ -26,32 +26,50 @@ const (
 	processCapacity = 1 << 12
 	// pendingCapacity bounds the distinct GPU work waiting for its launch.
 	pendingCapacity = 1 << 16
-	// gpuUUIDKey is the sample attribute naming the GPU that did the work.
-	gpuUUIDKey = attribute.Key("gpu.uuid")
+	// unresolvedCapacity bounds the GPU work waiting for the UUID of its GPU.
+	unresolvedCapacity = 1 << 16
+	// gpuCapacity bounds the GPU indexes kept, of all processes.
+	gpuCapacity = 1 << 14
+	// samplesPerProcess bounds the samples of a process in each report.
+	samplesPerProcess = 1 << 12
+	// otherWork names the sample that work beyond samplesPerProcess goes to.
+	otherWork = "[other GPU work]"
+	// hwIDKey and hwTypeKey identify the GPU that did the work, as the
+	// hw.gpu.* metrics do.
+	hwIDKey   = attribute.Key("hw.id")
+	hwTypeKey = attribute.Key("hw.type")
 	// matchGrace is how long a GPU record waits for its launch stack, which
 	// takes the slower path through the trace pipeline.
 	matchGrace = 2 * time.Second
 	// exitGrace is how long the state of an exited process is kept, for its
 	// records and launch stacks still in flight.
 	exitGrace = 5 * time.Second
+	// gpuGrace is how long GPU work waits for the UUID of its GPU's index, which
+	// producers send again at least every 10 seconds.
+	gpuGrace = 12 * time.Second
 )
 
 // gpuWork is GPU activity to attribute to the host stack of its launch.
 type gpuWork struct {
 	pid libpf.PID
-	// correlationID is the low half of the call's correlation id, all that the
-	// launch trace has room for.
-	correlationID uint32
+	// correlationID is the id of the call, 0 for work that no call started.
+	correlationID uint64
 	// sampleWeight is the number of calls the work's call stands for.
 	sampleWeight uint32
+	// frameType is the type of the frames added for the work, from the
+	// runtime that reported it.
+	frameType libpf.FrameType
 	// leaf names the work in the leaf frame, e.g. the kernel name.
 	leaf string
 	// ranges is the stack of annotation ranges active at the call, such as
 	// NVTX ranges, or empty.
 	ranges string
 	// gpu is the UUID of the GPU that did the work, or empty.
-	gpu    string
-	values []profileValue
+	gpu string
+	// gpuIndex is the index the process names the GPU by, until the matcher
+	// resolves it to gpu.
+	gpuIndex uint32
+	values   []profileValue
 }
 
 // profileValue is what gpuWork adds to a profile.
@@ -74,11 +92,22 @@ func (k processKey) hash32() uint32 {
 // launchKey identifies the GPU call that issued some GPU work.
 type launchKey struct {
 	processKey
-	correlationID uint32
+	correlationID uint64
 }
 
 func (k launchKey) hash32() uint32 {
-	return k.processKey.hash32() ^ k.correlationID*0x85ebca6b
+	return k.processKey.hash32() ^ uint32(k.correlationID)*0x85ebca6b ^
+		uint32(k.correlationID>>32)*0x27d4eb2f
+}
+
+// gpuKey identifies the GPU that a process names by an index.
+type gpuKey struct {
+	processKey
+	index uint32
+}
+
+func (k gpuKey) hash32() uint32 {
+	return k.processKey.hash32() ^ k.index*0x85ebca6b
 }
 
 // bucketKey identifies one exported sample: GPU work of a process, below one
@@ -87,10 +116,11 @@ type bucketKey struct {
 	profileType *samples.TypeMetadata
 	pid         libpf.PID
 	// stack is the hash of the host stack, zero if the launch was not captured.
-	stack  libpf.TraceHash
-	leaf   string
-	ranges string
-	gpu    string
+	stack     libpf.TraceHash
+	frameType libpf.FrameType
+	leaf      string
+	ranges    string
+	gpu       string
 }
 
 type bucket struct {
@@ -106,9 +136,10 @@ type bucket struct {
 // for the launch stack: a CUDA graph launch runs hundreds of kernels, mostly
 // repeating a few.
 type workKey struct {
-	leaf   string
-	ranges string
-	gpu    string
+	frameType libpf.FrameType
+	leaf      string
+	ranges    string
+	gpu       string
 }
 
 // pendingWork is GPU work whose launch stack has not arrived yet.
@@ -143,9 +174,16 @@ type matcher struct {
 	// samples reported after the process exited.
 	metas        *lru.LRU[processKey, *samples.ProcessMeta]
 	retiredMetas *lru.LRU[libpf.PID, *samples.ProcessMeta]
-	pending      map[launchKey]map[workKey]*pendingWork
-	numPending   int
-	buckets      map[bucketKey]*bucket
+	// gpus holds the UUIDs of the GPUs that processes name by an index, and
+	// unresolved the work naming an index whose UUID has not arrived yet.
+	gpus          *lru.LRU[gpuKey, string]
+	unresolved    map[gpuKey][]pendingWork
+	numUnresolved int
+	pending       map[launchKey]map[workKey]*pendingWork
+	numPending    int
+	buckets       map[bucketKey]*bucket
+	// samples counts the buckets of each process since the previous report.
+	samples map[libpf.PID]int
 }
 
 func newMatcher(processMeta func(libpf.PID) samples.ProcessMeta) (*matcher, error) {
@@ -169,6 +207,10 @@ func newMatcher(processMeta func(libpf.PID) samples.ProcessMeta) (*matcher, erro
 	if err != nil {
 		return nil, err
 	}
+	gpus, err := lru.New[gpuKey, string](gpuCapacity, gpuKey.hash32)
+	if err != nil {
+		return nil, err
+	}
 	return &matcher{
 		processMeta:  processMeta,
 		generations:  generations,
@@ -177,8 +219,11 @@ func newMatcher(processMeta func(libpf.PID) samples.ProcessMeta) (*matcher, erro
 		stacks:       stacks,
 		metas:        metas,
 		retiredMetas: retiredMetas,
+		gpus:         gpus,
+		unresolved:   make(map[gpuKey][]pendingWork),
 		pending:      make(map[launchKey]map[workKey]*pendingWork),
 		buckets:      make(map[bucketKey]*bucket),
+		samples:      make(map[libpf.PID]int),
 	}, nil
 }
 
@@ -197,13 +242,13 @@ func (m *matcher) processKeyLocked(pid libpf.PID, now time.Time) processKey {
 	return processKey{pid: pid, generation: generation}
 }
 
-func (m *matcher) launchKeyLocked(pid libpf.PID, correlationID uint32, now time.Time) launchKey {
+func (m *matcher) launchKeyLocked(pid libpf.PID, correlationID uint64, now time.Time) launchKey {
 	return launchKey{processKey: m.processKeyLocked(pid, now), correlationID: correlationID}
 }
 
 // addLaunch records the host stack of a GPU call and folds the GPU records
 // that arrived before it.
-func (m *matcher) addLaunch(pid libpf.PID, correlationID uint32, trace *libpf.Trace,
+func (m *matcher) addLaunch(pid libpf.PID, correlationID uint64, trace *libpf.Trace,
 	now time.Time,
 ) {
 	m.rememberMeta(pid, now)
@@ -229,17 +274,38 @@ func (m *matcher) addLaunch(pid libpf.PID, correlationID uint32, trace *libpf.Tr
 }
 
 // addWork folds GPU work, multiplied by its sample weight, into its launch
-// stack's samples, or keeps it until the launch arrives.
+// stack's samples, or keeps it until the launch and the UUID of its GPU arrive.
 func (m *matcher) addWork(work gpuWork, now time.Time) {
 	if len(work.values) == 0 {
 		return
 	}
-	work = work.scaled()
 	m.rememberMeta(work.pid, now)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := m.launchKeyLocked(work.pid, work.correlationID, now)
+	m.addWorkLocked(work, m.processKeyLocked(work.pid, now), now)
+}
+
+// addWorkLocked adds the work of process pk. The caller must hold m.mu.
+func (m *matcher) addWorkLocked(work gpuWork, pk processKey, now time.Time) {
+	if work.gpuIndex != 0 {
+		gk := gpuKey{processKey: pk, index: work.gpuIndex}
+		if uuid, ok := m.gpus.Get(gk); ok {
+			work.gpu = uuid
+		} else if m.numUnresolved < unresolvedCapacity {
+			m.unresolved[gk] = append(m.unresolved[gk], pendingWork{work: work, arrived: now})
+			m.numUnresolved++
+			return
+		}
+		work.gpuIndex = 0
+	}
+	work = work.scaled()
+	if work.correlationID == 0 {
+		// No call started the work, so no stack will come.
+		m.foldLocked(work, libpf.TraceHash{}, nil)
+		return
+	}
+	key := launchKey{processKey: pk, correlationID: work.correlationID}
 	if stack, ok := m.launches.Get(key); ok {
 		if frames, ok := m.stacks.Get(stack); ok {
 			m.foldLocked(work, stack, frames)
@@ -250,7 +316,7 @@ func (m *matcher) addWork(work gpuWork, now time.Time) {
 		return
 	}
 	works := m.pending[key]
-	wk := workKey{leaf: work.leaf, ranges: work.ranges, gpu: work.gpu}
+	wk := workKey{frameType: work.frameType, leaf: work.leaf, ranges: work.ranges, gpu: work.gpu}
 	if p, ok := works[wk]; ok {
 		p.work.merge(work)
 		return
@@ -270,11 +336,16 @@ func (m *matcher) addWork(work gpuWork, now time.Time) {
 // foldLocked adds the work's values to the samples of its leaf below the host
 // stack. The caller must hold m.mu.
 func (m *matcher) foldLocked(work gpuWork, stack libpf.TraceHash, hostFrames libpf.Frames) {
+	if m.samples[work.pid] >= samplesPerProcess {
+		work = otherWorkOf(work)
+		stack, hostFrames = libpf.TraceHash{}, nil
+	}
 	for _, v := range work.values {
 		key := bucketKey{
 			profileType: v.profileType,
 			pid:         work.pid,
 			stack:       stack,
+			frameType:   work.frameType,
 			leaf:        work.leaf,
 			ranges:      work.ranges,
 			gpu:         work.gpu,
@@ -288,9 +359,19 @@ func (m *matcher) foldLocked(work gpuWork, stack libpf.TraceHash, hostFrames lib
 				meta:   m.capturedMetaLocked(work.pid),
 			}
 			m.buckets[key] = b
+			m.samples[work.pid]++
 		}
-		b.value += v.value
+		b.value = saturatingAdd(b.value, v.value)
 	}
+}
+
+// otherWorkOf returns the work as part of the single sample that a process's
+// work beyond samplesPerProcess goes to.
+func otherWorkOf(work gpuWork) gpuWork {
+	work.leaf = otherWork
+	work.ranges = ""
+	work.gpu = ""
+	return work
 }
 
 // rangeSeparator separates the ranges of a range stack.
@@ -300,11 +381,11 @@ const rangeSeparator = "\x1f"
 // it ran in from the innermost outwards, then the host stack.
 func sampleFrames(work gpuWork, hostFrames libpf.Frames) libpf.Frames {
 	frames := make(libpf.Frames, 0, len(hostFrames)+2)
-	frames.Append(&libpf.Frame{Type: libpf.GPUFrame, FunctionName: libpf.Intern(work.leaf)})
+	frames.Append(&libpf.Frame{Type: work.frameType, FunctionName: libpf.Intern(work.leaf)})
 	for name := range strings.SplitSeq(work.ranges, rangeSeparator) {
 		if name != "" {
 			frames.Append(&libpf.Frame{
-				Type:         libpf.GPUFrame,
+				Type:         work.frameType,
 				FunctionName: libpf.Intern("range:" + name),
 			})
 		}
@@ -330,7 +411,7 @@ func sampleAttributes(work gpuWork) []attribute.KeyValue {
 	if work.gpu == "" {
 		return nil
 	}
-	return []attribute.KeyValue{gpuUUIDKey.String(work.gpu)}
+	return []attribute.KeyValue{hwIDKey.String(work.gpu), hwTypeKey.String("gpu")}
 }
 
 // sampleHash identifies a sample. libpf.Trace.Hash does not cover function
@@ -338,6 +419,7 @@ func sampleAttributes(work gpuWork) []attribute.KeyValue {
 func sampleHash(stack libpf.TraceHash, work gpuWork) libpf.TraceHash {
 	h := xxh3.New128()
 	_, _ = h.Write(stack.Bytes())
+	_, _ = h.Write([]byte{byte(work.frameType)})
 	// The separators keep "a"+"bc" apart from "ab"+"c".
 	_, _ = h.WriteString(work.leaf)
 	_, _ = h.WriteString(rangeSeparator)
@@ -346,6 +428,45 @@ func sampleHash(stack libpf.TraceHash, work gpuWork) libpf.TraceHash {
 	_, _ = h.WriteString(work.gpu)
 	sum := h.Sum128()
 	return libpf.NewTraceHash(sum.Hi, sum.Lo)
+}
+
+// expireUnresolvedLocked adds the GPU work whose GPU's UUID did not arrive
+// within gpuGrace, without a GPU. The caller must hold m.mu.
+func (m *matcher) expireUnresolvedLocked(now time.Time) {
+	for gk, works := range m.unresolved {
+		// Work is kept in the order it arrived.
+		expired := 0
+		for expired < len(works) && now.Sub(works[expired].arrived) >= gpuGrace {
+			expired++
+		}
+		if expired == len(works) {
+			delete(m.unresolved, gk)
+		} else {
+			m.unresolved[gk] = works[expired:]
+		}
+		m.numUnresolved -= expired
+		for _, p := range works[:expired] {
+			p.work.gpuIndex = 0
+			m.addWorkLocked(p.work, gk.processKey, p.arrived)
+		}
+	}
+}
+
+// releaseUnresolvedLocked adds the work of a retired process that still waits
+// for the UUID of its GPU, without one: the process will not send it. The caller
+// must hold m.mu.
+func (m *matcher) releaseUnresolvedLocked(pk processKey) {
+	for gk, works := range m.unresolved {
+		if gk.processKey != pk {
+			continue
+		}
+		delete(m.unresolved, gk)
+		m.numUnresolved -= len(works)
+		for _, p := range works {
+			p.work.gpuIndex = 0
+			m.addWorkLocked(p.work, pk, p.arrived)
+		}
+	}
 }
 
 // expirePendingLocked folds GPU work whose launch did not arrive within
@@ -391,9 +512,11 @@ func (m *matcher) processStarted(pid libpf.PID) {
 // The caller must hold m.mu.
 func (m *matcher) retireLocked(pid libpf.PID) {
 	if generation, ok := m.generations.Peek(pid); ok {
-		if meta, ok := m.metas.Get(processKey{pid: pid, generation: generation}); ok {
+		pk := processKey{pid: pid, generation: generation}
+		if meta, ok := m.metas.Get(pk); ok {
 			m.retiredMetas.Add(pid, meta)
 		}
+		m.releaseUnresolvedLocked(pk)
 	}
 	delete(m.exits, pid)
 	m.generations.Remove(pid)
@@ -431,13 +554,30 @@ func (m *matcher) rememberMeta(pid libpf.PID, now time.Time) {
 	m.mu.Unlock()
 }
 
+// setGPU records the UUID of the GPU that a process names by index, and adds
+// the work that waited for it.
+func (m *matcher) setGPU(pid libpf.PID, index uint32, uuid string, now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	gk := gpuKey{processKey: m.processKeyLocked(pid, now), index: index}
+	m.gpus.Add(gk, uuid)
+	works := m.unresolved[gk]
+	delete(m.unresolved, gk)
+	m.numUnresolved -= len(works)
+	for _, p := range works {
+		m.addWorkLocked(p.work, gk.processKey, p.arrived)
+	}
+}
+
 // snapshot returns the samples aggregated since the previous call.
 func (m *matcher) snapshot(now time.Time) []samples.SnapshotProfile {
 	m.mu.Lock()
+	m.expireUnresolvedLocked(now)
 	m.expirePendingLocked(now)
 	m.retireExitedLocked(now)
 	buckets := m.buckets
 	m.buckets = make(map[bucketKey]*bucket)
+	clear(m.samples)
 	m.mu.Unlock()
 
 	fresh := make(map[libpf.PID]samples.ProcessMeta)

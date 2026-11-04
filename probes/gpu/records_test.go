@@ -41,24 +41,26 @@ func appendUint(b []byte, num protowire.Number, v uint64) []byte {
 func TestDecodeEvent(t *testing.T) {
 	var payload []byte
 	payload = appendString(payload, fieldGPU, "GPU-1")
-	payload = appendString(payload, fieldName, "HtoD")
 	payload = appendString(payload, fieldRanges, "aten::copy_")
 	payload = appendString(payload, fieldRanges, "train_step")
 	payload = appendUint(payload, fieldDurationNS, 1500)
 	payload = appendUint(payload, fieldBytes, 4096)
+	payload = appendUint(payload, fieldRuntime, runtimeCUDA)
+	payload = appendUint(payload, fieldGPUIndex, 2)
 
-	ev, err := decodeEvent(encodeEvent(7, 1<<40|42, 5, kindCopy, payload))
+	ev, err := decodeEvent(encodeEvent(7, 1<<40|42, 5, kindCopyHtoD, payload))
 	require.NoError(t, err)
 	assert.Equal(t, event{
 		pid:           libpf.PID(7),
 		correlationID: 1<<40 | 42,
 		sampleWeight:  5,
-		kind:          kindCopy,
+		kind:          kindCopyHtoD,
 		gpu:           "GPU-1",
-		name:          "HtoD",
 		ranges:        "aten::copy_" + rangeSeparator + "train_step",
 		durationNS:    1500,
 		bytes:         4096,
+		runtime:       runtimeCUDA,
+		gpuIndex:      2,
 	}, ev)
 }
 

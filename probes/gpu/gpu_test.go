@@ -17,7 +17,7 @@ func TestPreHandleTraceKeepsCorrelationID(t *testing.T) {
 	trace := &libpf.EbpfTrace{PID: 7, ContextValues: []uint64{1<<40 | 41, 3}}
 	assert.True(t, p.PreHandleTrace(trace))
 	assert.Equal(t, libpf.PID(7), p.launch.pid)
-	assert.Equal(t, uint32(41), p.launch.correlationID)
+	assert.Equal(t, uint64(1<<40|41), p.launch.correlationID)
 
 	assert.False(t, p.PreHandleTrace(&libpf.EbpfTrace{PID: 7}), "a launch without its values")
 }

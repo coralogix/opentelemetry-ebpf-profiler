@@ -246,8 +246,11 @@ func TestLaunchStacks(t *testing.T) {
 	require.Equal(t, fired.launchWeights, weights)
 }
 
-// testGPU is the GPU UUID the fake producer sends with every event.
+// testGPU is the GPU UUID the fake producer names by an index in its events.
 const testGPU = "GPU-00000000-0000-0000-0000-000000000001"
+
+// deviceLaunched is the kernel the fake producer reports without a call.
+const deviceLaunched = "device_launched"
 
 // collectGPUProfiles collects the snapshot samples of pid until the totals by
 // profile type reach want. It returns the totals by profile type, then by leaf
@@ -269,14 +272,18 @@ func collectGPUProfiles(t *testing.T, trc *tracer.Tracer, pid libpf.PID,
 					continue
 				}
 				leaf := sample.Frames[0].Value()
-				require.Equal(t, libpf.GPUFrame, leaf.Type)
-				require.True(t, inProducer(t, sample.Frames[1:]),
-					"%s %s has no launch stack", sampleType, leaf.FunctionName)
+				require.Equal(t, libpf.CUDAFrame, leaf.Type)
+				// Kernels that no call started have no launch stack.
+				require.Equal(t, leaf.FunctionName.String() != deviceLaunched,
+					inProducer(t, sample.Frames[1:]),
+					"launch stack of %s %s", sampleType, leaf.FunctionName)
 				require.NotNil(t, sample.ProcessMeta)
 				require.Equal(t, "producer",
 					filepath.Base(sample.ProcessMeta.ExecutablePath.String()))
-				require.Equal(t, []attribute.KeyValue{attribute.String("gpu.uuid", testGPU)},
-					sample.Attributes)
+				require.Equal(t, []attribute.KeyValue{
+					attribute.String("hw.id", testGPU),
+					attribute.String("hw.type", "gpu"),
+				}, sample.Attributes)
 				if byLeaf[sampleType] == nil {
 					byLeaf[sampleType] = make(map[string]int64)
 					byStack[sampleType] = make(map[string]int64)
@@ -299,7 +306,7 @@ func gpuFrames(frames libpf.Frames) string {
 	var names []string
 	for _, handle := range frames {
 		frame := handle.Value()
-		if frame.Type != libpf.GPUFrame {
+		if frame.Type != libpf.CUDAFrame {
 			break
 		}
 		names = append(names, frame.FunctionName.String())
@@ -319,11 +326,12 @@ func TestGPUProfiles(t *testing.T) {
 
 	// The totals leave out the events the producer breaks on purpose.
 	byLeaf, byStack := collectGPUProfiles(t, trc, fired.pid, fired.profiles())
-	require.Equal(t, []string{"graph_step", "vector_add"},
+	require.Equal(t, []string{deviceLaunched, "graph_step", "vector_add"},
 		slices.Sorted(maps.Keys(byLeaf["gpu_kernel_time"])))
 	require.Equal(t, []string{"memcpy:HtoD", "memset"},
 		slices.Sorted(maps.Keys(byLeaf["gpu_mem_time"])))
 	require.Equal(t, []string{
+		deviceLaunched,
 		"graph_step",
 		"vector_add",
 		"vector_add > range:aten::mm > range:aten::matmul > range:train_step",
@@ -390,6 +398,9 @@ func TestProcessesShareUprobes(t *testing.T) {
 					got[sample.PID] = make(map[string]int64)
 				}
 				got[sample.PID][profile.ProfileType.SampleTypes[0].Type] += sample.Value
+				if sample.Frames[0].Value().FunctionName.String() == deviceLaunched {
+					continue
+				}
 				if inProducer(t, sample.Frames[1:]) {
 					stacked[sample.PID] += sample.Value
 				} else {
@@ -418,4 +429,28 @@ func TestProcessesShareUprobes(t *testing.T) {
 			"launch weights of %d: %d of %d", fired.pid, weights, fired.launchWeights)
 		require.LessOrEqual(t, weights, fired.launchWeights)
 	}
+}
+
+// TestProducerPaths attaches to a producer given by path as the probe loads,
+// before any process maps it: the semaphore is up as soon as the producer
+// starts, and its work is reported.
+func TestProducerPaths(t *testing.T) {
+	bin := buildProducer(t)
+	rep := &recordingReporter{}
+	trc, _ := startTracer(t, rep, gpu.Config{ProducerPaths: []string{bin}})
+	fired := runBuiltProducer(t, bin, 2)
+
+	want := fired.profiles()
+	got := make(map[string]int64)
+	require.Eventually(t, func() bool {
+		for _, profile := range trc.CollectSnapshots() {
+			for _, sample := range profile.Samples {
+				if sample.PID == fired.pid {
+					got[profile.ProfileType.SampleTypes[0].Type] += sample.Value
+				}
+			}
+		}
+		return maps.Equal(want, got)
+	}, 10*time.Second, 500*time.Millisecond, "want %v, got %v", want, got)
+	require.NotEmpty(t, rep.eventsOf(fired.pid, "gpu_launches"))
 }

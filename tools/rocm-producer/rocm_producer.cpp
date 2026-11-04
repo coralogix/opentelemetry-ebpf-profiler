@@ -178,17 +178,6 @@ collect_agents(rocprofiler_agent_version_t, const void **agents, size_t num_agen
   return ROCPROFILER_STATUS_SUCCESS;
 }
 
-/* Returns the UUID of a GPU agent, or NULL for other agents. */
-static const char *gpu_uuid(rocprofiler_agent_id_t agent)
-{
-  for (size_t i = 0; i < g_num_agents; i++) {
-    if (g_agent_handle[i] == agent.handle) {
-      return g_agent_uuid[i][0] ? g_agent_uuid[i] : NULL;
-    }
-  }
-  return NULL;
-}
-
 /* ─── Range stacks ──────────────────────────────────────────────────────────
  * ROCTx ranges (roctxRangePush/Pop), the counterpart of NVTX ranges. Each
  * thread keeps its active ranges as one interned string, innermost first and
@@ -313,8 +302,17 @@ enum call_class {
 #define DEFAULT_SAMPLE_RATE       200
 #define DEFAULT_GRAPH_SAMPLE_RATE 20
 
+/* Sampled calls per process per second, by class; 0 samples all of them. Each
+ * class is sampled for the whole process, so that a process with many threads
+ * is not reported more often than one with a single thread. */
 static uint32_t g_sample_rate[CALL_CLASSES];
-static __thread struct otel_sampler t_samplers[CALL_CLASSES];
+static struct otel_sampler g_samplers[CALL_CLASSES];
+static pthread_mutex_t g_sampler_mu[CALL_CLASSES] = {
+  PTHREAD_MUTEX_INITIALIZER,
+  PTHREAD_MUTEX_INITIALIZER,
+  PTHREAD_MUTEX_INITIALIZER,
+  PTHREAD_MUTEX_INITIALIZER,
+};
 static __thread uint64_t t_rng;
 
 static uint64_t now_ns(void)
@@ -326,11 +324,17 @@ static uint64_t now_ns(void)
 
 static uint32_t sample_call(enum call_class cls)
 {
+  if (g_sample_rate[cls] == 0) {
+    return 1;
+  }
   const uint64_t now = now_ns();
   if (t_rng == 0) {
     t_rng = (now ^ (uint64_t)(uintptr_t)&t_rng) | 1;
   }
-  return otel_sampler_weight(&t_samplers[cls], g_sample_rate[cls], now, &t_rng);
+  pthread_mutex_lock(&g_sampler_mu[cls]);
+  const uint32_t weight = otel_sampler_weight(&g_samplers[cls], g_sample_rate[cls], now, &t_rng);
+  pthread_mutex_unlock(&g_sampler_mu[cls]);
+  return weight;
 }
 
 static uint32_t env_rate(const char *name, uint32_t fallback)
@@ -413,6 +417,61 @@ static enum call_class call_class(rocprofiler_tracing_operation_t operation)
   return (enum call_class)g_operation_class[operation];
 }
 
+/* ─── Events ──────────────────────────────────────────────────────────────── */
+
+/* emit_event is the only place firing the probe, so the profiler attaches one
+ * uprobe to the library. */
+OTEL_GPU_EMITTER static void emit_event(const struct otel_gpu_event *ev)
+{
+  OTEL_GPU_EVENT(ev);
+}
+
+static void
+begin_event(struct otel_gpu_event *ev, enum otel_gpu_kind kind, uint64_t corr, uint32_t weight)
+{
+  ev->correlation_id = corr;
+  ev->sample_weight  = weight;
+  ev->kind           = (uint16_t)kind;
+  ev->payload_size   = 0;
+}
+
+/* ─── GPU indexes ────────────────────────────────────────────────────────────
+ * Events of work name their GPU by an index, its agent's position plus one; a
+ * DEVICE event tells the profiler which UUID an index stands for. It is sent
+ * before the first work on a GPU in each epoch: a new epoch starts when tracing
+ * does, as the profiler may be a new one, and every GPU_RESEND_PERIOD_MS, in
+ * case a DEVICE event was lost. */
+#define GPU_RESEND_PERIOD_MS 10000
+
+static uint32_t g_gpu_epoch;
+static uint32_t g_gpu_sent_epoch[MAX_AGENTS];
+
+/* Returns the index of a GPU agent, 0 for other agents, telling the profiler
+ * its UUID first if needed. */
+static uint32_t gpu_index(rocprofiler_agent_id_t agent)
+{
+  for (size_t i = 0; i < g_num_agents; i++) {
+    if (g_agent_handle[i] != agent.handle) {
+      continue;
+    }
+    if (!g_agent_uuid[i][0]) {
+      return 0;
+    }
+    const uint32_t epoch = __atomic_load_n(&g_gpu_epoch, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&g_gpu_sent_epoch[i], __ATOMIC_ACQUIRE) != epoch) {
+      struct otel_gpu_event ev;
+      begin_event(&ev, OTEL_GPU_DEVICE, 0, 0);
+      otel_gpu_put_string(&ev, OTEL_GPU_FIELD_GPU, g_agent_uuid[i]);
+      otel_gpu_put_uint(&ev, OTEL_GPU_FIELD_GPU_INDEX, i + 1);
+      emit_event(&ev);
+      // Marked once sent: no other thread may report work on the GPU before it.
+      __atomic_store_n(&g_gpu_sent_epoch[i], epoch, __ATOMIC_RELEASE);
+    }
+    return (uint32_t)i + 1;
+  }
+  return 0;
+}
+
 /* ─── Tracing while the profiler is attached ────────────────────────────────
  * GPU work is recorded only while the probe's semaphore is raised, so the
  * producer costs little without a profiler: a check of the semaphore at each
@@ -435,6 +494,7 @@ static void update_tracing(void)
       rocprofiler_timestamp_t now = 0;
       rocprofiler_get_timestamp(&now);
       __atomic_store_n(&g_tracing_since, now, __ATOMIC_RELEASE);
+      __atomic_add_fetch(&g_gpu_epoch, 1, __ATOMIC_ACQ_REL);
       const rocprofiler_status_t status = rocprofiler_start_context(g_trace_context);
       if (status == ROCPROFILER_STATUS_SUCCESS) {
         __atomic_store_n(&g_tracing, 1, __ATOMIC_RELEASE);
@@ -455,47 +515,32 @@ static void update_tracing(void)
   pthread_mutex_unlock(&g_tracing_mu);
 }
 
-/* ─── Events ──────────────────────────────────────────────────────────────── */
-
-/* emit_event is the only place firing the probe, so the profiler attaches one
- * uprobe to the library. */
-__attribute__((noinline)) static void emit_event(const struct otel_gpu_event *ev)
-{
-  OTEL_GPU_EVENT(ev);
-}
-
-static void
-begin_event(struct otel_gpu_event *ev, enum otel_gpu_kind kind, uint64_t corr, uint32_t weight)
-{
-  ev->correlation_id = corr;
-  ev->sample_weight  = weight;
-  ev->kind           = (uint16_t)kind;
-  ev->payload_size   = 0;
-}
-
 /* put_work adds the fields of an event of GPU work: the GPU, how long it took,
- * how many bytes it moved, its name, and the ranges at its call, innermost
- * first. Names come last: one too long for the payload is cut short, and must
- * not crowd out the others. */
+ * how many bytes it moved and the runtime, then the ranges at its call,
+ * innermost first, as long as they fit whole, and last its name, cut short if
+ * needed. */
 static void put_work(
   struct otel_gpu_event *ev,
-  const char *gpu,
+  uint32_t gpu,
   uint64_t start,
   uint64_t end,
   uint64_t bytes,
   const char *name,
   const char *ranges)
 {
-  otel_gpu_put_string(ev, OTEL_GPU_FIELD_GPU, gpu);
+  otel_gpu_put_uint(ev, OTEL_GPU_FIELD_GPU_INDEX, gpu);
   otel_gpu_put_uint(ev, OTEL_GPU_FIELD_DURATION_NS, end > start ? end - start : 0);
   otel_gpu_put_uint(ev, OTEL_GPU_FIELD_BYTES, bytes);
-  otel_gpu_put_string(ev, OTEL_GPU_FIELD_NAME, name);
+  otel_gpu_put_uint(ev, OTEL_GPU_FIELD_RUNTIME, OTEL_GPU_RUNTIME_ROCM);
   for (const char *range = ranges; range && *range;) {
     const char *sep  = strchr(range, RANGE_SEP);
     const size_t len = sep ? (size_t)(sep - range) : strlen(range);
-    otel_gpu_put_bytes(ev, OTEL_GPU_FIELD_RANGES, range, len);
+    if (!otel_gpu_put_whole_bytes(ev, OTEL_GPU_FIELD_RANGES, range, len)) {
+      break;
+    }
     range = sep ? sep + 1 : NULL;
   }
+  otel_gpu_put_string(ev, OTEL_GPU_FIELD_NAME, name);
 }
 
 /* ─── Callbacks on the application's threads ─────────────────────────────── */
@@ -557,15 +602,15 @@ static void code_object_callback(
 
 /* ─── GPU records ───────────────────────────────────────────────────────────── */
 
-/* Names where the data of a copy went. */
-static const char *copy_name(rocprofiler_memory_copy_operation_t operation)
+/* Returns the kind of event of a copy, 0 for copies not reported. */
+static uint16_t copy_kind(rocprofiler_memory_copy_operation_t operation)
 {
   switch (operation) {
-  case ROCPROFILER_MEMORY_COPY_HOST_TO_DEVICE: return "HtoD";
-  case ROCPROFILER_MEMORY_COPY_DEVICE_TO_HOST: return "DtoH";
-  case ROCPROFILER_MEMORY_COPY_DEVICE_TO_DEVICE: return "DtoD";
-  case ROCPROFILER_MEMORY_COPY_HOST_TO_HOST: return "HtoH";
-  default: return NULL;
+  case ROCPROFILER_MEMORY_COPY_HOST_TO_DEVICE: return OTEL_GPU_COPY_HTOD;
+  case ROCPROFILER_MEMORY_COPY_DEVICE_TO_HOST: return OTEL_GPU_COPY_DTOH;
+  case ROCPROFILER_MEMORY_COPY_DEVICE_TO_DEVICE: return OTEL_GPU_COPY_DTOD;
+  case ROCPROFILER_MEMORY_COPY_HOST_TO_HOST: return OTEL_GPU_COPY_HTOH;
+  default: return 0;
   }
 }
 
@@ -581,7 +626,7 @@ static void kernel_dispatch(const rocprofiler_buffer_tracing_kernel_dispatch_rec
   begin_event(&ev, OTEL_GPU_KERNEL, corr, weight);
   put_work(
     &ev,
-    gpu_uuid(k->dispatch_info.agent_id),
+    gpu_index(k->dispatch_info.agent_id),
     k->start_timestamp,
     k->end_timestamp,
     0,
@@ -598,17 +643,17 @@ static void memory_copy(const rocprofiler_buffer_tracing_memory_copy_record_t *m
   if (weight == 0) {
     return;
   }
-  const char *gpu = gpu_uuid(m->dst_agent_id);
+  const uint16_t kind = copy_kind(m->operation);
+  if (kind == 0) {
+    return;
+  }
+  uint32_t gpu = gpu_index(m->dst_agent_id);
+  if (gpu == 0) {
+    gpu = gpu_index(m->src_agent_id);
+  }
   struct otel_gpu_event ev;
-  begin_event(&ev, OTEL_GPU_COPY, corr, weight);
-  put_work(
-    &ev,
-    gpu ? gpu : gpu_uuid(m->src_agent_id),
-    m->start_timestamp,
-    m->end_timestamp,
-    m->bytes,
-    copy_name(m->operation),
-    ranges);
+  begin_event(&ev, (enum otel_gpu_kind)kind, corr, weight);
+  put_work(&ev, gpu, m->start_timestamp, m->end_timestamp, m->bytes, NULL, ranges);
   emit_event(&ev);
 }
 
@@ -644,14 +689,19 @@ static void buffer_callback(
 /* Follows the profiler from here, not from the application's calls, which
  * would wait while tracing starts or stops, and hands over the records of
  * finished work: otherwise they sit until the buffer reaches its watermark. */
+#define FLUSH_PERIOD_MS 500
+
 static void *tracing_thread(void *)
 {
-  for (;;) {
+  for (uint64_t round = 1;; round++) {
     update_tracing();
     if (__atomic_load_n(&g_tracing, __ATOMIC_ACQUIRE)) {
       rocprofiler_flush_buffer(g_buffer);
+      if (round % (GPU_RESEND_PERIOD_MS / FLUSH_PERIOD_MS) == 0) {
+        __atomic_add_fetch(&g_gpu_epoch, 1, __ATOMIC_ACQ_REL);
+      }
     }
-    usleep(500 * 1000);
+    usleep(FLUSH_PERIOD_MS * 1000);
   }
   return NULL;
 }
@@ -758,10 +808,16 @@ static void fork_prepare(void)
 {
   pthread_mutex_lock(&g_tracing_mu);
   pthread_mutex_lock(&g_pool_mu);
+  for (size_t i = 0; i < CALL_CLASSES; i++) {
+    pthread_mutex_lock(&g_sampler_mu[i]);
+  }
 }
 
 static void fork_parent(void)
 {
+  for (size_t i = CALL_CLASSES; i > 0; i--) {
+    pthread_mutex_unlock(&g_sampler_mu[i - 1]);
+  }
   pthread_mutex_unlock(&g_pool_mu);
   pthread_mutex_unlock(&g_tracing_mu);
 }
